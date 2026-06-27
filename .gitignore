@@ -1,0 +1,29 @@
+# 数据文件不进 git（太大）
+data/
+logs/
+*.parquet
+*.csv
+*.h5
+
+# 密钥绝对不进 git
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# 输出
+*.png
+*.pdf
+backtest_result*
