@@ -27,3 +27,4 @@ venv/
 *.png
 *.pdf
 backtest_result*
+tmp_cols.txt
