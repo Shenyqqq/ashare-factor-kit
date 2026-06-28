@@ -49,6 +49,7 @@ XGB_PARAMS = dict(
     n_estimators=300, max_depth=4, learning_rate=0.05,
     subsample=0.8, colsample_bytree=0.8, min_child_weight=30,
     reg_alpha=0.1, reg_lambda=1.0,
+    early_stopping_rounds=30,   # XGBoost 2.x 在构造器里传，不在 fit() 里传
     random_state=42, verbosity=0, n_jobs=-1,
 )
 
@@ -177,7 +178,7 @@ def _fit_model(model_type, X_tr, y_tr, w_tr, X_va, y_va):
                   callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(-1)])
     elif model_type == "xgb":
         model.fit(X_tr, y_tr, sample_weight=w_tr,
-                  eval_set=[(X_va, y_va)], early_stopping_rounds=30, verbose=False)
+                  eval_set=[(X_va, y_va)], verbose=False)
     elif model_type == "cat":
         model.fit(X_tr, y_tr, sample_weight=w_tr,
                   eval_set=(X_va, y_va), early_stopping_rounds=30)

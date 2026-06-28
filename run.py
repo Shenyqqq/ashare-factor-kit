@@ -38,6 +38,34 @@ FIN_PATH        = RAW_DIR / "financial_indicators.parquet"
 ML_MODES    = {"lgbm", "xgb", "cat", "ridge", "ensemble"}
 ALL_MODES   = {"linear", "industry"} | ML_MODES
 
+INDEX_MAP = {"沪深300": "000300", "创业板指": "399006"}
+
+
+def _load_indices() -> dict:
+    """加载沪深300和创业板指收盘价，优先读本地缓存，否则从AKShare拉取。"""
+    import akshare as ak
+    result = {}
+    for name, code in INDEX_MAP.items():
+        cache = RAW_DIR / f"index_{code}.parquet"
+        if cache.exists():
+            s = pd.read_parquet(cache).squeeze()
+        else:
+            try:
+                df = ak.index_zh_a_hist(
+                    symbol=code, period="daily",
+                    start_date=BACKTEST_START.replace("-", ""),
+                    end_date=BACKTEST_END.replace("-", ""),
+                )
+                df["日期"] = pd.to_datetime(df["日期"])
+                s = df.set_index("日期")["收盘"].rename(name)
+                s.to_frame().to_parquet(cache)
+                logger.info(f"指数 {name}({code}) 下载完成，shape={s.shape}")
+            except Exception as e:
+                logger.warning(f"指数 {name} 下载失败: {e}，跳过")
+                continue
+        result[name] = s
+    return result
+
 
 def _load_data(skip_download, sample):
     if not skip_download:
@@ -172,6 +200,7 @@ def main(mode="linear", skip_download=False, sample=0,
         from backtest.quantile import (
             run_quantile_backtest, plot_quantile_result, print_quantile_summary,
         )
+        indices = _load_indices()
         result = run_quantile_backtest(
             prices, factor_scores,
             n_quantiles=5,
@@ -180,6 +209,7 @@ def main(mode="linear", skip_download=False, sample=0,
             end=BACKTEST_END,
             open_prices=open_,   # 次日开盘执行，一字涨停自动剔除
             masks=masks,
+            indices=indices,
         )
         print_quantile_summary(result)
         plot_quantile_result(

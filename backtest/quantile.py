@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 @dataclass
 class QuantileResult:
-    nav: pd.DataFrame          # 各组NAV，columns=[Q1,Q2,...,Q5,benchmark]
+    nav: pd.DataFrame          # 各组NAV，columns=[Q1,Q2,...,Q5,benchmark,沪深300,创业板指]
     annual_returns: pd.DataFrame   # 逐年收益，index=year, columns=[Q1,...,Q5]
     ic_monotonicity: float     # 组别rank vs 组别收益的相关性（越接近1越好）
     long_short_nav: pd.Series  # Q5/Q1 多空组合NAV
@@ -60,6 +60,7 @@ def run_quantile_backtest(
     min_stocks: int = 5,
     open_prices: pd.DataFrame = None,
     masks: dict = None,
+    indices: dict = None,   # {"沪深300": pd.Series, "创业板指": pd.Series}
 ) -> QuantileResult:
     """
     分组回测核心逻辑。
@@ -194,6 +195,23 @@ def run_quantile_backtest(
     period_rets.index = [t[0] for t in date_index]
     period_rets.index = pd.DatetimeIndex(period_rets.index)
 
+    # ── 指数基准（沪深300 / 创业板指）────────────────────────────────────────
+    if indices:
+        for idx_name, idx_price in indices.items():
+            idx_price = idx_price.sort_index()
+            idx_rets = []
+            for sig_date, hold_end in date_index:
+                hold_dates = idx_price.index[
+                    (idx_price.index > sig_date) & (idx_price.index <= hold_end)
+                ]
+                if len(hold_dates) == 0:
+                    idx_rets.append(np.nan)
+                    continue
+                p0 = idx_price.asof(sig_date)
+                p1 = idx_price.loc[hold_dates[-1]]
+                idx_rets.append(p1 / p0 - 1 if p0 and p0 > 0 else np.nan)
+            period_rets[idx_name] = idx_rets
+
     nav = (1 + period_rets.fillna(0)).cumprod()
 
     # ── 多空NAV：Q5 / Q1 ─────────────────────────────────────────────────────
@@ -257,6 +275,10 @@ def plot_quantile_result(result: QuantileResult,
     if "benchmark" in result.nav.columns:
         result.nav["benchmark"].plot(ax=ax, color="gray", lw=1.5,
                                      ls="--", label="等权基准")
+    idx_styles = {"沪深300": ("black", "-.", 1.8), "创业板指": ("purple", ":", 1.8)}
+    for idx_name, (color, ls, lw) in idx_styles.items():
+        if idx_name in result.nav.columns:
+            result.nav[idx_name].plot(ax=ax, color=color, ls=ls, lw=lw, label=idx_name)
     ax.set_title("各分组净值走势")
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)

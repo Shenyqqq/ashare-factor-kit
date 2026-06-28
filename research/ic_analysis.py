@@ -325,14 +325,29 @@ def run(period: int = 20, top: int = 0, plot: bool = False,
 
     print("载入数据...")
     prices    = pd.read_parquet(RAW_DIR / "prices_hfq.parquet")
-    financial = pd.read_parquet(RAW_DIR / "financial_indicators.parquet")
-    prices_raw = None
-    if (RAW_DIR / "prices_raw.parquet").exists():
-        prices_raw = pd.read_parquet(RAW_DIR / "prices_raw.parquet")
+    financial = (pd.read_parquet(RAW_DIR / "financial_indicators.parquet")
+                 if (RAW_DIR / "financial_indicators.parquet").exists() else None)
+
+    def _opt(fname):
+        p = RAW_DIR / fname
+        return pd.read_parquet(p) if p.exists() else None
+
+    prices_raw  = _opt("prices_raw.parquet")
+    volume      = _opt("volume.parquet")
+    amount      = _opt("amount.parquet")
+    open_       = _opt("open_hfq.parquet")
+    high        = _opt("high_hfq.parquet")
+    low         = _opt("low_hfq.parquet")
+    institution = _opt("institution_holding.parquet")
+
+    from data.clean import clean_ohlcv
+    clean_ret, masks = clean_ohlcv(prices, open_, high, low)
 
     print(f"计算因子（持仓期={period}日）...")
     registry = get_factor_registry(
         prices=prices, financial=financial, prices_raw=prices_raw,
+        volume=volume, amount=amount, open_=open_, high=high, low=low,
+        clean_ret=clean_ret, masks=masks, institution=institution,
     )
     forward_return = prices.pct_change(period).shift(-period)
 
