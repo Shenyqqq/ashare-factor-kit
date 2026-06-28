@@ -20,6 +20,17 @@ def run(
     prices_raw: pd.DataFrame = None,
     volume: pd.DataFrame = None,
     amount: pd.DataFrame = None,
+    open_: pd.DataFrame = None,
+    high: pd.DataFrame = None,
+    low: pd.DataFrame = None,
+    clean_ret: pd.DataFrame = None,
+    masks: dict = None,
+    market_prices: pd.DataFrame = None,
+    industry_map: pd.DataFrame = None,
+    margin: pd.DataFrame = None,
+    moneyflow: pd.DataFrame = None,
+    northbound: pd.DataFrame = None,
+    institution: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     计算线性加权合成因子得分。
@@ -30,11 +41,13 @@ def run(
     返回 DataFrame(index=日期, columns=股票)，值越大选股优先级越高。
     """
     registry = get_factor_registry(
-        prices=prices,
-        financial=financial,
-        prices_raw=prices_raw,
-        volume=volume,
-        amount=amount,
+        prices=prices, financial=financial,
+        prices_raw=prices_raw, volume=volume, amount=amount,
+        open_=open_, high=high, low=low,
+        clean_ret=clean_ret, masks=masks,
+        market_prices=market_prices, industry_map=industry_map,
+        margin=margin, moneyflow=moneyflow,
+        northbound=northbound, institution=institution,
     )
 
     composite = None

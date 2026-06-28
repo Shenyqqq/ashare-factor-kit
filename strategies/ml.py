@@ -15,12 +15,56 @@ from models.trainer import WalkForwardTrainer, build_ml_dataset, MODEL_TYPES
 from models.analyzer import MLAnalyzer
 
 
+def build_factor_dataset(
+    prices: pd.DataFrame,
+    financial: pd.DataFrame,
+    prices_raw: pd.DataFrame = None,
+    volume: pd.DataFrame = None,
+    amount: pd.DataFrame = None,
+    open_: pd.DataFrame = None,
+    high: pd.DataFrame = None,
+    low: pd.DataFrame = None,
+    clean_ret: pd.DataFrame = None,
+    masks: dict = None,
+    market_prices: pd.DataFrame = None,
+    industry_map: pd.DataFrame = None,
+    margin: pd.DataFrame = None,
+    moneyflow: pd.DataFrame = None,
+    northbound: pd.DataFrame = None,
+    institution: pd.DataFrame = None,
+    hold_period: int = 20,
+):
+    """构建 MLDataset，供 IndustryWalkForwardTrainer 等复用"""
+    registry = get_factor_registry(
+        prices=prices, financial=financial,
+        prices_raw=prices_raw, volume=volume, amount=amount,
+        open_=open_, high=high, low=low,
+        clean_ret=clean_ret, masks=masks,
+        market_prices=market_prices, industry_map=industry_map,
+        margin=margin, moneyflow=moneyflow,
+        northbound=northbound, institution=institution,
+    )
+    forward_return = prices.pct_change(hold_period).shift(-hold_period)
+    return build_ml_dataset(registry, forward_return)
+
+
 def run(
     prices: pd.DataFrame,
     financial: pd.DataFrame,
     prices_raw: pd.DataFrame = None,
     volume: pd.DataFrame = None,
     amount: pd.DataFrame = None,
+    open_: pd.DataFrame = None,
+    high: pd.DataFrame = None,
+    low: pd.DataFrame = None,
+    clean_ret: pd.DataFrame = None,
+    masks: dict = None,
+    market_prices: pd.DataFrame = None,
+    industry_map: pd.DataFrame = None,
+    margin: pd.DataFrame = None,
+    moneyflow: pd.DataFrame = None,
+    northbound: pd.DataFrame = None,
+    institution: pd.DataFrame = None,
     model_types: list = None,
     hold_period: int = 20,
     show_report: bool = False,
@@ -42,11 +86,13 @@ def run(
 
     # 1. 计算所有因子
     registry = get_factor_registry(
-        prices=prices,
-        financial=financial,
-        prices_raw=prices_raw,
-        volume=volume,
-        amount=amount,
+        prices=prices, financial=financial,
+        prices_raw=prices_raw, volume=volume, amount=amount,
+        open_=open_, high=high, low=low,
+        clean_ret=clean_ret, masks=masks,
+        market_prices=market_prices, industry_map=industry_map,
+        margin=margin, moneyflow=moneyflow,
+        northbound=northbound, institution=institution,
     )
     logger.info(f"ML 策略使用 {len(registry)} 个因子，模型={model_types}")
 

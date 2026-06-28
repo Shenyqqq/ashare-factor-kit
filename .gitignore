@@ -1,5 +1,7 @@
 # 数据文件不进 git（太大）
-data/
+data/raw/
+data/processed/
+data/universe/
 logs/
 *.parquet
 *.csv

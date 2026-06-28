@@ -77,93 +77,114 @@ def _pivot_financial(financial: pd.DataFrame, col: str,
 # 价格/动量类因子（只需 prices_hfq）
 # ══════════════════════════════════════════════════════════════════════════════
 
-def factor_momentum(prices: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+def factor_momentum(prices: pd.DataFrame, window: int = 20,
+                    clean_ret: pd.DataFrame = None) -> pd.DataFrame:
     """
-    中期动量：过去 N 日涨幅。
-    A股20-60日动量有正向预测力。
+    中期动量：过去 N 日复合收益率。
+    用 clean_ret（屏蔽涨跌停日）滚动复合，避免涨停日 return 截断导致动量低估。
+    若 clean_ret 为 None，退化为 pct_change(window)。
     """
-    return _normalize(prices.pct_change(window))
+    if clean_ret is not None:
+        # 用 clean_ret 逐日复合，NaN 日透明跳过
+        mom = (1 + clean_ret).rolling(window, min_periods=max(1, window // 2)).apply(
+            lambda x: np.nanprod(x) - 1, raw=True
+        )
+    else:
+        mom = prices.pct_change(window)
+    return _normalize(mom)
 
 
-def factor_reversal(prices: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+def factor_reversal(prices: pd.DataFrame, window: int = 5,
+                    clean_ret: pd.DataFrame = None) -> pd.DataFrame:
     """
-    短期反转：过去 N 日涨幅取负值。
-    A股5日反转效应显著，涨多了买入信号弱。
+    短期反转：过去 N 日复合收益率取负。
+    A股5日反转效应显著。使用 clean_ret 屏蔽涨跌停日。
     """
-    return _normalize(-prices.pct_change(window))
+    if clean_ret is not None:
+        mom = (1 + clean_ret).rolling(window, min_periods=max(1, window // 2)).apply(
+            lambda x: np.nanprod(x) - 1, raw=True
+        )
+    else:
+        mom = prices.pct_change(window)
+    return _normalize(-mom)
 
 
 def factor_momentum_skip(prices: pd.DataFrame,
                          long_window: int = 240,
-                         skip_window: int = 20) -> pd.DataFrame:
+                         skip_window: int = 20,
+                         clean_ret: pd.DataFrame = None) -> pd.DataFrame:
     """
     跳过最近1月的中长期动量（12-1月动量）。
-    跳过最近1月是为了避免短期反转效应污染动量信号。
     long_window=240（约12月），skip_window=20（约1月）。
     """
-    ret_long = prices.pct_change(long_window)
-    ret_skip = prices.pct_change(skip_window)
-    # 12月收益 / (1 + 1月收益) - 1，近似去掉最近1月
+    if clean_ret is not None:
+        _roll = lambda w: (1 + clean_ret).rolling(w, min_periods=w // 2).apply(
+            lambda x: np.nanprod(x) - 1, raw=True
+        )
+        ret_long = _roll(long_window)
+        ret_skip = _roll(skip_window)
+    else:
+        ret_long = prices.pct_change(long_window)
+        ret_skip = prices.pct_change(skip_window)
     mom_skip = (1 + ret_long) / (1 + ret_skip) - 1
     return _normalize(mom_skip)
 
 
-def factor_volatility(prices: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+def factor_volatility(prices: pd.DataFrame, window: int = 20,
+                      clean_ret: pd.DataFrame = None) -> pd.DataFrame:
     """
-    特质波动率取反（低波动得高分）。
-    用日收益率的滚动标准差近似特质波动率。
-    A股中高波动率股票未来收益偏低（与美股相反）。
+    波动率取反（低波动得高分）。
+    必须用 clean_ret：涨跌停日 return 被强制截断，若不屏蔽会系统性低估波动率。
     """
-    daily_ret = prices.pct_change()
-    vol = daily_ret.rolling(window).std()
-    return _normalize(-vol)  # 取负：低波动得高分
+    ret = clean_ret if clean_ret is not None else prices.pct_change()
+    vol = ret.rolling(window, min_periods=window // 2).std()
+    return _normalize(-vol)
 
 
 def factor_turnover(volume: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     """
-    换手率因子：过去N日平均换手率取反（低换手得高分）。
-    低换手率说明筹码稳定，机构持仓比例高。
-    需要传入 volume（成交量）数据。
-    注：严格换手率 = 成交量/流通股本，这里用成交量均值近似排名。
+    换手率因子取反（低换手得高分）。
+    用成交量均值近似排名（无需 clean_ret，成交量在涨停日本身是信号）。
     """
     avg_vol = volume.rolling(window).mean()
-    return _normalize(-avg_vol)  # 取负：低换手得高分
+    return _normalize(-avg_vol)
 
 
 def factor_amihud(prices: pd.DataFrame,
                   amount: pd.DataFrame,
-                  window: int = 20) -> pd.DataFrame:
+                  window: int = 20,
+                  clean_ret: pd.DataFrame = None) -> pd.DataFrame:
     """
-    Amihud 非流动性因子（越大说明越难交易，流动性溢价越高）。
-    ILLIQ = mean(|日收益率| / 日成交额)，窗口内均值。
-    A股中小票流动性溢价真实存在，该因子正向预测收益。
-    需要传入 amount（成交额，元）数据。
+    Amihud 非流动性因子：ILLIQ = mean(|日收益率| / 日成交额)。
+    涨跌停日成交额失真（买不到/卖不出），需用 clean_ret 屏蔽对应日。
     """
-    daily_ret = prices.pct_change().abs()
-    amount_m = amount.replace(0, np.nan)  # 避免除以0
-    illiq = (daily_ret / amount_m).rolling(window).mean()
+    ret = clean_ret if clean_ret is not None else prices.pct_change()
+    amount_m = amount.replace(0, np.nan)
+    illiq = (ret.abs() / amount_m).rolling(window, min_periods=window // 2).mean()
     return _normalize(illiq)
 
 
 def factor_high_low(prices: pd.DataFrame,
                     high: pd.DataFrame,
                     low: pd.DataFrame,
-                    window: int = 20) -> pd.DataFrame:
+                    window: int = 20,
+                    masks: dict = None) -> pd.DataFrame:
     """
     振幅因子取反：过去N日 (high-low)/close 均值取反。
-    低振幅说明价格走势平稳，通常对应机构持仓。
-    需要传入 high、low 数据。
+    一字板日（高==低==开==收）振幅为 0，会压低均值，需屏蔽。
     """
     hl_ratio = (high - low) / prices.replace(0, np.nan)
-    avg_hl = hl_ratio.rolling(window).mean()
+    if masks is not None:
+        # 一字涨停/跌停日振幅为0，不具参考价值
+        hl_ratio[masks["limit_up_open"] | masks["limit_down_open"]] = np.nan
+    avg_hl = hl_ratio.rolling(window, min_periods=window // 2).mean()
     return _normalize(-avg_hl)
 
 
 def factor_price_to_high(prices: pd.DataFrame, window: int = 52) -> pd.DataFrame:
     """
-    价格相对N日高点的位置（52周新高因子）。
-    价格接近历史高点往往意味着强势，正向预测动量延续。
-    window=52时约等于1年。
+    52周新高因子：价格相对 N 日最高价的位置。
+    不涉及 return 计算，无需 clean_ret。
     """
     roll_high = prices.rolling(window).max()
     ratio = prices / roll_high.replace(0, np.nan)
@@ -323,66 +344,107 @@ def get_factor_registry(
     prices_raw: pd.DataFrame = None,
     volume: pd.DataFrame = None,
     amount: pd.DataFrame = None,
+    open_: pd.DataFrame = None,
+    high: pd.DataFrame = None,
+    low: pd.DataFrame = None,
+    clean_ret: pd.DataFrame = None,
+    masks: dict = None,
+    market_prices: pd.DataFrame = None,
+    industry_map: pd.DataFrame = None,
+    margin: pd.DataFrame = None,
+    moneyflow: pd.DataFrame = None,
+    northbound: pd.DataFrame = None,
+    institution: pd.DataFrame = None,
 ) -> dict:
     """
     返回所有可计算因子的字典 {因子名: DataFrame}。
     根据传入的数据自动跳过缺少数据源的因子。
 
     prices:     后复权收盘价（必须）
-    financial:  财务季报数据（可选，无则跳过财务因子）
-    prices_raw: 不复权收盘价（可选，无则跳过PB/EP因子）
-    volume:     成交量（可选，无则跳过换手率因子）
-    amount:     成交额（可选，无则跳过Amihud因子）
+    financial:  财务季报数据（可选）
+    prices_raw: 不复权收盘价（可选）
+    volume:     成交量（可选）
+    amount:     成交额（可选）
+    open_/high/low: 后复权 OHLC（可选）
+    clean_ret:  屏蔽涨跌停日后的日收益率，由 clean.clean_ohlcv() 生成（强烈建议传入）
+    masks:      涨跌停 mask dict，由 clean.clean_ohlcv() 生成（强烈建议传入）
+    market_prices/industry_map/margin/moneyflow/northbound/institution: 可选 Alpha 数据源
     """
     registry = {}
 
-    # ── 价格因子（始终可算）──
-    registry["动量_20d"]    = factor_momentum(prices, 20)
-    registry["动量_60d"]    = factor_momentum(prices, 60)
-    registry["动量_120d"]   = factor_momentum(prices, 120)
-    registry["动量_skip"]   = factor_momentum_skip(prices, 240, 20)
-    registry["反转_5d"]     = factor_reversal(prices, 5)
-    registry["反转_20d"]    = factor_reversal(prices, 20)
-    registry["波动率_20d"]  = factor_volatility(prices, 20)
-    registry["波动率_60d"]  = factor_volatility(prices, 60)
-    registry["52周新高"]    = factor_price_to_high(prices, 52 * 5)
+    # ── 价格/动量类（全部传入 clean_ret，有则用，无则自动回退）──
+    registry["动量_20d"]   = factor_momentum(prices, 20,  clean_ret)
+    registry["动量_60d"]   = factor_momentum(prices, 60,  clean_ret)
+    registry["动量_120d"]  = factor_momentum(prices, 120, clean_ret)
+    registry["动量_skip"]  = factor_momentum_skip(prices, 240, 20, clean_ret)
+    registry["反转_5d"]    = factor_reversal(prices, 5,   clean_ret)
+    registry["反转_20d"]   = factor_reversal(prices, 20,  clean_ret)
+    registry["波动率_20d"] = factor_volatility(prices, 20, clean_ret)
+    registry["波动率_60d"] = factor_volatility(prices, 60, clean_ret)
+    registry["52周新高"]   = factor_price_to_high(prices, 52 * 5)
 
-    # ── 需要成交量 ──
     if volume is not None:
         registry["换手率_20d"] = factor_turnover(volume, 20)
-    else:
-        logger.debug("未传入 volume，跳过换手率因子")
 
-    # ── 需要成交额 ──
     if amount is not None:
-        registry["Amihud_20d"] = factor_amihud(prices, amount, 20)
-    else:
-        logger.debug("未传入 amount，跳过 Amihud 因子")
+        registry["Amihud_20d"] = factor_amihud(prices, amount, 20, clean_ret)
 
-    # ── 需要财务数据 ──
+    if high is not None and low is not None:
+        registry["振幅_20d"] = factor_high_low(prices, high, low, 20, masks)
+
+    # ── 财务类 ──
     if financial is not None and not financial.empty:
         _pr = prices_raw if prices_raw is not None else prices
-
         registry["价值_PB"]      = factor_value_pb(financial, _pr)
         registry["价值_EP"]      = factor_value_ep(financial, _pr)
         registry["质量_ROE"]     = factor_quality_roe(financial, prices)
         registry["质量_ROE变化"] = factor_quality_roe_chg(financial, prices)
         registry["规模"]         = factor_size(financial, prices)
         registry["杠杆"]         = factor_leverage(financial, prices)
+        for name, f in [
+            ("质量_毛利率",   factor_quality_gpm(financial, prices)),
+            ("质量_毛利率变化", factor_quality_gpm_chg(financial, prices)),
+            ("质量_应计项目", factor_quality_accrual(financial, prices)),
+        ]:
+            if f is not None:
+                registry[name] = f
 
-        # 毛利率和应计项目：数据列可能不存在，函数内部会处理
-        gpm     = factor_quality_gpm(financial, prices)
-        gpm_chg = factor_quality_gpm_chg(financial, prices)
-        accrual = factor_quality_accrual(financial, prices)
-        if gpm     is not None: registry["质量_毛利率"]     = gpm
-        if gpm_chg is not None: registry["质量_毛利率变化"] = gpm_chg
-        if accrual is not None: registry["质量_应计项目"]   = accrual
-    else:
-        logger.debug("未传入 financial，跳过所有财务因子")
+    # ── 第二批 Alpha 因子 ──
+    try:
+        from factors.factor_alpha import (
+            factor_industry_momentum, factor_idiosyncratic_vol,
+            factor_margin_change, factor_moneyflow_large,
+            factor_northbound_change, factor_institution_change,
+        )
+        if industry_map is not None:
+            f = factor_industry_momentum(prices, industry_map, window=20)
+            if f is not None:
+                registry["行业动量_20d"] = f
+        if market_prices is not None:
+            registry["特质波动率_60d"] = factor_idiosyncratic_vol(
+                prices, market_prices, window=60)
+        if margin is not None:
+            registry["融资余额变化_20d"] = factor_margin_change(margin, window=20)
+        if moneyflow is not None:
+            registry["大单净流入_5d"] = factor_moneyflow_large(moneyflow, window=5)
+        if northbound is not None:
+            registry["北向持股变化_20d"] = factor_northbound_change(northbound, window=20)
+        if institution is not None:
+            registry["机构持仓变化"] = factor_institution_change(institution, prices)
+    except ImportError as e:
+        logger.warning(f"factor_alpha 导入失败: {e}")
 
-    # 过滤掉计算失败（返回None）的因子
+    # ── 涨跌停信号因子（需要 masks，由 clean_ohlcv() 提供）──
+    if masks is not None and masks.get("limit_up") is not None:
+        try:
+            from factors.factor_limit import get_limit_factors
+            limit_factors = get_limit_factors(prices, masks)
+            registry.update(limit_factors)
+        except Exception as e:
+            logger.warning(f"涨跌停因子计算失败: {e}")
+
     registry = {k: v for k, v in registry.items() if v is not None}
-    logger.info(f"因子库就绪: {len(registry)} 个因子 → {list(registry.keys())}")
+    logger.info(f"因子库就绪: {len(registry)} 个因子")
     return registry
 
 

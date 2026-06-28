@@ -26,9 +26,9 @@ BACKTEST_END   = pd.Timestamp.today().strftime("%Y-%m-%d")
 INITIAL_CAPITAL     = 2_000_000   # 初始资金（元）
 REBALANCE_FREQ      = "ME"        # 调仓频率：ME=月末, W-FRI=每周五
 N_STOCKS            = 30          # 持仓股票数
-COMMISSION_RATE     = 0.001       # 手续费（双边各0.1%）
-SLIPPAGE_RATE       = 0.002       # 滑点估算（中小盘适当调高）
-STAMP_DUTY          = 0.001       # 印花税（卖出方向）
+COMMISSION_RATE     = 0.0001      # 手续费（双边各0.01%）
+SLIPPAGE_RATE       = 0.0         # 手动小仓位操作，市场冲击可忽略
+STAMP_DUTY          = 0.0005      # 印花税（卖出单边0.05%）
 
 # ── 股票池过滤 ────────────────────────────────────────────────────────────────
 MIN_MARKET_CAP      = 20e8        # 最小市值 20亿，过滤壳股
