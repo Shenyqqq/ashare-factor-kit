@@ -444,6 +444,15 @@ def get_factor_registry(
             logger.warning(f"涨跌停因子计算失败: {e}")
 
     registry = {k: v for k, v in registry.items() if v is not None}
+
+    # 将所有因子 reindex 到 prices.index，保证日期维度完全对齐。
+    # margin/moneyflow/northbound 等数据源历史较短，reindex 后缺失日期填 NaN，
+    # 不影响有数据的时段，避免 set.intersection 因日期不重叠返回空集。
+    for name in list(registry.keys()):
+        f = registry[name]
+        if not f.index.equals(prices.index):
+            registry[name] = f.reindex(prices.index)
+
     logger.info(f"因子库就绪: {len(registry)} 个因子")
     return registry
 

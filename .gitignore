@@ -30,3 +30,4 @@ venv/
 *.pdf
 backtest_result*
 tmp_cols.txt
+catboost_info/

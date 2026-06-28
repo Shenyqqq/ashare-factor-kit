@@ -33,12 +33,11 @@ class QuantileResult:
 
 def _get_rebalance_dates(factor_scores: pd.DataFrame,
                          rebalance_freq: str) -> pd.DatetimeIndex:
-    """按频率生成调仓日期"""
+    """按频率生成调仓日期（每个周期的最后一个交易日）"""
     return (
-        pd.Series(index=factor_scores.index, dtype=float)
+        pd.Series(1, index=factor_scores.index)
         .resample(rebalance_freq)
         .last()
-        .dropna()
         .index
         .intersection(factor_scores.index)
     )
@@ -74,11 +73,16 @@ def run_quantile_backtest(
     cost_bps:     单边成本 bp（佣金0.01%+印花税摊半0.025%≈0.035%，即3.5bp）
     """
     # ── 对齐时间范围 ──────────────────────────────────────────────────────────
+    if factor_scores.empty or not isinstance(factor_scores.index, pd.DatetimeIndex):
+        raise ValueError(
+            f"factor_scores 为空或 index 不是 DatetimeIndex（实际 dtype={factor_scores.index.dtype}），"
+            "请检查模型训练是否产生了有效预测"
+        )
     common_dates = prices.index.intersection(factor_scores.index)
     if start:
-        common_dates = common_dates[common_dates >= start]
+        common_dates = common_dates[common_dates >= pd.Timestamp(start)]
     if end:
-        common_dates = common_dates[common_dates <= end]
+        common_dates = common_dates[common_dates <= pd.Timestamp(end)]
 
     prices_aligned = prices.loc[common_dates]
     scores_aligned = factor_scores.loc[common_dates]

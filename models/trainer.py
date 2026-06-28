@@ -29,7 +29,7 @@ from config.settings import PROCESSED_DIR
 
 # ── 超参数（集中配置）────────────────────────────────────────────────────────
 
-TRAIN_WINDOWS_MONTHS = [24, 36, 60]
+TRAIN_WINDOWS_MONTHS = [12, 24, 36]
 VAL_WINDOW_MONTHS    = 6
 TIME_DECAY           = 0.005
 MIN_STOCKS_PER_DATE  = 30
@@ -76,9 +76,13 @@ class MLDataset:
     def get_cross_section(self, date):
         rows = {name: df.loc[date] for name, df in self.factor_panel.items()
                 if date in df.index}
-        if len(rows) != len(self.feature_names):
+        if not rows:
             return None, None
-        X = pd.DataFrame(rows).dropna()
+        # 用 0 填充 NaN（z-score 空间里 0 = 截面中性），避免稀疏因子剔除大量股票
+        X = pd.DataFrame(rows).fillna(0)
+        # 至少要有一个因子有真实值的股票才保留
+        has_data = pd.DataFrame(rows).notna().any(axis=1)
+        X = X.loc[has_data]
         if date not in self.forward_return.index:
             return None, None
         y = self.forward_return.loc[date].reindex(X.index).dropna()
@@ -103,10 +107,20 @@ class MLDataset:
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 
 def build_ml_dataset(factor_dict, forward_return, rebalance_freq=REBALANCE_FREQ):
+    if not factor_dict:
+        raise ValueError("factor_dict 为空，没有任何因子被计算")
     all_dates = sorted(
         set.intersection(*[set(df.index) for df in factor_dict.values()])
         & set(forward_return.index)
     )
+    if not all_dates:
+        ranges = {n: f"[{df.index.min()}, {df.index.max()}]" if len(df) > 0 else "EMPTY"
+                  for n, df in factor_dict.items()}
+        raise ValueError(
+            f"all_dates 为空：各因子日期无公共交集。\n"
+            f"forward_return: [{forward_return.index.min()}, {forward_return.index.max()}]\n"
+            f"各因子范围: {ranges}"
+        )
     rebalance_dates = [
         d for d in pd.date_range(all_dates[0], all_dates[-1], freq=rebalance_freq)
         if d in all_dates
