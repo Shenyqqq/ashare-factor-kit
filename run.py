@@ -46,16 +46,20 @@ def _load_data(skip_download, sample):
         download_main(BACKTEST_START, BACKTEST_END, sample=sample)
     else:
         logger.info("Step 1: 跳过下载（--skip-download）")
-        for p in [PRICES_PATH, PRICES_RAW_PATH, FIN_PATH]:
+        if not PRICES_PATH.exists():
+            raise FileNotFoundError(f"必须文件不存在: {PRICES_PATH}")
+        for p in [PRICES_RAW_PATH, FIN_PATH]:
             if not p.exists():
-                raise FileNotFoundError(f"数据文件不存在: {p}")
+                logger.warning(f"可选文件不存在，对应因子将跳过: {p.name}")
 
     logger.info("Step 2: 加载并清洗数据")
     from data.clean import clean_prices, clean_financial, clean_ohlcv
 
-    prices     = clean_prices(pd.read_parquet(PRICES_PATH),     label="prices_hfq")
-    prices_raw = clean_prices(pd.read_parquet(PRICES_RAW_PATH), label="prices_raw")
-    financial  = clean_financial(pd.read_parquet(FIN_PATH))
+    prices     = clean_prices(pd.read_parquet(PRICES_PATH), label="prices_hfq")
+    prices_raw = (clean_prices(pd.read_parquet(PRICES_RAW_PATH), label="prices_raw")
+                  if PRICES_RAW_PATH.exists() else None)
+    financial  = (clean_financial(pd.read_parquet(FIN_PATH))
+                  if FIN_PATH.exists() else None)
 
     def _load_opt(fname):
         p = RAW_DIR / fname

@@ -1,21 +1,21 @@
 """
 data/download_northbound.py  —  北向资金个股持股数据下载
 
-数据：沪深股通外资对A股各股票的持股量（股）和持股市值（元）
-接口：
-    ak.stock_hsgt_individual_em()  — 个股北向资金持股数据（东财）
-    ak.stock_hsgt_hold_stock_em()  — 沪深港通持股明细（按日期）
-存储：
-    data/raw/northbound_holding.parquet   持股量宽表（index=日期, columns=股票）
-    data/raw/northbound_value.parquet     持股市值宽表
+接口：ak.stock_hsgt_individual_em(symbol)
+      按股票代码拉取沪深股通历史持股数量（全量历史，约从2017年开始）
 
-策略：
-    按日期批量拉取（接口支持按日查询），比逐股拉取效率高得多。
-    历史数据从2016年开始，沪股通2014年，深股通2016年。
+存储：
+    data/raw/northbound_holding.parquet  持股量宽表（index=日期, columns=股票）
+    data/raw/northbound_value.parquet    持股市值宽表
+
+特点：
+  - 逐股拉取，每只股票返回完整历史（约1500-2000行）
+  - 断点续传：已有且数据较新的股票跳过
+  - 只下载沪深股通成分股（600/601/603/605 沪市 + 000/001/002/300 深市中的纳通标的）
 
 用法：
     python -m data.download_northbound
-    python -m data.download_northbound --start 2018-01-01
+    python -m data.download_northbound --sample 20
 """
 import argparse
 import time
@@ -27,126 +27,97 @@ import pandas as pd
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config.settings import RAW_DIR
+from config.settings import RAW_DIR, UNIVERSE_DIR
 
 
-def download_northbound_by_date(
-    start: str,
-    end: str,
-    save_every: int = 60,  # 每60个交易日保存一次
-) -> pd.DataFrame:
-    """
-    按日期逐日拉取北向持股明细，汇总成宽表。
+def _load_existing(path: Path) -> dict:
+    if path.exists():
+        df = pd.read_parquet(path)
+        return {c: df[c].dropna() for c in df.columns}
+    return {}
 
-    接口：ak.stock_hsgt_hold_stock_em(market="北向", date="20231201")
-    返回列：股票代码, 股票名称, 持股数量, 持股市值, 持股数量占A股, 持股市值占总市值
-    """
+
+def download_northbound(codes: list, save_every: int = 100) -> tuple:
     hold_path = RAW_DIR / "northbound_holding.parquet"
     val_path  = RAW_DIR / "northbound_value.parquet"
 
-    # 加载已有数据
-    existing_hold = pd.read_parquet(hold_path) if hold_path.exists() else pd.DataFrame()
-    existing_val  = pd.read_parquet(val_path)  if val_path.exists()  else pd.DataFrame()
+    hold_data = _load_existing(hold_path)
+    val_data  = _load_existing(val_path)
 
-    # 生成待下载日期列表（交易日历）
-    try:
-        cal = ak.tool_trade_date_hist_sina()
-        all_dates = pd.to_datetime(cal["trade_date"])
-    except Exception:
-        all_dates = pd.bdate_range(start, end)
+    # 跳过近30日内已更新的股票
+    cutoff = pd.Timestamp.today() - pd.Timedelta(days=30)
+    need = []
+    for code in codes:
+        s = hold_data.get(code)
+        if s is None or len(s) == 0 or s.index[-1] < cutoff:
+            need.append(code)
 
-    target_dates = all_dates[
-        (all_dates >= pd.Timestamp(start)) &
-        (all_dates <= pd.Timestamp(end))
-    ]
-
-    # 跳过已有的日期
-    if not existing_hold.empty:
-        done_dates = set(existing_hold.index)
-        target_dates = [d for d in target_dates if d not in done_dates]
-
-    if not target_dates:
+    if not need:
         logger.info("北向资金数据已是最新，跳过")
-        return existing_hold
+        return pd.DataFrame(hold_data), pd.DataFrame(val_data)
 
-    logger.info(f"北向资金: 需下载 {len(target_dates)} 个交易日")
-    hold_records = {}
-    val_records  = {}
+    logger.info(f"北向资金: 需下载 {len(need)}/{len(codes)} 只")
     failed = []
 
-    for i, date in enumerate(target_dates):
-        date_str = date.strftime("%Y%m%d")
+    for i, code in enumerate(need):
         try:
-            df = ak.stock_hsgt_hold_stock_em(market="北向", date=date_str)
+            df = ak.stock_hsgt_individual_em(symbol=code)
             if df is None or df.empty:
                 continue
 
-            df.columns = [c.strip() for c in df.columns]
-            code_col = [c for c in df.columns if "代码" in c or "股票代码" in c]
-            hold_col = [c for c in df.columns if "持股数量" in c and "占" not in c]
-            val_col  = [c for c in df.columns if "持股市值" in c and "占" not in c]
+            # 列顺序固定：持股日期, 收盘价, 涨跌幅, 持股数量, 持股市值, 持股占A股%, 当日增减, 当日净买入, 近一周持股市值变化
+            df.columns = ["date", "close", "pct_chg", "holding",
+                          "value", "hold_pct", "chg", "net_buy", "weekly_chg"]
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()
 
-            if not code_col:
-                logger.debug(f"{date_str} 列名: {list(df.columns)}")
-                continue
+            hold_s = pd.to_numeric(df["holding"], errors="coerce")
+            val_s  = pd.to_numeric(df["value"],   errors="coerce")
 
-            df["code"] = df[code_col[0]].astype(str).str.zfill(6)
-            df = df.set_index("code")
+            for data_dict, s in [(hold_data, hold_s), (val_data, val_s)]:
+                existing = data_dict.get(code)
+                if existing is not None and len(existing) > 0:
+                    combined = pd.concat([existing, s])
+                    data_dict[code] = combined[~combined.index.duplicated(keep="last")].sort_index()
+                else:
+                    data_dict[code] = s
 
-            if hold_col:
-                s = pd.to_numeric(df[hold_col[0]], errors="coerce")
-                hold_records[date] = s
-            if val_col:
-                s = pd.to_numeric(df[val_col[0]], errors="coerce")
-                val_records[date] = s
-
-            time.sleep(0.3)
+            time.sleep(0.2)
 
         except Exception as e:
-            logger.warning(f"北向资金失败 {date_str}: {e}")
-            failed.append(date_str)
+            logger.warning(f"北向资金失败 {code}: {e}")
+            failed.append(code)
 
         if (i + 1) % save_every == 0:
-            logger.info(f"进度 {i+1}/{len(target_dates)}")
-            _merge_and_save(hold_records, val_records, existing_hold, existing_val,
-                            hold_path, val_path)
+            logger.info(f"进度 {i+1}/{len(need)}")
+            _save(hold_data, val_data, hold_path, val_path)
 
     if failed:
-        logger.warning(f"失败 {len(failed)} 个日期: {failed[:5]}")
+        logger.warning(f"失败 {len(failed)} 只: {failed[:10]}")
 
-    return _merge_and_save(hold_records, val_records, existing_hold, existing_val,
-                           hold_path, val_path)
+    return _save(hold_data, val_data, hold_path, val_path)
 
 
-def _merge_and_save(hold_new, val_new, existing_hold, existing_val, hold_path, val_path):
-    def _merge(new_dict, existing):
-        if not new_dict:
-            return existing
-        new_df = pd.DataFrame(new_dict).T.sort_index()  # (date, stock)
-        new_df.index = pd.to_datetime(new_df.index)
-        if existing.empty:
-            result = new_df
-        else:
-            result = pd.concat([existing, new_df])
-            result = result[~result.index.duplicated(keep="last")].sort_index()
-        return result
-
-    hold_df = _merge(hold_new, existing_hold)
-    val_df  = _merge(val_new,  existing_val)
+def _save(hold_data, val_data, hold_path, val_path):
+    hold_df = pd.DataFrame(hold_data).sort_index()
+    val_df  = pd.DataFrame(val_data).sort_index()
     hold_df.to_parquet(hold_path)
     val_df.to_parquet(val_path)
     logger.info(f"北向资金保存: holding={hold_df.shape}, value={val_df.shape}")
-    return hold_df
+    return hold_df, val_df
 
 
-def main(start: str, end: str):
+def main(sample: int = 0):
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    download_northbound_by_date(start, end)
+    universe = pd.read_parquet(UNIVERSE_DIR / "stock_list.parquet")
+    codes = universe["code"].tolist()
+    if sample:
+        codes = codes[:sample]
+    download_northbound(codes)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start", default="2018-01-01")
-    parser.add_argument("--end",   default=pd.Timestamp.today().strftime("%Y-%m-%d"))
+    parser.add_argument("--sample", type=int, default=0)
     args = parser.parse_args()
-    main(args.start, args.end)
+    main(args.sample)

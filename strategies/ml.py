@@ -34,7 +34,15 @@ def build_factor_dataset(
     institution: pd.DataFrame = None,
     hold_period: int = 20,
 ):
-    """构建 MLDataset，供 IndustryWalkForwardTrainer 等复用"""
+    """
+    构建 MLDataset，供 IndustryWalkForwardTrainer 等复用。
+
+    forward_return 定义：
+        有 open_（次日开盘价）时 → close[t+N] / open[t+1] - 1
+            即信号日收盘后，次日开盘买入，持有 N 日到收盘卖出的真实收益。
+            这与实盘执行完全一致（次日开盘手动买入）。
+        无 open_ 时 → close[t+N] / close[t] - 1（退化为收收收益，含隔夜跳空）
+    """
     registry = get_factor_registry(
         prices=prices, financial=financial,
         prices_raw=prices_raw, volume=volume, amount=amount,
@@ -44,7 +52,13 @@ def build_factor_dataset(
         margin=margin, moneyflow=moneyflow,
         northbound=northbound, institution=institution,
     )
-    forward_return = prices.pct_change(hold_period).shift(-hold_period)
+    if open_ is not None:
+        # 买入价 = 次日开盘，卖出价 = N 日后收盘
+        buy_price  = open_.shift(-1)                  # open[t+1]
+        sell_price = prices.shift(-hold_period)        # close[t+N]
+        forward_return = sell_price / buy_price.replace(0, float("nan")) - 1
+    else:
+        forward_return = prices.pct_change(hold_period).shift(-hold_period)
     return build_ml_dataset(registry, forward_return)
 
 
@@ -96,8 +110,13 @@ def run(
     )
     logger.info(f"ML 策略使用 {len(registry)} 个因子，模型={model_types}")
 
-    # 2. 构建数据集
-    forward_return = prices.pct_change(hold_period).shift(-hold_period)
+    # 2. 构建数据集（forward_return 从次日开盘算起，与实盘执行一致）
+    if open_ is not None:
+        buy_price  = open_.shift(-1)
+        sell_price = prices.shift(-hold_period)
+        forward_return = sell_price / buy_price.replace(0, float("nan")) - 1
+    else:
+        forward_return = prices.pct_change(hold_period).shift(-hold_period)
     dataset = build_ml_dataset(registry, forward_return)
 
     # 3. Walk-Forward 训练

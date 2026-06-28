@@ -1,13 +1,17 @@
 """
 data/download_margin.py  —  融资余额数据下载
 
-数据：沪深两市各股票的融资余额（元）
-接口：ak.stock_margin_detail_em()  东财个股融资融券数据
-存储：data/raw/margin_balance.parquet  (宽表: index=日期, columns=股票)
+接口：
+    ak.stock_margin_detail_sse(date)   沪市个股融资明细（按日期）
+    ak.stock_margin_detail_szse(date)  深市个股融资明细（按日期）
+存储：
+    data/raw/margin_balance.parquet   融资余额宽表（index=日期, columns=股票代码）
+
+策略：按交易日逐日拉取沪深两市，合并后存宽表，支持断点续传。
 
 用法：
     python -m data.download_margin
-    python -m data.download_margin --start 2020-01-01 --sample 200
+    python -m data.download_margin --start 2020-01-01
 """
 import argparse
 import time
@@ -19,111 +23,104 @@ import pandas as pd
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config.settings import RAW_DIR, UNIVERSE_DIR
+from config.settings import RAW_DIR
 
 
-def _load_existing(path: Path) -> dict:
-    if path.exists():
-        df = pd.read_parquet(path)
-        return {c: df[c].dropna() for c in df.columns}
-    return {}
+def _load_existing(path: Path) -> pd.DataFrame:
+    return pd.read_parquet(path) if path.exists() else pd.DataFrame()
 
 
-def download_margin(
-    codes: list,
-    start: str,
-    end: str,
-    save_every: int = 100,
-) -> pd.DataFrame:
-    """
-    逐股下载融资余额，保存宽表parquet。
-    断点续传：已有且数据较新的股票直接跳过。
-    """
+def download_margin(start: str, end: str, save_every: int = 60) -> pd.DataFrame:
     out_path = RAW_DIR / "margin_balance.parquet"
-    data = _load_existing(out_path)
+    existing = _load_existing(out_path)
 
-    last_trade = pd.Timestamp(end)
-    need = []
-    for code in codes:
-        s = data.get(code)
-        if s is None or len(s) == 0 or s.index[-1] < last_trade - pd.Timedelta(days=10):
-            need.append(code)
+    # 生成目标交易日列表
+    try:
+        cal = ak.tool_trade_date_hist_sina()
+        all_dates = pd.to_datetime(cal["trade_date"])
+    except Exception:
+        all_dates = pd.bdate_range(start, end)
 
+    target_dates = all_dates[
+        (all_dates >= pd.Timestamp(start)) &
+        (all_dates <= pd.Timestamp(end))
+    ]
+
+    done = set(existing.index) if not existing.empty else set()
+    need = [d for d in target_dates if d not in done]
     if not need:
         logger.info("融资余额数据已是最新，跳过")
-        return pd.DataFrame(data).sort_index()
+        return existing
 
-    logger.info(f"融资余额: 需下载 {len(need)}/{len(codes)} 只")
+    logger.info(f"融资余额: 需下载 {len(need)} 个交易日")
+    records = {}
     failed = []
 
-    for i, code in enumerate(need):
+    for i, date in enumerate(need):
+        date_str = date.strftime("%Y%m%d")
         try:
-            df = ak.stock_margin_detail_em(symbol=code)
-            if df is None or df.empty:
-                failed.append(code)
-                continue
+            sh = ak.stock_margin_detail_sse(date=date_str)
+            sz = ak.stock_margin_detail_szse(date=date_str)
 
-            # 东财接口列名：'日期', '融资余额', '融资买入额', ...
-            date_col = [c for c in df.columns if "日期" in c or "date" in c.lower()]
-            bal_col  = [c for c in df.columns if "融资余额" in c]
+            # 沪市：列顺序固定，取代码和融资余额
+            # cols: 交易日期, 证券代码, 证券名称, 融资余额, 融资买入额, 融资偿还额, 融券余量, 融券余量金额, 融券偿还量
+            sh_code = sh.columns[1]
+            sh_bal  = sh.columns[3]
+            sh_s = sh[[sh_code, sh_bal]].copy()
+            sh_s.columns = ["code", "balance"]
+            sh_s["code"] = sh_s["code"].astype(str).str.zfill(6)
 
-            if not date_col or not bal_col:
-                logger.debug(f"{code} 列名: {list(df.columns)}")
-                failed.append(code)
-                continue
+            # 深市：列顺序固定，取代码和融资余额
+            # cols: 证券代码, 证券名称, 融资余额, 融资买入额, 融券余量金额, 融券余量, 融券卖出额, 融资融券余额
+            sz_code = sz.columns[0]
+            sz_bal  = sz.columns[2]
+            sz_s = sz[[sz_code, sz_bal]].copy()
+            sz_s.columns = ["code", "balance"]
+            sz_s["code"] = sz_s["code"].astype(str).str.zfill(6)
 
-            df = df[[date_col[0], bal_col[0]]].copy()
-            df.columns = ["date", "margin_balance"]
-            df["date"] = pd.to_datetime(df["date"])
-            df = df.set_index("date").sort_index()
+            combined = pd.concat([sh_s, sz_s], ignore_index=True)
+            combined["balance"] = pd.to_numeric(combined["balance"], errors="coerce")
+            records[date] = combined.set_index("code")["balance"]
 
-            # 过滤日期范围
-            df = df.loc[start:end, "margin_balance"]
-            df = pd.to_numeric(df, errors="coerce")
-
-            existing = data.get(code)
-            if existing is not None and len(existing) > 0:
-                combined = pd.concat([existing, df])
-                data[code] = combined[~combined.index.duplicated(keep="last")].sort_index()
-            else:
-                data[code] = df
-
-            time.sleep(0.15)
+            time.sleep(0.5)
 
         except Exception as e:
-            logger.warning(f"融资余额失败 {code}: {e}")
-            failed.append(code)
+            logger.warning(f"融资余额失败 {date_str}: {e}")
+            failed.append(date_str)
 
         if (i + 1) % save_every == 0:
-            logger.info(f"进度 {i+1}/{len(need)}，保存中间结果...")
-            _save(data, out_path)
+            logger.info(f"进度 {i+1}/{len(need)}")
+            _merge_and_save(records, existing, out_path)
 
     if failed:
-        logger.warning(f"失败 {len(failed)} 只: {failed[:10]}")
+        logger.warning(f"失败 {len(failed)} 个日期: {failed[:5]}")
 
-    return _save(data, out_path)
-
-
-def _save(data: dict, path: Path) -> pd.DataFrame:
-    df = pd.DataFrame(data).sort_index()
-    df.to_parquet(path)
-    logger.info(f"融资余额保存: {path.name}, shape={df.shape}")
-    return df
+    return _merge_and_save(records, existing, out_path)
 
 
-def main(start: str, end: str, sample: int = 0):
+def _merge_and_save(new_records: dict, existing: pd.DataFrame, path: Path) -> pd.DataFrame:
+    if not new_records:
+        return existing
+    new_df = pd.DataFrame(new_records).T.sort_index()
+    new_df.index = pd.to_datetime(new_df.index)
+    if not existing.empty:
+        result = pd.concat([existing, new_df])
+        result = result[~result.index.duplicated(keep="last")].sort_index()
+    else:
+        result = new_df
+    result.to_parquet(path)
+    logger.info(f"融资余额保存: shape={result.shape}")
+    return result
+
+
+def main(start: str, end: str):
     RAW_DIR.mkdir(parents=True, exist_ok=True)
-    universe = pd.read_parquet(UNIVERSE_DIR / "stock_list.parquet")
-    codes = universe["code"].tolist()
-    if sample:
-        codes = codes[:sample]
-    download_margin(codes, start, end)
+    download_margin(start, end)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--start",  default="2018-01-01")
-    parser.add_argument("--end",    default=pd.Timestamp.today().strftime("%Y-%m-%d"))
-    parser.add_argument("--sample", type=int, default=0)
+    parser.add_argument("--start", default="2018-01-01")
+    parser.add_argument("--end",   default=pd.Timestamp.today().strftime("%Y-%m-%d"))
     args = parser.parse_args()
-    main(args.start, args.end, args.sample)
+    main(args.start, args.end)
