@@ -158,8 +158,10 @@ class MLAnalyzer:
         X_np = X_sample.values[:sample_size]
 
         if model_type == "ridge":
+            # build_model 对 ridge 返回裸 Ridge（无 Pipeline），直接访问 coef_
+            coef_arr = model.coef_ if hasattr(model, "coef_") else model.named_steps["model"].coef_
             coef = pd.Series(
-                np.abs(model.named_steps["model"].coef_),
+                np.abs(coef_arr),
                 index=feature_names
             ).sort_values(ascending=True)
             fig, ax = plt.subplots(figsize=(8, max(4, len(coef) * 0.4)))
@@ -200,7 +202,9 @@ class MLAnalyzer:
                 continue
             try:
                 if model_type == "ridge":
-                    imp = np.abs(model.named_steps["model"].coef_)
+                    # ridge 为裸 Ridge 对象（无 Pipeline），直接访问 coef_
+                    coef_arr = model.coef_ if hasattr(model, "coef_") else model.named_steps["model"].coef_
+                    imp = np.abs(coef_arr)
                 elif model_type in ("lgbm", "xgb"):
                     imp = model.feature_importances_
                 elif model_type == "cat":
@@ -223,6 +227,94 @@ class MLAnalyzer:
         plt.tight_layout()
         plt.show()
 
+    def plot_clustered_importance(
+        self,
+        model_type="lgbm",
+        window=None,
+        correlation_threshold: float = 0.7,
+        n_repeats_cluster: int = 10,
+        n_repeats_intra: int = 5,
+        sample_size: int = 2000,
+    ):
+        """
+        AFML Ch6 Clustered Feature Importance：先按相关性聚类，再按簇做 MDA，
+        簇内单特征再分配重要性。避免相关因子重要性分裂被误删。
+
+        在最后一个调仓日的截面 + 最近训练窗口的模型上评估。
+        """
+        from models.wf.clustered_importance import compute_clustered_importance
+
+        if window is None:
+            window = self.trainer.train_windows[-1]
+        model = self.trainer.models.get((window, model_type))
+        if model is None:
+            logger.warning(f"找不到模型 ({model_type}, window={window})")
+            return
+
+        feature_names = self.trainer._dataset.feature_names
+        last_date = self.trainer._dataset.rebalance_dates[-1]
+        X_sample, y_sample = self.trainer._dataset.get_cross_section(last_date)
+        if X_sample is None or y_sample is None:
+            logger.warning("无可用截面数据评估 clustered importance")
+            return
+
+        X_sample = X_sample.iloc[:sample_size]
+        y_sample = y_sample.iloc[:sample_size]
+        # 对齐特征列名（与训练时一致）
+        X_sample = X_sample[feature_names]
+
+        try:
+            df = compute_clustered_importance(
+                model, X_sample, y_sample,
+                correlation_threshold=correlation_threshold,
+                n_repeats_cluster=n_repeats_cluster,
+                n_repeats_intra=n_repeats_intra,
+                scoring="ic",
+            )
+        except Exception as e:
+            logger.warning(f"Clustered importance 计算失败: {e}")
+            return
+
+        if df.empty:
+            logger.warning("Clustered importance 结果为空")
+            return
+
+        fig, axes = plt.subplots(1, 2, figsize=(15, max(4, len(df) * 0.35)))
+        fig.suptitle(
+            f"Clustered Feature Importance（AFML Ch6, {model_type}, "
+            f"thresh={correlation_threshold})",
+            fontsize=11,
+        )
+
+        # 左：簇级重要性
+        clu = (df.groupby("cluster", as_index=False)
+                 .agg(cluster_importance=("cluster_importance", "first"),
+                      n_features=("feature", "count"))
+                 .sort_values("cluster_importance", ascending=True))
+        ax = axes[0]
+        ax.barh(clu["cluster"], clu["cluster_importance"],
+                color="steelblue", edgecolor="white")
+        for y, (imp, n) in zip(clu["cluster"],
+                               zip(clu["cluster_importance"], clu["n_features"])):
+            ax.text(imp, y, f" n={n}", va="center", fontsize=8, color="gray")
+        ax.set_title("簇级 MDA 重要性（IC 下降量）")
+        ax.set_xlabel("importance (Δ IC)")
+        ax.grid(alpha=0.3, axis="x")
+
+        # 右：单特征再分配后总重要性
+        ax = axes[1]
+        sub = df.sort_values("total_importance", ascending=True)
+        colors = plt.cm.tab20(sub["cluster"].astype("category").cat.codes / max(1, len(clu)))
+        ax.barh(sub["feature"], sub["total_importance"], color=colors, edgecolor="white")
+        ax.set_title("单特征总重要性（簇内再分配）")
+        ax.set_xlabel("total importance")
+        ax.grid(alpha=0.3, axis="x")
+
+        plt.tight_layout()
+        plt.show()
+        print(df.to_string(index=False))
+        return df
+
     def full_report(self, prices, benchmark=None):
         self.plot_ic()
         self.plot_model_comparison()
@@ -230,3 +322,4 @@ class MLAnalyzer:
         self.plot_feature_importance()
         self.plot_shap(model_type="lgbm")
         self.plot_shap(model_type="ridge")
+        self.plot_clustered_importance(model_type="lgbm")

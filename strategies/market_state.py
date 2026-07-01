@@ -32,9 +32,12 @@ from config.settings import RAW_DIR
 
 STATE_PATH = RAW_DIR / "market_state.parquet"
 INDEX_PATH = RAW_DIR / "csi300.parquet"
+CSI_ALL_PATH = RAW_DIR / "csi_all.parquet"
 
 # 沪深300 AKShare symbol
 CSI300_SYMBOL = "sh000300"
+# 中证全指 AKShare symbol（覆盖全A股，更适合做市场组合代理）
+CSI_ALL_SYMBOL = "sh000985"
 
 
 # ── 数据获取 ──────────────────────────────────────────────────────────────────
@@ -50,8 +53,12 @@ def download_csi300(start: str = "2017-01-01",
     import akshare as ak
     from loguru import logger
 
-    logger.info("下载沪深300指数...")
-    df = ak.stock_zh_index_daily(symbol=CSI300_SYMBOL)
+    logger.info("下载沪深300指数(sh000300)...")
+    # 优先东方财富源（数据更新），失败回退到原源
+    try:
+        df = ak.stock_zh_index_daily_em(symbol=CSI300_SYMBOL)
+    except Exception:
+        df = ak.stock_zh_index_daily(symbol=CSI300_SYMBOL)
     df.index = pd.to_datetime(df["date"])
     df = df.sort_index()
 
@@ -62,6 +69,41 @@ def download_csi300(start: str = "2017-01-01",
 
     INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
     df[["open", "high", "low", "close", "volume"]].to_parquet(INDEX_PATH)
+    return df["close"]
+
+
+def download_csi_all(start: str = "2017-01-01",
+                     end: str = None,
+                     force: bool = False) -> pd.Series:
+    """
+    下载中证全指日收盘价，缓存到 data/raw/csi_all.parquet。
+
+    中证全指（000985）覆盖全A股，比沪深300（大盘股）更适合做市场组合代理，
+    用于 IVOL / Barra beta 等需要市场收益的因子。
+    """
+    if CSI_ALL_PATH.exists() and not force:
+        series = pd.read_parquet(CSI_ALL_PATH)["close"]
+        return series
+
+    import akshare as ak
+    from loguru import logger
+
+    logger.info("下载中证全指指数(sh000985)...")
+    # 优先东方财富源（数据更新），失败回退到原源
+    try:
+        df = ak.stock_zh_index_daily_em(symbol=CSI_ALL_SYMBOL)
+    except Exception:
+        df = ak.stock_zh_index_daily(symbol=CSI_ALL_SYMBOL)
+    df.index = pd.to_datetime(df["date"])
+    df = df.sort_index()
+
+    if start:
+        df = df[df.index >= start]
+    if end:
+        df = df[df.index <= end]
+
+    CSI_ALL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df[["open", "high", "low", "close", "volume"]].to_parquet(CSI_ALL_PATH)
     return df["close"]
 
 
@@ -281,7 +323,10 @@ def ic_by_state(factor: pd.DataFrame,
 
 
 if __name__ == "__main__":
-    print("下载并计算市场状态...")
+    print("下载中证全指与沪深300指数...")
+    # 中证全指用于 IVOL / Barra beta 等市场组合代理
+    close_all = download_csi_all(force=False)
+    # 沪深300用于市场状态计算（保持原行为）
     close = download_csi300(force=False)
     state = compute_market_state(close, method="ma")
 

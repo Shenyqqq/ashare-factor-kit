@@ -37,6 +37,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import RAW_DIR, PROCESSED_DIR
+from utils.pit_align import pit_pivot_ffill, pit_reindex_ffill
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -49,7 +50,7 @@ def cross_sectional_zscore(df: pd.DataFrame, clip: float = 3.0) -> pd.DataFrame:
         np.clip(scipy_zscore(row.dropna()), -clip, clip),
         index=row.dropna().index
     ), axis=1)
-    return result
+    return result.astype(np.float32)
 
 
 def winsorize(df: pd.DataFrame, pct: float = 0.01) -> pd.DataFrame:
@@ -58,7 +59,7 @@ def winsorize(df: pd.DataFrame, pct: float = 0.01) -> pd.DataFrame:
         lo = row.quantile(pct)
         hi = row.quantile(1 - pct)
         return row.clip(lo, hi)
-    return df.apply(_win, axis=1)
+    return df.apply(_win, axis=1).astype(np.float32)
 
 
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -68,9 +69,17 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 
 def _pivot_financial(financial: pd.DataFrame, col: str,
                      prices: pd.DataFrame) -> pd.DataFrame:
-    """将长表财务数据透视并前向填充到日频"""
-    pivot = financial.pivot_table(index="trade_date", columns="code", values=col)
-    return pivot.reindex(prices.index, method="ffill")
+    """
+    将长表财务数据透视并前向填充到日频（PIT 安全）。
+
+    把报告期 trade_date 按 A 股法定披露窗口（Q1/Q3 +45 天，半年报 +75 天，
+    年报 +120 天）平移到「可用日下界」后再 pivot + ffill，
+    消除用报告期日做 ffill 起点的 look-ahead bias。
+    详见 utils/pit_align.py。
+    """
+    return pit_pivot_ffill(
+        financial, prices.index, date_col="trade_date", value_cols=[col],
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -191,6 +200,36 @@ def factor_price_to_high(prices: pd.DataFrame, window: int = 52) -> pd.DataFrame
     return _normalize(ratio)
 
 
+def factor_frac_diff_momentum(prices: pd.DataFrame, d: float = 0.4,
+                              window: int = 20,
+                              threshold: float = 1e-5) -> pd.DataFrame:
+    """
+    分数差分动量因子（AFML Ch5）。
+
+    用 d∈(0,1) 部分差分价格序列，保留长期记忆同时使序列平稳，
+    再取过去 window 日的差分值变化（动量信号）做截面 z-score。
+
+    相比 pct_change（d=1 完全差分，丢失长期记忆），d=0.4 的分数差分
+    能保留 AI 主题等股票的长期趋势信息，对动量/反转因子尤其重要。
+
+    参数
+    ----
+    prices    : 后复权收盘价宽表
+    d         : 分数差分阶数，默认 0.4（AFML 实证常用 0.3-0.5）
+    window    : 动量窗口，默认 20 日；对差分后序列取 window 日变化
+    threshold : 权重截断阈值，|w_k| < threshold 时停止扩展权重
+
+    输出：截面 z-score 化的分数差分动量（越高越好）
+    """
+    from utils.fractional_diff import frac_diff_ffd
+
+    fd = frac_diff_ffd(prices, d=d, threshold=threshold)
+    # 取过去 window 日的分数差分变化作为动量信号
+    # fd 已是平稳化的"价格水平"信号，window 日变化 = fd - fd.shift(window)
+    mom = fd - fd.shift(window)
+    return _normalize(mom)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 财务类因子（需要 financial 数据）
 # ══════════════════════════════════════════════════════════════════════════════
@@ -241,13 +280,15 @@ def factor_quality_roe_chg(financial: pd.DataFrame,
     """
     质量因子：ROE 季度环比变化（ROE改善信号）。
     ROE在提升的公司，往往伴随盈利能力改善，预示未来超额收益。
-    用季报数据做差分，前向填充到日频。
+    用季报数据做差分，前向填充到日频（PIT 安全：报告期按法定披露窗口
+    平移后再 ffill）。
     """
     roe_pivot = financial.pivot_table(
         index="trade_date", columns="code", values="roe"
     )
+    roe_pivot.index = pd.to_datetime(roe_pivot.index)
     roe_chg = roe_pivot.diff(1)  # 季度环比变化
-    roe_chg = roe_chg.reindex(prices.index, method="ffill")
+    roe_chg = pit_reindex_ffill(roe_chg, prices.index)
     return _normalize(roe_chg)
 
 
@@ -270,6 +311,7 @@ def factor_quality_gpm_chg(financial: pd.DataFrame,
     """
     质量因子：毛利率季度环比变化。
     毛利率改善是上游成本下降或产品提价的信号。
+    PIT 安全：报告期按法定披露窗口平移后再 ffill。
     """
     if "gross_profit_margin" not in financial.columns:
         logger.warning("财务数据中无 gross_profit_margin 列，factor_quality_gpm_chg 跳过")
@@ -277,8 +319,9 @@ def factor_quality_gpm_chg(financial: pd.DataFrame,
     gpm_pivot = financial.pivot_table(
         index="trade_date", columns="code", values="gross_profit_margin"
     )
+    gpm_pivot.index = pd.to_datetime(gpm_pivot.index)
     gpm_chg = gpm_pivot.diff(1)
-    gpm_chg = gpm_chg.reindex(prices.index, method="ffill")
+    gpm_chg = pit_reindex_ffill(gpm_chg, prices.index)
     return _normalize(gpm_chg)
 
 
@@ -338,6 +381,130 @@ def factor_leverage(financial: pd.DataFrame,
 # 因子注册表（供 notebook 和 run() 使用）
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _fit_hmm_regime(idx_ret: pd.Series, n_states: int = 3) -> pd.DataFrame:
+    """
+    用 GaussianHMM 从指数日收益率序列识别市场隐藏状态，返回各状态的后验概率。
+
+    n_states=3: 强势/震荡/弱势三状态，比二状态更能区分 A 股牛快熊慢的特征。
+    状态按均值收益率排序后重新标记: 强势=idx 0, 震荡=idx 1, 弱势=idx 2。
+
+    输出列: ['HMM_强势概率', 'HMM_弱势概率']（丢弃震荡，三列加和=1 线性相关）
+    """
+    from hmmlearn import hmm as _hmm
+
+    returns = idx_ret.fillna(0).values.reshape(-1, 1)
+
+    model = _hmm.GaussianHMM(
+        n_components=n_states,
+        covariance_type="full",
+        n_iter=200,
+        random_state=42,
+    )
+    model.fit(returns)
+
+    # 后验概率矩阵，shape=(T, n_states)
+    probs = model.predict_proba(returns)  # (T, 3)
+
+    # 按各状态均值收益率排序：最高均值=强势(0)，最低=弱势(2)
+    means = model.means_.flatten()
+    order = np.argsort(means)[::-1]   # 降序：强势 → 震荡 → 弱势
+    probs = probs[:, order]
+
+    df = pd.DataFrame(probs, index=idx_ret.index,
+                      columns=["HMM_强势概率", "HMM_震荡概率", "HMM_弱势概率"])
+    return df[["HMM_强势概率", "HMM_弱势概率"]]  # 丢弃震荡（线性相关）
+
+
+def _market_regime_features(market_prices: pd.DataFrame,
+                             prices: pd.DataFrame) -> dict:
+    """
+    市场状态特征：截面内所有股票相同值，帮助树模型感知宏观 regime。
+
+    不做截面 zscore（截面内同值 → zscore=0），改用时序滚动标准化。
+    shift(1) 避免前视偏差（今天的特征用昨天的市场数据）。
+
+    特征列表（共7个）：
+      - 市场动量_20d/60d/120d  : 多周期趋势，时序zscore
+      - 市场波动率_20d         : 恐慌/风险偏好信号，时序zscore
+      - 市场MA偏离_60d         : 连续版牛熊程度，时序zscore
+      - HMM_强势概率           : GaussianHMM 3态强势状态后验概率（数据驱动）
+      - HMM_弱势概率           : GaussianHMM 3态弱势状态后验概率
+    """
+    idx = market_prices.iloc[:, 0].reindex(prices.index, method="ffill")
+    idx_ret = idx.pct_change()
+
+    def _ts_norm(s: pd.Series, window: int = 252) -> pd.Series:
+        mu  = s.rolling(window, min_periods=60).mean()
+        sig = s.rolling(window, min_periods=60).std().replace(0, np.nan)
+        return ((s - mu) / sig).clip(-3, 3)
+
+    def _broadcast(s: pd.Series) -> pd.DataFrame:
+        arr = s.shift(1).reindex(prices.index).values.reshape(-1, 1)
+        return pd.DataFrame(
+            np.repeat(arr, len(prices.columns), axis=1),
+            index=prices.index, columns=prices.columns
+        )
+
+    features = {}
+
+    # 连续型技术特征
+    for w in [20, 60, 120]:
+        features[f"市场动量_{w}d"] = _broadcast(_ts_norm(idx.pct_change(w)))
+    features["市场波动率_20d"] = _broadcast(_ts_norm(idx_ret.rolling(20).std()))
+    ma60 = idx.rolling(60).mean()
+    features["市场MA偏离_60d"] = _broadcast(_ts_norm(idx / ma60.replace(0, np.nan) - 1))
+
+    # HMM 数据驱动状态概率（替代均线规则的离散状态）
+    try:
+        hmm_probs = _fit_hmm_regime(idx_ret)
+        for col in hmm_probs.columns:
+            features[col] = _broadcast(hmm_probs[col])
+        logger.info(f"HMM 市场状态拟合完成，样本={len(idx_ret)}条")
+    except Exception as e:
+        logger.warning(f"HMM 拟合失败，跳过: {e}")
+
+    return features
+
+
+def _is_regime_factor(name: str) -> bool:
+    return name.startswith("市场") or name.startswith("HMM_")
+
+
+def _want_factor(name: str, factor_names: set | None) -> bool:
+    if factor_names is None:
+        return True
+    return name in factor_names or _is_regime_factor(name)
+
+
+def _section_needed(candidates: frozenset, factor_names: set | None) -> bool:
+    if factor_names is None:
+        return True
+    return bool(factor_names & candidates)
+
+
+_PRICE_FACTOR_NAMES = frozenset({
+    "动量_3d", "动量_10d", "动量_20d", "动量_40d", "动量_60d", "动量_120d", "动量_skip",
+    "反转_3d", "反转_5d", "反转_10d", "反转_20d",
+    "波动率_20d", "波动率_60d", "52周新高", "换手率_20d", "Amihud_20d", "振幅_20d",
+    "分数差分动量_20d",
+})
+_FIN_FACTOR_NAMES = frozenset({
+    "价值_PB", "价值_EP", "质量_ROE", "质量_ROE变化", "规模", "杠杆",
+    "质量_毛利率", "质量_毛利率变化", "质量_应计项目",
+})
+_ALPHA2_FACTOR_NAMES = frozenset({
+    "行业动量_20d", "特质波动率_60d", "融资余额变化_20d",
+    "大单净流入_5d", "北向持股变化_20d", "机构持仓变化",
+})
+_TECH_FACTOR_NAMES = frozenset({
+    "BIAS_5d", "BIAS_20d", "PSY_12d", "AR_26d", "BR_26d",
+    "换手率加速度", "换手率行业中性_20d", "行业相对强度_20d",
+})
+_LIMIT_FACTOR_NAMES = frozenset({
+    "涨停强度_20d", "跌停弱势_20d", "连板数", "涨跌停净强度_20d", "开板反转_5d",
+})
+
+
 def get_factor_registry(
     prices: pd.DataFrame,
     financial: pd.DataFrame,
@@ -355,10 +522,13 @@ def get_factor_registry(
     moneyflow: pd.DataFrame = None,
     northbound: pd.DataFrame = None,
     institution: pd.DataFrame = None,
+    factor_names: list | set | None = None,
 ) -> dict:
     """
     返回所有可计算因子的字典 {因子名: DataFrame}。
     根据传入的数据自动跳过缺少数据源的因子。
+
+    factor_names: 仅计算指定因子 + 市场/HMM regime 特征；None 表示全量计算。
 
     prices:     后复权收盘价（必须）
     financial:  财务季报数据（可选）
@@ -370,75 +540,146 @@ def get_factor_registry(
     masks:      涨跌停 mask dict，由 clean.clean_ohlcv() 生成（强烈建议传入）
     market_prices/industry_map/margin/moneyflow/northbound/institution: 可选 Alpha 数据源
     """
+    fn_set = set(factor_names) if factor_names is not None else None
     registry = {}
 
     # ── 价格/动量类（全部传入 clean_ret，有则用，无则自动回退）──
-    registry["动量_20d"]   = factor_momentum(prices, 20,  clean_ret)
-    registry["动量_60d"]   = factor_momentum(prices, 60,  clean_ret)
-    registry["动量_120d"]  = factor_momentum(prices, 120, clean_ret)
-    registry["动量_skip"]  = factor_momentum_skip(prices, 240, 20, clean_ret)
-    registry["反转_5d"]    = factor_reversal(prices, 5,   clean_ret)
-    registry["反转_20d"]   = factor_reversal(prices, 20,  clean_ret)
-    registry["波动率_20d"] = factor_volatility(prices, 20, clean_ret)
-    registry["波动率_60d"] = factor_volatility(prices, 60, clean_ret)
-    registry["52周新高"]   = factor_price_to_high(prices, 52 * 5)
-
-    if volume is not None:
-        registry["换手率_20d"] = factor_turnover(volume, 20)
-
-    if amount is not None:
-        registry["Amihud_20d"] = factor_amihud(prices, amount, 20, clean_ret)
-
-    if high is not None and low is not None:
-        registry["振幅_20d"] = factor_high_low(prices, high, low, 20, masks)
+    if _section_needed(_PRICE_FACTOR_NAMES, fn_set):
+        if _want_factor("动量_3d", fn_set):
+            registry["动量_3d"] = factor_momentum(prices, 3, clean_ret)
+        if _want_factor("动量_10d", fn_set):
+            registry["动量_10d"] = factor_momentum(prices, 10, clean_ret)
+        if _want_factor("动量_20d", fn_set):
+            registry["动量_20d"] = factor_momentum(prices, 20, clean_ret)
+        if _want_factor("动量_40d", fn_set):
+            registry["动量_40d"] = factor_momentum(prices, 40, clean_ret)
+        if _want_factor("动量_60d", fn_set):
+            registry["动量_60d"] = factor_momentum(prices, 60, clean_ret)
+        if _want_factor("动量_120d", fn_set):
+            registry["动量_120d"] = factor_momentum(prices, 120, clean_ret)
+        if _want_factor("动量_skip", fn_set):
+            registry["动量_skip"] = factor_momentum_skip(prices, 240, 20, clean_ret)
+        if _want_factor("反转_3d", fn_set):
+            registry["反转_3d"] = factor_reversal(prices, 3, clean_ret)
+        if _want_factor("反转_5d", fn_set):
+            registry["反转_5d"] = factor_reversal(prices, 5, clean_ret)
+        if _want_factor("反转_10d", fn_set):
+            registry["反转_10d"] = factor_reversal(prices, 10, clean_ret)
+        if _want_factor("反转_20d", fn_set):
+            registry["反转_20d"] = factor_reversal(prices, 20, clean_ret)
+        if _want_factor("波动率_20d", fn_set):
+            registry["波动率_20d"] = factor_volatility(prices, 20, clean_ret)
+        if _want_factor("波动率_60d", fn_set):
+            registry["波动率_60d"] = factor_volatility(prices, 60, clean_ret)
+        if _want_factor("52周新高", fn_set):
+            registry["52周新高"] = factor_price_to_high(prices, 52 * 5)
+        if _want_factor("分数差分动量_20d", fn_set):
+            registry["分数差分动量_20d"] = factor_frac_diff_momentum(
+                prices, d=0.4, window=20
+            )
+        if volume is not None and _want_factor("换手率_20d", fn_set):
+            registry["换手率_20d"] = factor_turnover(volume, 20)
+        if amount is not None and _want_factor("Amihud_20d", fn_set):
+            registry["Amihud_20d"] = factor_amihud(prices, amount, 20, clean_ret)
+        if high is not None and low is not None and _want_factor("振幅_20d", fn_set):
+            registry["振幅_20d"] = factor_high_low(prices, high, low, 20, masks)
 
     # ── 财务类 ──
-    if financial is not None and not financial.empty:
+    if financial is not None and not financial.empty and _section_needed(_FIN_FACTOR_NAMES, fn_set):
         _pr = prices_raw if prices_raw is not None else prices
-        registry["价值_PB"]      = factor_value_pb(financial, _pr)
-        registry["价值_EP"]      = factor_value_ep(financial, _pr)
-        registry["质量_ROE"]     = factor_quality_roe(financial, prices)
-        registry["质量_ROE变化"] = factor_quality_roe_chg(financial, prices)
-        registry["规模"]         = factor_size(financial, prices)
-        registry["杠杆"]         = factor_leverage(financial, prices)
+        if _want_factor("价值_PB", fn_set):
+            registry["价值_PB"] = factor_value_pb(financial, _pr)
+        if _want_factor("价值_EP", fn_set):
+            registry["价值_EP"] = factor_value_ep(financial, _pr)
+        if _want_factor("质量_ROE", fn_set):
+            registry["质量_ROE"] = factor_quality_roe(financial, prices)
+        if _want_factor("质量_ROE变化", fn_set):
+            registry["质量_ROE变化"] = factor_quality_roe_chg(financial, prices)
+        if _want_factor("规模", fn_set):
+            registry["规模"] = factor_size(financial, prices)
+        if _want_factor("杠杆", fn_set):
+            registry["杠杆"] = factor_leverage(financial, prices)
         for name, f in [
-            ("质量_毛利率",   factor_quality_gpm(financial, prices)),
+            ("质量_毛利率", factor_quality_gpm(financial, prices)),
             ("质量_毛利率变化", factor_quality_gpm_chg(financial, prices)),
             ("质量_应计项目", factor_quality_accrual(financial, prices)),
         ]:
-            if f is not None:
+            if f is not None and _want_factor(name, fn_set):
                 registry[name] = f
 
     # ── 第二批 Alpha 因子 ──
-    try:
-        from factors.factor_alpha import (
-            factor_industry_momentum, factor_idiosyncratic_vol,
-            factor_margin_change, factor_moneyflow_large,
-            factor_northbound_change, factor_institution_change,
-        )
-        if industry_map is not None:
-            f = factor_industry_momentum(prices, industry_map, window=20)
-            if f is not None:
-                registry["行业动量_20d"] = f
-        if market_prices is not None:
-            registry["特质波动率_60d"] = factor_idiosyncratic_vol(
-                prices, market_prices, window=60)
-        if margin is not None:
-            registry["融资余额变化_20d"] = factor_margin_change(margin, window=20)
-        if moneyflow is not None:
-            registry["大单净流入_5d"] = factor_moneyflow_large(moneyflow, window=5)
-        if northbound is not None:
-            registry["北向持股变化_20d"] = factor_northbound_change(northbound, window=20)
-        if institution is not None:
-            registry["机构持仓变化"] = factor_institution_change(institution, prices)
-    except ImportError as e:
-        logger.warning(f"factor_alpha 导入失败: {e}")
+    if _section_needed(_ALPHA2_FACTOR_NAMES, fn_set):
+        try:
+            from factors.factor_alpha import (
+                factor_industry_momentum, factor_idiosyncratic_vol,
+                factor_margin_change, factor_moneyflow_large,
+                factor_northbound_change, factor_institution_change,
+            )
+            if industry_map is not None and _want_factor("行业动量_20d", fn_set):
+                f = factor_industry_momentum(prices, industry_map, window=20, clean_ret=clean_ret)
+                if f is not None:
+                    registry["行业动量_20d"] = f
+            if market_prices is not None and _want_factor("特质波动率_60d", fn_set):
+                registry["特质波动率_60d"] = factor_idiosyncratic_vol(
+                    prices, market_prices, window=60, clean_ret=clean_ret)
+            if margin is not None and _want_factor("融资余额变化_20d", fn_set):
+                registry["融资余额变化_20d"] = factor_margin_change(margin, window=20)
+            if moneyflow is not None and _want_factor("大单净流入_5d", fn_set):
+                registry["大单净流入_5d"] = factor_moneyflow_large(moneyflow, window=5)
+            if northbound is not None and _want_factor("北向持股变化_20d", fn_set):
+                registry["北向持股变化_20d"] = factor_northbound_change(northbound, window=20)
+            if institution is not None and _want_factor("机构持仓变化", fn_set):
+                registry["机构持仓变化"] = factor_institution_change(institution, prices)
+        except ImportError as e:
+            logger.warning(f"factor_alpha 导入失败: {e}")
+
+    # ── 市场状态特征（白名单模式始终计算 regime）──
+    if market_prices is not None:
+        try:
+            mkt_features = _market_regime_features(market_prices, prices)
+            if fn_set is not None:
+                mkt_features = {k: v for k, v in mkt_features.items() if _want_factor(k, fn_set)}
+            registry.update(mkt_features)
+        except Exception as e:
+            logger.warning(f"市场状态特征计算失败: {e}")
+
+    # ── 技术分析类因子（BIAS/PSY/ARBR/换手率变体/行业相对强度）──
+    if _section_needed(_TECH_FACTOR_NAMES, fn_set):
+        try:
+            from factors.factor_technical import get_technical_factors
+            tech_factors = get_technical_factors(
+                prices=prices, volume=volume, industry_map=industry_map,
+                open_=open_, high=high, low=low, clean_ret=clean_ret,
+            )
+            if fn_set is not None:
+                tech_factors = {k: v for k, v in tech_factors.items() if k in fn_set}
+            registry.update(tech_factors)
+        except Exception as e:
+            logger.warning(f"技术因子计算失败: {e}")
+
+    # ── WorldQuant Alpha101 精选因子 ──
+    need_wq = fn_set is None or any(n.startswith("WQ_") for n in fn_set)
+    if need_wq:
+        try:
+            from factors.factor_alpha101 import get_alpha101_factors
+            wq_factors = get_alpha101_factors(
+                prices=prices, open_=open_, high=high, low=low,
+                volume=volume, amount=amount,
+            )
+            if fn_set is not None:
+                wq_factors = {k: v for k, v in wq_factors.items() if k in fn_set}
+            registry.update(wq_factors)
+        except Exception as e:
+            logger.warning(f"Alpha101 因子计算失败: {e}")
 
     # ── 涨跌停信号因子（需要 masks，由 clean_ohlcv() 提供）──
-    if masks is not None and masks.get("limit_up") is not None:
+    if (masks is not None and masks.get("limit_up") is not None
+            and _section_needed(_LIMIT_FACTOR_NAMES, fn_set)):
         try:
             from factors.factor_limit import get_limit_factors
             limit_factors = get_limit_factors(prices, masks)
+            if fn_set is not None:
+                limit_factors = {k: v for k, v in limit_factors.items() if k in fn_set}
             registry.update(limit_factors)
         except Exception as e:
             logger.warning(f"涨跌停因子计算失败: {e}")

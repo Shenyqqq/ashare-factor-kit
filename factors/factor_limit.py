@@ -67,14 +67,21 @@ def factor_post_limit_reversion(
     hold_days: int = 5,
 ) -> pd.DataFrame:
     """
-    开板反转因子：开板日后N日预期收益取负。
-    连续涨停后开板，套牢盘解套抛售，往往大幅回调。
-    用于规避"接飞刀"风险。
+    开板反转因子：开板日已实现的历史收益取负（供应压力释放信号）。
+
+    语义：在 t 时刻若近期发生过开板，用开板信号滞后 hold_days 后，
+    结合**截至 t 已实现**的收益（close[t]/close[t-hold_days]-1）刻画
+    开板后的反转强度。绝不用未来收益，避免 look-ahead bias。
+
+    连续涨停后开板，套牢盘解套抛售，往往大幅回调；已发生的回调幅度
+    可作为后续继续承压的反向信号（收益越低 → 取负后分越高 → 规避）。
     """
-    fwd_ret = close.pct_change(hold_days).shift(-hold_days)
-    # 只在开板日激活，前向填充整个持有期
-    signal = fwd_ret.where(masks["broke_limit"], other=np.nan)
-    signal = signal.ffill(limit=hold_days)
+    # 截至当前 t 的已实现收益（仅用 t 及之前的信息）
+    realized_ret = close.pct_change(hold_days)
+    # 开板信号滞后 hold_days，保证 t 时刻只用 t-hold_days 之前已知的开板事件
+    broke_lagged = masks["broke_limit"].shift(hold_days)
+    # 仅在滞后开板窗口激活，向前不填充（避免再次引入未来信息）
+    signal = realized_ret.where(broke_lagged, other=np.nan)
     return _normalize(-signal)
 
 

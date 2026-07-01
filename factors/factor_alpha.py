@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import RAW_DIR
 from factors.factor import _normalize, cross_sectional_zscore, winsorize
+from utils.pit_align import pit_reindex_ffill
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -31,6 +32,7 @@ def factor_industry_momentum(
     industry_map: pd.DataFrame,
     window: int = 20,
     min_stocks: int = 5,
+    clean_ret: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     行业动量因子：每只股票过去N日所在行业的平均涨幅（排除自身）。
@@ -39,6 +41,8 @@ def factor_industry_momentum(
     "排除自身"避免自相关偏差（IDiosyncratic）。
 
     industry_map: DataFrame，index=code，列含 'sw_l2'（申万二级行业）
+    clean_ret:   屏蔽涨跌停日后的日收益率；传入时用逐日复合，避免涨停日
+                  return 截断污染行业均值；为 None 时退化为 pct_change(window)。
     """
     # 对齐股票列表
     common = prices.columns.intersection(industry_map.index)
@@ -47,7 +51,13 @@ def factor_industry_momentum(
         return None
 
     prices_aligned = prices[common]
-    ret = prices_aligned.pct_change(window)  # (date, stock) 收益率
+    if clean_ret is not None:
+        # 用 clean_ret 逐日复合，涨跌停日 NaN 透明跳过
+        ret = (1 + clean_ret[common]).rolling(
+            window, min_periods=max(1, window // 2)
+        ).apply(lambda x: np.nanprod(x) - 1, raw=True)
+    else:
+        ret = prices_aligned.pct_change(window)  # (date, stock) 收益率
 
     sw_l2 = industry_map.loc[common, "sw_l2"]
     industries = sw_l2.unique()
@@ -89,6 +99,7 @@ def factor_idiosyncratic_vol(
     market_prices: pd.DataFrame,
     window: int = 60,
     min_obs: int = 30,
+    clean_ret: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     特质波动率（IVOL）：用市场模型剔除系统性风险后的残差波动率，取反。
@@ -99,10 +110,20 @@ def factor_idiosyncratic_vol(
     A股中低IVOL股票往往有超额收益（与美股IVOL anomaly方向类似，
     但机制不同——A股高IVOL多为散户炒作标的，均值回归快）。
 
-    market_prices: 市场指数价格序列（单列DataFrame或Series，如沪深300）
+    market_prices: 市场指数价格序列（单列DataFrame或Series，推荐中证全指 sh000985，
+                   覆盖全A股，比沪深300更适合做市场组合代理）
+    clean_ret:    屏蔽涨跌停日后的日收益率。传入时 stock_ret 用 clean_ret（个股涨跌停
+                   日 NaN），mkt_ret 仍用 market_prices 的指数收益（指数本身不受个股
+                   涨跌停影响），保证 OLS 残差不被涨跌停日的截断收益污染；
+                   为 None 时退化为原 pct_change 逻辑。
     """
-    stock_ret = prices.pct_change()
-    mkt_ret = market_prices.squeeze().pct_change()
+    if clean_ret is not None:
+        stock_ret = clean_ret
+        # 市场收益用指数收益（指数本身不受个股涨跌停影响）
+        mkt_ret = market_prices.squeeze().pct_change()
+    else:
+        stock_ret = prices.pct_change()
+        mkt_ret = market_prices.squeeze().pct_change()
 
     # 对齐日期
     common_dates = stock_ret.index.intersection(mkt_ret.index)
@@ -221,14 +242,15 @@ def factor_institution_change(
 
     institution: DataFrame(index=季报日期, columns=股票), 值=持股市值或比例
     机构增持往往伴随深度调研，是信息优势的代理指标。
-    季报数据前向填充到日频（类似财务数据处理）。
+    季报数据前向填充到日频（PIT 安全：报告期按法定披露窗口平移后再 ffill，
+    消除用季报日做 ffill 起点的 look-ahead bias）。
 
     数据来源：data/raw/institution_holding.parquet
     """
     # 季度变化：当季持仓 - 上季持仓
     inst_chg = institution.diff(1)
-    # 前向填充到日频
-    inst_chg_daily = inst_chg.reindex(prices.index, method="ffill")
+    # PIT 安全：报告期按法定披露窗口平移后再 ffill 到日频
+    inst_chg_daily = pit_reindex_ffill(inst_chg, prices.index)
     return _normalize(inst_chg_daily)
 
 

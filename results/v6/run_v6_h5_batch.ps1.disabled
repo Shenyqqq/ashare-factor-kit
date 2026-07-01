@@ -1,0 +1,60 @@
+﻿# v6 h5 batch — fixed conditions, no ensemble/blend-dynamic
+# Resumes modes that already have model_metrics_*_h5.json (or backtest for linear/dynamic)
+$ErrorActionPreference = "Continue"
+Set-Location "F:\PythonProject\quant_trading"
+
+chcp 65001 | Out-Null
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+[Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+$env:LOGURU_COLORIZE  = "0"
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8       = "1"
+$env:PYTHONUNBUFFERED = "1"
+
+$py = ".venv\Scripts\python.exe"
+$yaml = "config\factor_configs.yaml"
+$out = "results\v6"
+$logDir = "$out\logs"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+
+function Test-ModeDone([string]$mode) {
+    $tag = "${mode}_h5"
+    $metrics = Join-Path $out "model_metrics_${tag}.json"
+    $backtest = Join-Path $out "backtest_${tag}.png"
+    if ($mode -in @("linear", "dynamic")) {
+        return (Test-Path $backtest) -and (Test-Path (Join-Path $out "factor_scores_${tag}.parquet"))
+    }
+    return (Test-Path $metrics) -and (Test-Path $backtest)
+}
+
+$modes = @("linear", "ridge", "lgbm", "xgb", "cat", "rf", "mlp", "dynamic")
+$driverLog = "$logDir\driver_v6_h5.log"
+"=== v6 h5 batch RESUME $(Get-Date -Format o) ===" | Tee-Object -Append $driverLog
+
+foreach ($mode in $modes) {
+    if (Test-ModeDone $mode) {
+        "SKIP $mode h5 (already done)" | Tee-Object -Append $driverLog
+        continue
+    }
+    if ($mode -eq "dynamic") {
+        $env:DYNAMIC_MAX_WORKERS = "1"
+    } else {
+        Remove-Item Env:DYNAMIC_MAX_WORKERS -ErrorAction SilentlyContinue
+    }
+    $runLog = "$logDir\run_${mode}_h5.log"
+    "START $mode h5 $(Get-Date -Format o)" | Tee-Object -Append $driverLog
+    & $py -u run.py --skip-download --mode $mode --horizon 5 `
+        --factor-config $yaml --output-dir $out 2>&1 |
+        ForEach-Object {
+            $_ | Out-File -FilePath $runLog -Append -Encoding utf8
+            $_
+        }
+    $rc = $LASTEXITCODE
+    "DONE $mode h5 rc=$rc $(Get-Date -Format o)" | Tee-Object -Append $driverLog
+    if ($rc -ne 0) {
+        "FAILED $mode — continuing batch" | Tee-Object -Append $driverLog
+    }
+}
+"=== v6 h5 batch END $(Get-Date -Format o) ===" | Tee-Object -Append $driverLog

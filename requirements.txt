@@ -16,6 +16,7 @@ xgboost>=2.0.0
 lightgbm>=4.1.0
 catboost>=1.2.0
 shap>=0.44.0
+optuna>=3.5              # 离线超参搜索（LGBM/XGB/RF，--tune）
 
 # ── 组合优化 ───────────────────────────────────
 cvxpy>=1.4.0             # 凸优化（均值-方差/风险平价）
@@ -27,7 +28,9 @@ plotly>=5.17.0
 
 # ── 工具 ──────────────────────────────────────
 python-dotenv>=1.0.0     # 管理 token/密钥
+PyYAML>=6.0              # factor_configs.yaml 读写（run.py / logs/driver.py）
 loguru>=0.7.0            # 更好用的日志
 schedule>=1.2.0          # 定时任务
 jupyter>=1.0.0
 tqdm>=4.66.0
+hmmlearn>=0.3.3

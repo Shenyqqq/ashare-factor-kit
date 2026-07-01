@@ -1,0 +1,563 @@
+"""
+Label construction for walk-forward training.
+
+Supports cross-sectional standardization of the regression target (Issue ⑤),
+plus Barra+industry neutralized residual labels (P0-4).
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def cross_sectional_rank(y: np.ndarray) -> np.ndarray:
+    """Percentile rank in [0, 1]."""
+    if len(y) == 0:
+        return y
+    order = y.argsort()
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(len(y))
+    return ranks / max(len(y) - 1, 1)
+
+
+def cross_sectional_zscore(y: np.ndarray) -> np.ndarray:
+    """Cross-sectional z-score; zero std → zeros."""
+    if len(y) < 2:
+        return np.zeros_like(y, dtype=float)
+    mu, sigma = np.nanmean(y), np.nanstd(y)
+    if sigma < 1e-12:
+        return np.zeros_like(y, dtype=float)
+    return (y - mu) / sigma
+
+
+def triple_barrier_label(
+    prices: pd.DataFrame,
+    open_prices: pd.DataFrame,
+    signal_dates: list,
+    hold_period: int,
+    vol_window: int = 20,
+    upper_mult: float = 2.0,
+    lower_mult: float = 1.5,
+    label_type: str = "sign",
+) -> pd.DataFrame:
+    """
+    AFML §3 triple-barrier 标签（路径依赖 + 波动率自适应）。
+
+    对每个 signal_date 的每只股票：
+      1. 入场价 = open[signal_date + 1]（次日开盘）
+      2. σ = rolling std of daily returns, vol_window 天（截至 signal_date）
+      3. 上障碍 = entry * (1 + upper_mult * σ)
+         下障碍 = entry * (1 - lower_mult * σ)
+      4. 从 signal_date+1 到 signal_date+hold_period 逐日检查累计收益是否触碰：
+         - 先触碰上障碍 → +1（或触碰时实际收益）
+         - 先触碰下障碍 → -1（或触碰时实际收益）
+         - 都未触碰 → 0（或残余收益 close[end]/entry-1）
+      5. 入场价/σ 缺失（停牌/退市/历史不足）→ 标签为 NaN
+
+    实现说明：
+      - 用 close 近似 high/low 检查障碍（无 high/low 时）；此处传入 prices 即可。
+      - 对每个 signal_date 一次性向量化：取 hold_period 天 price 矩阵（days×stocks），
+        计算相对 entry 的累计收益，用 argmax 找首个触碰日。
+      - 同日同时触碰上下障碍时按"上障碍优先"判定（AFML 默认约定）。
+
+    Parameters
+    ----------
+    prices : pd.DataFrame
+        日频收盘价（index=日期, columns=股票），用于路径检查与 σ 计算。
+    open_prices : pd.DataFrame
+        日频开盘价，用于确定入场价。
+    signal_dates : list
+        调仓日列表（Timestamp 或可解析字符串）。
+    hold_period : int
+        持仓天数（时间障碍宽度，单位：交易日）。
+    vol_window : int, default 20
+        波动率回看窗口（交易日）。
+    upper_mult, lower_mult : float
+        上/下障碍的 σ 倍数。
+    label_type : ``"sign"`` | ``"return"``
+        ``sign`` → 标签 ∈ {+1, -1, 0}；``return`` → 触碰时实际收益（未触碰则残余收益）。
+
+    Returns
+    -------
+    pd.DataFrame
+        index=signal_dates, columns=stocks, values=label（NaN 表示该股该日无效）。
+    """
+    if prices is None or open_prices is None:
+        return pd.DataFrame()
+    prices = pd.DataFrame(prices).sort_index()
+    open_prices = pd.DataFrame(open_prices).sort_index()
+    common = prices.columns.intersection(open_prices.columns)
+    if len(common) == 0:
+        return pd.DataFrame()
+    prices = prices[common]
+    open_prices = open_prices[common]
+
+    # σ：日收益的滚动标准差（min_periods 取窗口一半，避免开市初期全 NaN）
+    daily_ret = prices.pct_change()
+    min_per = max(5, vol_window // 2)
+    vol = daily_ret.rolling(vol_window, min_periods=min_per).std()
+
+    idx = prices.index
+    pos = {pd.Timestamp(d): i for i, d in enumerate(idx)}
+    n = len(idx)
+    cols = prices.columns
+
+    out: dict = {}
+    for sd in signal_dates:
+        sd = pd.Timestamp(sd)
+        if sd not in pos:
+            continue
+        i_sig = pos[sd]
+        i_entry = i_sig + 1
+        if i_entry >= n:
+            continue
+        i_end = min(i_sig + hold_period, n - 1)
+        if i_end < i_entry:
+            continue
+
+        entry = open_prices.iloc[i_entry]
+        # asof 取截至 sd 的最近一次有效 σ，处理边界 NaN
+        try:
+            sigma = vol.asof(sd)
+        except Exception:
+            sigma = pd.Series(np.nan, index=cols)
+        if sigma is None or not isinstance(sigma, pd.Series):
+            sigma = pd.Series(np.nan, index=cols)
+
+        window = prices.iloc[i_entry:i_end + 1]
+        entry_arr = entry.reindex(cols).values.astype(np.float64)
+        sigma_arr = sigma.reindex(cols).values.astype(np.float64)
+
+        # 相对入场的累计收益（days × stocks）
+        ret = window[cols].values / entry_arr[np.newaxis, :] - 1.0
+        # 停牌日 NaN 当作 0（不触发任何障碍）
+        ret = np.where(np.isnan(ret), 0.0, ret)
+        # σ 缺失则阈值放到 ±inf（永不触发），后续 valid 标志会把标签设为 NaN
+        up_thr = np.where(np.isnan(sigma_arr), np.inf, upper_mult * sigma_arr)
+        dn_thr = np.where(np.isnan(sigma_arr), -np.inf, -lower_mult * sigma_arr)
+
+        up_touch = ret >= up_thr[np.newaxis, :]
+        dn_touch = ret <= dn_thr[np.newaxis, :]
+        up_any = up_touch.any(axis=0)
+        dn_any = dn_touch.any(axis=0)
+        up_first = np.argmax(up_touch, axis=0)
+        dn_first = np.argmax(dn_touch, axis=0)
+        no_touch_d = window.shape[0]  # 哨兵：表示"未触碰"
+        up_d = np.where(up_any, up_first, no_touch_d)
+        dn_d = np.where(dn_any, dn_first, no_touch_d)
+
+        # 同日同时触碰按上障碍优先
+        upper_wins = up_any & (up_d <= dn_d)
+        lower_wins = dn_any & (dn_d < up_d)
+
+        valid = (~np.isnan(entry_arr)) & (entry_arr != 0.0) & (~np.isnan(sigma_arr))
+
+        if label_type == "sign":
+            lab = np.where(valid, 0.0, np.nan)
+            lab = np.where(valid & upper_wins, 1.0, lab)
+            lab = np.where(valid & lower_wins, -1.0, lab)
+        elif label_type == "return":
+            touched = upper_wins | lower_wins
+            touch_day = np.where(upper_wins, up_d,
+                                 np.where(lower_wins, dn_d, no_touch_d))
+            safe_day = np.clip(touch_day, 0, window.shape[0] - 1)
+            touch_px = np.take_along_axis(
+                window[cols].values, safe_day[np.newaxis, :], axis=0,
+            )[0]
+            touch_ret = touch_px / np.where(entry_arr == 0, np.nan, entry_arr) - 1.0
+            end_ret = (
+                window[cols].iloc[-1].values
+                / np.where(entry_arr == 0, np.nan, entry_arr) - 1.0
+            )
+            lab = np.where(valid & touched, touch_ret, end_ret)
+            lab = np.where(valid, lab, np.nan)
+        else:
+            raise ValueError(f"未知 label_type: {label_type}，可选 sign | return")
+
+        out[sd] = pd.Series(lab, index=cols)
+
+    if not out:
+        return pd.DataFrame()
+    df = pd.DataFrame(out).T
+    df.index.name = "signal_date"
+    return df
+
+
+def transform_labels(
+    y: np.ndarray,
+    mode: str = "raw",
+    *,
+    barra_factors: pd.DataFrame | None = None,
+    industry_dummies: pd.DataFrame | None = None,
+) -> np.ndarray:
+    """
+    Transform forward-return labels for training.
+
+    Parameters
+    ----------
+    mode : ``raw`` | ``cs_rank`` | ``cs_zscore`` | ``barra_residual`` | ``triple_barrier``
+    barra_factors, industry_dummies :
+        仅 ``mode='barra_residual'`` 时使用，需为对齐到当期股票索引的
+        DataFrame（stock × control）。省略时退化为 ``cs_zscore``。
+
+    ``mode='triple_barrier'`` 时，``y`` 应已是预计算的当期 triple-barrier
+    标签（sign 或 return，由调用方从 ``triple_barrier_label`` 面板按当期
+    行/股票索引取出）。此处仅做截面 z-score，保证与其它模式同尺度。
+    """
+    if mode == "raw":
+        return y.astype(np.float32)
+    if mode == "cs_rank":
+        return cross_sectional_rank(y.astype(float)).astype(np.float32)
+    if mode == "cs_zscore":
+        return cross_sectional_zscore(y.astype(float)).astype(np.float32)
+    if mode == "triple_barrier":
+        # y 已是当期预计算的 triple-barrier 标签；做截面标准化供回归训练
+        return cross_sectional_zscore(y.astype(float)).astype(np.float32)
+    if mode == "barra_residual":
+        if barra_factors is None and industry_dummies is None:
+            # 无控制变量时退化为截面 z-score（保留向后兼容）
+            return cross_sectional_zscore(y.astype(float)).astype(np.float32)
+        y_series = pd.Series(y)
+        resid = residual_return_label(y_series, barra_factors, industry_dummies)
+        # 残差再做截面 z-score，保证训练稳定性（与 cs_zscore 同尺度）
+        return cross_sectional_zscore(resid.values.astype(float)).astype(np.float32)
+    raise ValueError(
+        f"未知 label_mode: {mode}，可选 raw | cs_rank | cs_zscore | triple_barrier | barra_residual"
+    )
+
+
+def residual_return_label(
+    y: pd.Series,
+    barra_factors: pd.DataFrame | None = None,
+    industry_dummies: pd.DataFrame | None = None,
+) -> pd.Series:
+    """
+    Barra + industry neutralized residual return label.
+
+    对单个截面做 OLS ``y ~ [const, Barra_*, industry_dummies_*]``，取残差作为
+    剔除系统性风格/行业暴露后的"纯 alpha"标签。参考 ``research/ic/barra.py``
+    的纯 IC 残差化实现（同样的控制变量构造方式）。
+
+    Parameters
+    ----------
+    y : pd.Series
+        当期 forward return，索引为股票代码。
+    barra_factors : pd.DataFrame | None
+        当期 Barra 风格因子值（stock × 9 Barra 因子，已截面 z-score）。
+    industry_dummies : pd.DataFrame | None
+        当期行业哑变量（stock × (n_industries - 1)，已 drop_first）。
+
+    Returns
+    -------
+    pd.Series
+        残差，索引与 ``y.dropna()`` 一致。控制变量不足或样本过少时返回原 y。
+    """
+    if y is None:
+        return pd.Series(dtype=float)
+    y_s = y if isinstance(y, pd.Series) else pd.Series(y)
+    y_s = y_s.dropna()
+    if len(y_s) == 0:
+        return y_s
+
+    controls = []
+    if barra_factors is not None and not barra_factors.empty:
+        controls.append(barra_factors.reindex(y_s.index).fillna(0.0))
+    if industry_dummies is not None and not industry_dummies.empty:
+        controls.append(industry_dummies.reindex(y_s.index).fillna(0.0))
+
+    if not controls:
+        return y_s
+
+    X_df = pd.concat(controls, axis=1).dropna(axis=1, how="all").fillna(0.0)
+    # 至少需要 2×(控制变量数+1) 个样本，否则 OLS 不可靠
+    if len(y_s) < 2 * (X_df.shape[1] + 1) or len(y_s) < 30:
+        return y_s
+
+    A = np.column_stack([np.ones(len(y_s), dtype=np.float64), X_df.values.astype(np.float64)])
+    try:
+        coef, _, _, _ = np.linalg.lstsq(A, y_s.values.astype(np.float64), rcond=None)
+        resid = y_s.values.astype(np.float64) - A @ coef
+    except Exception:
+        return y_s
+
+    return pd.Series(resid.astype(np.float32), index=y_s.index)
+
+
+def residualize_panel(
+    factor_panel: pd.DataFrame,
+    barra_factors: dict[str, pd.DataFrame] | None,
+    industry_map: pd.Series | None,
+    rebalance_dates: pd.DatetimeIndex,
+    min_stocks: int = 30,
+) -> pd.DataFrame:
+    """
+    逐截面 OLS: ``factor ~ [1, Barra_*, industry_dummies]``，返回残差面板。
+
+    与 ``research/ic/barra.py::compute_pure_ic_fast`` 用同一套控制变量
+    （Barra 9 风格 + 行业哑变量 drop_first），保证 IC 筛选与 ML 训练口径
+    一致——IC 阶段剔除系统性敞口后筛选出的因子，进入 ML 时特征同样被
+    中性化，避免模型把 Size/Beta 系统性敞口当成 alpha 学习。
+
+    Parameters
+    ----------
+    factor_panel : pd.DataFrame
+        单因子宽表 (date × stock)。
+    barra_factors : dict[str, pd.DataFrame] | None
+        Barra 风格因子名 -> (date × stock) DataFrame。
+    industry_map : pd.Series | None
+        stock code -> industry category。
+    rebalance_dates : pd.DatetimeIndex
+        需要做残差化的截面日期；非这些日期的行返回 NaN。
+    min_stocks : int, default 30
+        截面有效股票数低于此值则该截面返回 NaN。
+
+    Returns
+    -------
+    pd.DataFrame
+        残差面板，与 ``factor_panel`` 同 shape；非 ``rebalance_dates``
+        行为 NaN，无法做 OLS 的截面也为 NaN。
+    """
+    if factor_panel is None or factor_panel.empty:
+        return factor_panel
+    if (barra_factors is None or len(barra_factors) == 0) and industry_map is None:
+        # 无控制变量 → 不做残差化，原样返回
+        return factor_panel
+
+    out = pd.DataFrame(
+        np.nan, index=factor_panel.index, columns=factor_panel.columns,
+        dtype=np.float32,
+    )
+    f_cols = factor_panel.columns
+    f_arr = factor_panel.to_numpy(dtype=np.float64, copy=False)
+    date_to_row = {pd.Timestamp(d): i for i, d in enumerate(factor_panel.index)}
+
+    # 行业哑变量：一次性构造为 {col_name: Series(stock → 0/1)}，
+    # 后续按当期 barra_df.index reindex 即可。
+    ind_cols: dict | None = None
+    if industry_map is not None:
+        ind_s = industry_map.fillna("未分类")
+        cats = sorted(ind_s.unique())
+        if len(cats) > 1:
+            ref = cats[0]
+            ind_cols = {
+                f"_ind_{g}": (ind_s == g).astype(np.float32)
+                for g in cats if g != ref
+            }
+
+    for date in rebalance_dates:
+        date = pd.Timestamp(date)
+        row_i = date_to_row.get(date)
+        if row_i is None:
+            continue
+
+        # 构造当期 Barra 控制矩阵
+        ctrl_cols: dict = {}
+        if barra_factors:
+            for bname, bdf in barra_factors.items():
+                if bdf is None or bdf.empty:
+                    continue
+                if date in bdf.index:
+                    ctrl_cols[bname] = bdf.loc[date].astype(np.float32)
+        if not ctrl_cols:
+            continue  # 当期无 Barra 因子覆盖 → 跳过该截面
+        barra_df = pd.DataFrame(ctrl_cols).fillna(0.0)
+
+        # 行业哑变量对齐到 barra_df.index
+        if ind_cols is not None:
+            ind_df = pd.DataFrame(ind_cols).reindex(barra_df.index).fillna(0.0)
+            X_df = pd.concat([barra_df, ind_df], axis=1)
+        else:
+            X_df = barra_df
+
+        # factor 截面对齐到 X_df.index
+        f_series = pd.Series(f_arr[row_i], index=f_cols).reindex(X_df.index)
+        valid = np.isfinite(f_series.values)
+        if valid.sum() < min_stocks:
+            continue
+
+        f_v = f_series.values[valid].astype(np.float64)
+        X_v = X_df.values[valid].astype(np.float64)
+        A = np.column_stack([np.ones(len(f_v), dtype=np.float64), X_v])
+
+        try:
+            coef, _, _, _ = np.linalg.lstsq(A, f_v, rcond=None)
+            resid = f_v - A @ coef
+        except Exception:
+            continue
+
+        # 把残差填回该截面（仅 valid 位置，其余 NaN）
+        resid_full = np.full(len(X_df), np.nan, dtype=np.float64)
+        resid_full[np.where(valid)[0]] = resid
+        out.loc[date] = pd.Series(resid_full, index=X_df.index).reindex(f_cols).values.astype(np.float32)
+
+    return out
+
+
+def build_industry_dummies(
+    industry_map: pd.Series,
+    stock_index: pd.Index,
+    reference: str | None = None,
+) -> pd.DataFrame:
+    """
+    行业哑变量矩阵（drop_first 避免与常数项共线）。
+
+    与 ``research/ic/barra.py::_industry_dummies`` 同一约定。
+    """
+    if industry_map is None:
+        return pd.DataFrame(index=stock_index)
+    ind = industry_map.reindex(stock_index).fillna("未分类")
+    cats = sorted(ind.unique())
+    if len(cats) <= 1:
+        return pd.DataFrame(index=stock_index)
+    ref = reference if reference and reference != "drop_first" else cats[0]
+    if ref not in cats:
+        ref = cats[0]
+    cols = {f"_ind_{grp}": (ind == grp).astype(np.float32)
+            for grp in cats if grp != ref}
+    if not cols:
+        return pd.DataFrame(index=stock_index)
+    return pd.DataFrame(cols, index=stock_index)
+
+
+def precompute_label_controls(
+    barra_factors: dict[str, pd.DataFrame] | None,
+    industry_map: pd.Series | None,
+    dates,
+) -> dict:
+    """
+    预计算每个调仓日的标签残差化控制矩阵。
+
+    Returns
+    -------
+    dict
+        ``{date: (barra_df, industry_dummies_df)}``，二者均按当期
+        Barra 因子覆盖的股票并集索引。无 Barra 因子的日期不在 dict 中。
+    """
+    if barra_factors is None and industry_map is None:
+        return {}
+
+    controls: dict = {}
+    for date in dates:
+        cols = {}
+        if barra_factors:
+            for bname, bdf in barra_factors.items():
+                if date in bdf.index:
+                    cols[bname] = bdf.loc[date].astype(np.float32)
+        if not cols:
+            continue
+        barra_df = pd.DataFrame(cols).fillna(0.0)
+        ind_dummies = (
+            build_industry_dummies(industry_map, barra_df.index)
+            if industry_map is not None else pd.DataFrame(index=barra_df.index)
+        )
+        controls[date] = (barra_df, ind_dummies)
+    return controls
+
+
+def compute_return_overlap_weights(
+    train_dates: list,
+    hold_period_days: int,
+    next_rebalance_date=None,
+) -> np.ndarray:
+    """
+    AFML §4: 相邻训练样本的 forward_return 标签时间重叠时降权。
+
+    样本权重 ∝ |标签独有天数| / |标签总天数|，乘以 time_decay。
+    默认配置（调仓间隔≈hold_period）下 overlap≈0 → 权重≈1.0（无变化）。
+    override 配置（调仓更频繁）下 overlap>0 → 降权。
+    下限 0.1：即使 95% 重叠也保留 10% 权重。
+
+    Parameters
+    ----------
+    train_dates : list
+        训练调仓日列表（Timestamp 或可被 pd.to_datetime 解析的字符串）。
+    hold_period_days : int
+        持仓天数（与 forward_return 窗口一致）。
+    next_rebalance_date : Timestamp / str / None
+        预测日（可选），用于检查最后一个训练样本与预测日的标签重叠。
+
+    Returns
+    -------
+    np.ndarray
+        长度 = len(train_dates) 的逐日权重（每个调仓日一个权重，
+        调用方需自行展开到逐样本）。
+    """
+    n = len(train_dates)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    if hold_period_days is None or hold_period_days <= 0:
+        return np.ones(n, dtype=np.float64)
+
+    ts = pd.to_datetime(list(train_dates))
+    hold_td = pd.Timedelta(days=int(hold_period_days))
+    one_day = pd.Timedelta(days=1)
+
+    weights = np.ones(n, dtype=np.float64)
+    for i in range(n):
+        # 当前训练样本标签区间 [d_i + 1, d_i + hold_period_days]
+        start_i = ts[i] + one_day
+        end_i = ts[i] + hold_td
+        # 下一个参考日：相邻训练日；最后一个样本则用预测日（若提供）
+        if i + 1 < n:
+            ref = ts[i + 1]
+        elif next_rebalance_date is not None:
+            ref = pd.Timestamp(next_rebalance_date)
+        else:
+            continue  # 无后续参考日 → 权重保持 1.0
+        start_ref = ref + one_day
+        end_ref = ref + hold_td
+        # 标签区间日历日重叠
+        overlap_start = max(start_i, start_ref)
+        overlap_end = min(end_i, end_ref)
+        if overlap_end >= overlap_start:
+            overlap_days = int((overlap_end - overlap_start).days) + 1
+        else:
+            overlap_days = 0
+        overlap_ratio = overlap_days / float(hold_period_days)
+        # 折中版：1 - overlap_ratio * 0.5，下限 0.1
+        weights[i] = max(0.1, 1.0 - overlap_ratio * 0.5)
+    return weights
+
+
+def normalize_sample_weights_by_universe(
+    weights: np.ndarray,
+    dates_per_row: list,
+    stocks_per_date: list[int],
+) -> np.ndarray:
+    """
+    Per-date sample weight normalization for universe size changes (P1-2).
+
+    A 股股票池随时间扩张，早期调仓日股票少、晚期股票多。原始 decay 权重
+    对每只股票等同视之，导致晚期调仓日（股票多）的总权重远大于早期，
+    训练样本被晚期主导。此处按 ``decay * (n_stocks_date / max_n_stocks)``
+    缩放，让每个调仓日的总权重正比于其股票数占比而非绝对数量。
+
+    Parameters
+    ----------
+    weights : np.ndarray
+        已展开的逐样本权重（长度 = sum(stocks_per_date)），由 _stack_cached
+        按 date 顺序 extend 而成。
+    dates_per_row : list
+        每个权重行对应的调仓日（长度 = len(stocks_per_date)，仅用于诊断/对齐）。
+    stocks_per_date : list[int]
+        每个调仓日的有效股票数。
+
+    Returns
+    -------
+    np.ndarray
+        归一化后的权重，长度与 ``weights`` 相同。
+    """
+    if len(stocks_per_date) == 0 or len(weights) == 0:
+        return weights
+    max_n = max(stocks_per_date)
+    if max_n <= 0:
+        return weights
+    scale_per_date = np.array(
+        [n / max_n for n in stocks_per_date], dtype=np.float64,
+    )
+    # 把逐日 scale 展开到逐样本
+    scale_expanded = np.repeat(scale_per_date, stocks_per_date)
+    if len(scale_expanded) != len(weights):
+        # 长度不匹配时（理论上不应发生），安全降级返回原权重
+        return weights
+    return (weights * scale_expanded).astype(weights.dtype)

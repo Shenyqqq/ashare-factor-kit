@@ -1,52 +1,64 @@
 """
-backtest/quantile.py  —  分组回测（Q1-Q5）
+backtest/quantile.py — 分组回测（Q1-Q5）模块化引擎（原 quantile_v2，已合并）
 
 验证因子得分的单调性：Q5（高分）是否持续跑赢Q1（低分）？
 
-执行模型（尽量贴近实盘）：
-  - 信号日（月末收盘后）看因子得分 → 次日开盘执行
-  - 执行价 = 次日开盘价（open_prices 传入时生效）
-  - 一字涨停股（execution day 开盘即封死）剔除出买入列表
-  - 一字跌停股（想卖卖不出）：当期继续持有，下期尝试卖出（简化：不强制剔出）
-  - 持仓期收益用真实收盘价追踪（涨跌停日的 return 是真实发生的，不 mask）
+时间线（统一命名）：
+  signal_date       — 周期末收盘后观察因子得分
+  execution_date    — T+1 开盘买入（传入 open_prices 时）
+  next_signal_date  — 下一调仓信号
+  hold window       — [execution_date, next_signal_date]
 
-注意：执行价和持仓收益的 mask 概念不同：
-  - 因子计算 clean_ret：mask 涨跌停日（价格不反映真实供需）
-  - 持仓追踪 daily_returns：用真实 return（你持股涨停了就是赚了）
-  - 执行约束：一字板当天根本买不进去，从候选股中排除
+执行模型（贴近实盘）：
+  • 真实 buy-and-hold：每股 NAV 从 exec-open 起，组合 = Σ w×stock_NAV
+  • 调仓成本：执行日 NAV × (1 − cost)
+  • 一字涨停：跳过并按排名向后回填；一字跌停：无法卖出，继续持有
+  • 停牌：当日收益记 0（NAV 持平）
+  • ST / 上市天数 / 涨跌停 masks 全部走 TradeRules
+
+历史：原 v1 单体 quantile.py 已删除；本文件保留 v2 模块化实现，
+子模块 execution / portfolio / return_engine / turnover / benchmark / report 不变。
+公共 API（run_quantile_backtest / QuantileResult）保持与 run.py 直接对接。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+
+from backtest.benchmark import index_period_return
+from backtest.execution import (
+    BacktestConfig,
+    TradeRules,
+    hold_dates_between,
+    infer_st_codes,
+    resolve_execution_date,
+    total_cost_fraction,
+)
+from backtest.portfolio import (
+    PortfolioState,
+    apply_turnover_control,
+    assign_quantile_groups,
+    rebalance_holdings,
+    select_top_n,
+)
+from backtest.return_engine import simulate_period
+from backtest.turnover import TurnoverRecord, compute_turnover, make_turnover_record
+from utils.rebalance_dates import get_rebalance_dates
 
 
 @dataclass
 class QuantileResult:
-    nav: pd.DataFrame          # 各组NAV，columns=[Q1,Q2,...,Q5,benchmark,沪深300,创业板指]
-    annual_returns: pd.DataFrame   # 逐年收益，index=year, columns=[Q1,...,Q5]
-    ic_monotonicity: float     # 组别rank vs 组别收益的相关性（越接近1越好）
-    long_short_nav: pd.Series  # Q5/Q1 多空组合NAV
-    turnover: pd.DataFrame     # 各组换手率
+    """分组回测结果；turnover_detail 用于审计 CSV 导出。"""
 
-
-def _get_rebalance_dates(factor_scores: pd.DataFrame,
-                         rebalance_freq: str) -> pd.DatetimeIndex:
-    """按频率生成调仓日期（每个周期的最后一个交易日）"""
-    return (
-        pd.Series(1, index=factor_scores.index)
-        .resample(rebalance_freq)
-        .last()
-        .index
-        .intersection(factor_scores.index)
-    )
-
-
-def _next_trading_day(date: pd.Timestamp, index: pd.DatetimeIndex) -> pd.Timestamp | None:
-    """返回 index 中严格晚于 date 的第一个交易日，不存在则返回 None"""
-    later = index[index > date]
-    return later[0] if len(later) > 0 else None
+    nav: pd.DataFrame
+    annual_returns: pd.DataFrame
+    ic_monotonicity: float
+    long_short_nav: pd.Series
+    turnover: pd.DataFrame
+    top_holdings: dict = None
+    turnover_detail: pd.DataFrame | None = field(default=None)
 
 
 def run_quantile_backtest(
@@ -56,186 +68,217 @@ def run_quantile_backtest(
     rebalance_freq: str = "ME",
     start: str = None,
     end: str = None,
-    cost_bps: float = 3,
+    cost_bps: float = 3.5,
     min_stocks: int = 5,
     open_prices: pd.DataFrame = None,
     masks: dict = None,
-    indices: dict = None,   # {"沪深300": pd.Series, "创业板指": pd.Series}
+    indices: dict = None,
+    top_n: int = 30,
+    stock_names: pd.Series | None = None,
+    listing_dates: dict[str, pd.Timestamp] | None = None,
+    volume: pd.DataFrame | None = None,
+    config: BacktestConfig | None = None,
+    st_schedule: pd.DataFrame | None = None,
+    delist_dates: dict[str, pd.Timestamp] | None = None,
 ) -> QuantileResult:
     """
-    分组回测核心逻辑。
+    Run Q1-Q5 + Top-N quantile backtest.
 
-    prices:       后复权收盘价，用于持仓期收益追踪
-    open_prices:  后复权开盘价（可选）。传入时：
-                    - 执行价从 sig_date 收盘改为次日开盘
-                    - 一字涨停股（open==close==high，开盘即封死）从买入列表剔除
-    masks:        clean_ohlcv() 产生的 mask dict（可选）。
-                  用于识别 limit_up_open（一字涨停）以过滤不可买股票。
-    cost_bps:     单边成本 bp（佣金0.01%+印花税摊半0.025%≈0.035%，即3.5bp）
+    Parameters
+    ----------
+    prices, factor_scores : 后复权收盘价 / 模型预测得分
+    open_prices : 后复权开盘价（可选）。传入时启用 T+1 开盘执行 + 一字涨停剔除
+    masks : clean_ohlcv() 产生的 mask dict（limit_up_open / limit_down_open 等）
+    cost_bps : 单边成本 bp 兜底（仅当 commission/stamp/slippage 全 0 时使用）
+    indices : {"沪深300": pd.Series, "创业板指": pd.Series}
+    top_n : 每期保存得分最高的 top N 标的
+    stock_names, listing_dates, volume : 可选 universe 过滤
+    config : BacktestConfig 覆盖（成本率、ST、上市天数等）
+    st_schedule : M4 时间序列 ST 状态（wide bool: index=date, columns=stock）
+    delist_dates : M4 code → delist_date 字典，回测时按日期判断已退市
     """
-    # ── 对齐时间范围 ──────────────────────────────────────────────────────────
     if factor_scores.empty or not isinstance(factor_scores.index, pd.DatetimeIndex):
         raise ValueError(
-            f"factor_scores 为空或 index 不是 DatetimeIndex（实际 dtype={factor_scores.index.dtype}），"
-            "请检查模型训练是否产生了有效预测"
+            f"factor_scores 为空或 index 不是 DatetimeIndex（dtype={factor_scores.index.dtype}）"
         )
+
+    cfg = config or BacktestConfig(cost_bps=cost_bps)
+    cfg.cost_bps = cost_bps
+    cfg.use_open_execution = open_prices is not None
+
     common_dates = prices.index.intersection(factor_scores.index)
     if start:
         common_dates = common_dates[common_dates >= pd.Timestamp(start)]
     if end:
         common_dates = common_dates[common_dates <= pd.Timestamp(end)]
 
-    prices_aligned = prices.loc[common_dates]
-    scores_aligned = factor_scores.loc[common_dates]
+    prices_a = prices.loc[common_dates]
+    scores_a = factor_scores.loc[common_dates]
+    open_a = (
+        open_prices.reindex(index=prices_a.index, columns=prices_a.columns)
+        if open_prices is not None else None
+    )
 
-    use_open = (open_prices is not None)
-    if use_open:
-        open_aligned = open_prices.reindex(index=prices_aligned.index,
-                                           columns=prices_aligned.columns)
+    rules = TradeRules(
+        masks=masks,
+        st_codes=infer_st_codes(stock_names),
+        st_schedule=st_schedule,
+        listing_dates=listing_dates,
+        delist_dates=delist_dates,
+        volume=volume,
+        config=cfg,
+    )
 
-    rebalance_dates = _get_rebalance_dates(scores_aligned, rebalance_freq)
+    rebalance_dates = get_rebalance_dates(scores_a.index, rebalance_freq)
     if len(rebalance_dates) < 2:
         raise ValueError("调仓日期不足，请检查数据范围或调仓频率")
 
-    q_labels = [f"Q{i+1}" for i in range(n_quantiles)]
-    group_returns: dict[str, list] = {q: [] for q in q_labels}
-    group_returns["benchmark"] = []
-    date_index = []
+    q_labels = [f"Q{i + 1}" for i in range(n_quantiles)]
+    top_label = f"Top{top_n}"
+    track_labels = q_labels + [top_label, "benchmark"]
 
-    # 持仓期收益用真实收盘价（不 mask，涨跌停日的 P&L 是真实发生的）
-    daily_returns = prices_aligned.pct_change().fillna(0)
-    cost_rate = cost_bps / 10000
+    group_returns: dict[str, list] = {k: [] for k in track_labels}
+    turnover_rows: dict[str, list] = {k: [] for k in track_labels}
+    all_turnover_records: list[TurnoverRecord] = []
+    period_meta: list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
+    top_holdings_log: dict = {}
 
-    prev_holdings: dict[str, set] = {q: set() for q in q_labels}
+    states: dict[str, PortfolioState] = {k: PortfolioState() for k in track_labels}
 
     for i in range(len(rebalance_dates) - 1):
-        sig_date = rebalance_dates[i]
-        hold_end = rebalance_dates[i + 1]
+        signal_date = rebalance_dates[i]
+        next_signal_date = rebalance_dates[i + 1]
 
-        # 执行日：次日开盘（有 open_prices 时），否则同日收盘
-        exec_date = _next_trading_day(sig_date, prices_aligned.index) if use_open else sig_date
-
-        # 当日因子得分（过滤NaN）
-        scores_today = scores_aligned.loc[sig_date].dropna()
-
-        # ── 过滤不可买股票（一字涨停：开盘即封死，无法成交）──
-        if use_open and exec_date is not None and masks is not None:
-            lu_open = masks.get("limit_up_open")
-            if lu_open is not None and exec_date in lu_open.index:
-                # 一字涨停：当日 open==close==high，完全无法买入
-                cant_buy = lu_open.loc[exec_date]
-                cant_buy = cant_buy[cant_buy].index
-                scores_today = scores_today.drop(
-                    labels=[c for c in cant_buy if c in scores_today.index]
-                )
-
-        if len(scores_today) < n_quantiles * min_stocks:
+        use_open = cfg.use_open_execution
+        execution_date = resolve_execution_date(signal_date, prices_a.index, use_open)
+        if execution_date is None:
             continue
 
-        # 分组
-        try:
-            groups = pd.qcut(scores_today, n_quantiles,
-                             labels=q_labels, duplicates="drop")
-        except ValueError:
-            continue
-
-        # ── 持仓区间：从执行日（含）到下一执行日（不含）──
-        # 用开盘价执行时：收益 = open[exec+1] / open[exec] * close_path - 1
-        # 简化：持仓区间仍用收盘价追踪（开盘买入当天日内 return 忽略）
-        hold_dates = prices_aligned.index[
-            (prices_aligned.index > sig_date) &
-            (prices_aligned.index <= hold_end)
-        ]
+        hold_dates = hold_dates_between(prices_a.index, execution_date, next_signal_date)
         if len(hold_dates) == 0:
             continue
 
-        date_index.append((sig_date, hold_end))
-        period_returns_all = daily_returns.loc[hold_dates]
+        scores_today = scores_a.loc[signal_date].dropna()
+        # Drop execution-day unbuyable names before qcut (limit-up open, ST, …)
+        buyable = [
+            s for s in scores_today.index
+            if s in prices_a.columns and rules.can_buy(s, execution_date, prices_a)
+        ]
+        scores_for_groups = scores_today.loc[buyable] if buyable else scores_today.iloc[:0]
+        group_map = assign_quantile_groups(scores_for_groups, n_quantiles, q_labels, min_stocks)
+        if group_map is None:
+            continue
 
-        # 若使用开盘价执行，首日 return 替换为 close[exec] / open[exec] - 1（当日日内）
-        if use_open and exec_date is not None and exec_date in hold_dates:
-            open_exec = open_aligned.loc[exec_date]
-            close_exec = prices_aligned.loc[exec_date]
-            intraday_ret = (close_exec / open_exec.replace(0, np.nan) - 1).fillna(0)
-            period_returns_all = period_returns_all.copy()
-            period_returns_all.loc[exec_date] = intraday_ret
+        period_meta.append((signal_date, next_signal_date, execution_date))
+        eligible = [s for s in scores_today.index if s in prices_a.columns]
 
-        for q in q_labels:
-            stocks = groups[groups == q].index.tolist()
-            stocks_in_prices = [s for s in stocks if s in prices_aligned.columns]
-            if len(stocks_in_prices) < min_stocks:
-                group_returns[q].append(np.nan)
+        top_stocks = select_top_n(scores_today, top_n, rules, execution_date, prices_a)
+        top_holdings_log[signal_date] = top_stocks
+
+        targets: dict[str, set[str]] = {
+            q: set(stocks) for q, stocks in group_map.items() if stocks
+        }
+        targets[top_label] = set(top_stocks)
+        targets["benchmark"] = set(eligible)
+
+        for label in track_labels:
+            target = targets.get(label, set())
+            if label == "benchmark":
+                if len(eligible) < min_stocks:
+                    group_returns[label].append(np.nan)
+                    continue
+            elif len(target) < min_stocks:
+                group_returns[label].append(np.nan)
                 continue
 
-            prev = prev_holdings[q]
-            curr = set(stocks_in_prices)
-            turnover = (len(prev.symmetric_difference(curr)) / (2 * len(prev | curr))
-                        if prev else 1.0)
-            prev_holdings[q] = curr
+            # ── Turnover 控制（任务3）──────────────────────────────────────────
+            # 仅对非 benchmark track 生效（benchmark = 全样本等权，无主动选股）
+            # 当 turnover_limit < 1.0 或 rank_change_threshold > 0 时，
+            # 在 rebalance 前调整 target：保留排名仍高的上期持仓，限制换手。
+            if (
+                label != "benchmark"
+                and (cfg.turnover_limit < 1.0 or cfg.rank_change_threshold > 0.0)
+            ):
+                prev_holdings = set(states[label].holdings)
+                if prev_holdings:
+                    target = apply_turnover_control(
+                        prev_holdings,
+                        target,
+                        scores_today,
+                        turnover_limit=cfg.turnover_limit,
+                        rank_change_threshold=cfg.rank_change_threshold,
+                    )
 
-            ret_series = period_returns_all[stocks_in_prices].mean(axis=1)
-            cum_ret = (1 + ret_series).prod() - 1
-            cum_ret -= turnover * cost_rate
-            group_returns[q].append(cum_ret)
+            prev = states[label]
+            new_state, sold, bought = rebalance_holdings(
+                prev, target, execution_date, rules, prices_a,
+            )
+            turnover = compute_turnover(prev, new_state)
+            cost = total_cost_fraction(turnover, cfg)
+            rec = make_turnover_record(
+                signal_date, execution_date, prev, new_state, sold, bought, cfg,
+            )
+            all_turnover_records.append((label, rec))
+            turnover_rows[label].append({"turnover": turnover, "cost": cost})
 
-        # 全样本等权基准
-        all_stocks = [s for s in scores_today.index if s in prices_aligned.columns]
-        if all_stocks:
-            ret_bm = period_returns_all[all_stocks].mean(axis=1)
-            group_returns["benchmark"].append((1 + ret_bm).prod() - 1)
-        else:
-            group_returns["benchmark"].append(np.nan)
+            stocks = list(new_state.holdings)
+            if not stocks:
+                group_returns[label].append(np.nan)
+                states[label] = new_state
+                continue
 
-    if not date_index:
+            period_ret, _ = simulate_period(
+                prices_a, hold_dates, stocks, execution_date, open_a, rules, cost,
+            )
+            group_returns[label].append(period_ret)
+            states[label] = new_state
+
+    if not period_meta:
         raise ValueError("无有效调仓周期")
 
-    # ── 构建NAV ──────────────────────────────────────────────────────────────
-    period_rets = pd.DataFrame(group_returns,
-                               index=pd.MultiIndex.from_tuples(date_index))
-    period_rets.index = [t[0] for t in date_index]
-    period_rets.index = pd.DatetimeIndex(period_rets.index)
+    signal_dates = [m[0] for m in period_meta]
+    period_rets = pd.DataFrame(group_returns, index=pd.DatetimeIndex(signal_dates))
 
-    # ── 指数基准（沪深300 / 创业板指）────────────────────────────────────────
     if indices:
         for idx_name, idx_price in indices.items():
-            idx_price = idx_price.sort_index()
             idx_rets = []
-            for sig_date, hold_end in date_index:
-                hold_dates = idx_price.index[
-                    (idx_price.index > sig_date) & (idx_price.index <= hold_end)
-                ]
-                if len(hold_dates) == 0:
-                    idx_rets.append(np.nan)
-                    continue
-                p0 = idx_price.asof(sig_date)
-                p1 = idx_price.loc[hold_dates[-1]]
-                idx_rets.append(p1 / p0 - 1 if p0 and p0 > 0 else np.nan)
+            for signal_date, next_signal_date, exec_d in period_meta:
+                hdates = hold_dates_between(prices_a.index, exec_d, next_signal_date)
+                idx_rets.append(index_period_return(idx_price, hdates, exec_d))
             period_rets[idx_name] = idx_rets
 
     nav = (1 + period_rets.fillna(0)).cumprod()
 
-    # ── 多空NAV：Q5 / Q1 ─────────────────────────────────────────────────────
     ls_ret = period_rets[q_labels[-1]] - period_rets[q_labels[0]]
     long_short_nav = (1 + ls_ret.fillna(0)).cumprod()
 
-    # ── 逐年收益 ──────────────────────────────────────────────────────────────
     annual_rets = {}
-    for year, grp in period_rets[q_labels].groupby(period_rets.index.year):
-        # 年化：复利连乘
-        annual_rets[year] = (
-            (1 + grp.fillna(0)).prod() - 1
-        )
+    for year, grp in period_rets[q_labels + [top_label]].groupby(period_rets.index.year):
+        annual_rets[year] = (1 + grp.fillna(0)).prod() - 1
     annual_returns = pd.DataFrame(annual_rets).T
 
-    # ── 单调性检验：组别排名 vs 全周期收益 ───────────────────────────────────
     total_returns = nav[q_labels].iloc[-1]
     rank_corr = total_returns.rank().corr(
         pd.Series(range(1, n_quantiles + 1), index=q_labels, dtype=float)
     )
 
-    # ── 换手率（简化：只保存最后一轮，作为代表值）───────────────────────────
-    turnover_df = pd.DataFrame(index=period_rets.index,
-                               columns=q_labels, dtype=float)
+    turnover_df = pd.DataFrame(
+        {label: [r["turnover"] for r in turnover_rows[label]] for label in track_labels},
+        index=period_rets.index,
+    )
+
+    detail_rows = []
+    for group_label, rec in all_turnover_records:
+        detail_rows.append({
+            "group": group_label,
+            "signal_date": rec.signal_date,
+            "execution_date": rec.execution_date,
+            "sells": "|".join(rec.sells),
+            "buys": "|".join(rec.buys),
+            "turnover": rec.turnover,
+            "cost": rec.cost,
+        })
+    turnover_detail = pd.DataFrame(detail_rows) if detail_rows else None
 
     return QuantileResult(
         nav=nav,
@@ -243,132 +286,47 @@ def run_quantile_backtest(
         ic_monotonicity=rank_corr,
         long_short_nav=long_short_nav,
         turnover=turnover_df,
+        top_holdings=top_holdings_log,
+        turnover_detail=turnover_detail,
     )
 
 
-def plot_quantile_result(result: QuantileResult,
-                         title: str = "分组回测（Q1-Q5）",
-                         save_path: str = None):
-    """
-    4图布局：
-    1. 各组NAV走势（含基准）
-    2. 多空NAV
-    3. 逐年分组收益柱状图
-    4. 各组总收益条形图（直观看单调性）
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib
-    matplotlib.rcParams["font.family"] = "SimHei"
-    matplotlib.rcParams["axes.unicode_minus"] = False
-
-    q_labels = [c for c in result.nav.columns if c.startswith("Q")]
-    n = len(q_labels)
-    colors = plt.cm.RdYlGn(np.linspace(0.15, 0.85, n))  # Q1红→Q5绿
-
-    fig, axes = plt.subplots(2, 2, figsize=(16, 11))
-    fig.suptitle(title, fontsize=14, fontweight="bold", y=0.98)
-
-    # ── 图1: 各组NAV ─────────────────────────────────────────────────────────
-    ax = axes[0, 0]
-    for i, q in enumerate(q_labels):
-        result.nav[q].plot(ax=ax, color=colors[i], lw=1.5, label=q)
-    if "benchmark" in result.nav.columns:
-        result.nav["benchmark"].plot(ax=ax, color="gray", lw=1.5,
-                                     ls="--", label="等权基准")
-    idx_styles = {"沪深300": ("black", "-.", 1.8), "创业板指": ("purple", ":", 1.8)}
-    for idx_name, (color, ls, lw) in idx_styles.items():
-        if idx_name in result.nav.columns:
-            result.nav[idx_name].plot(ax=ax, color=color, ls=ls, lw=lw, label=idx_name)
-    ax.set_title("各分组净值走势")
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
-    ax.set_ylabel("净值")
-
-    # ── 图2: 多空NAV ─────────────────────────────────────────────────────────
-    ax = axes[0, 1]
-    result.long_short_nav.plot(ax=ax, color="steelblue", lw=1.5)
-    ax.axhline(1, color="gray", ls="--", lw=0.8)
-    # 超额收益为正的区域填充
-    ls = result.long_short_nav.copy()
-    ax.fill_between(ls.index, 1, ls, where=(ls > 1),
-                    alpha=0.3, color="green", label="Q5>Q1")
-    ax.fill_between(ls.index, 1, ls, where=(ls < 1),
-                    alpha=0.3, color="red",   label="Q5<Q1")
-    monotonicity = result.ic_monotonicity
-    mono_color = "green" if monotonicity > 0.8 else "orange" if monotonicity > 0.5 else "red"
-    ax.set_title(
-        f"多空组合 (Q5 - Q1)  |  单调性={monotonicity:.3f}",
-        color=mono_color
+def _smoke_test_2stock_math() -> None:
+    """Verify buy-hold math: equal-weight 2 stocks, zero cost."""
+    dates = pd.date_range("2024-01-02", periods=3, freq="B")
+    close = pd.DataFrame(
+        {"A": [10.0, 11.0, 11.55], "B": [20.0, 21.0, 21.0]},
+        index=dates,
     )
-    ax.legend(fontsize=9)
-    ax.grid(alpha=0.3)
-    ax.set_ylabel("净值")
-
-    # ── 图3: 逐年分组收益柱状图 ──────────────────────────────────────────────
-    ax = axes[1, 0]
-    x = np.arange(len(result.annual_returns))
-    width = 0.8 / n
-    for i, q in enumerate(q_labels):
-        if q in result.annual_returns.columns:
-            vals = result.annual_returns[q].values
-            ax.bar(x + i * width - 0.4 + width / 2, vals * 100,
-                   width, label=q, color=colors[i], alpha=0.85)
-    ax.set_xticks(x)
-    ax.set_xticklabels(result.annual_returns.index, rotation=45)
-    ax.axhline(0, color="black", lw=0.8)
-    ax.set_title("逐年分组收益（%）")
-    ax.legend(fontsize=8, ncol=n)
-    ax.grid(alpha=0.3, axis="y")
-    ax.set_ylabel("收益率（%）")
-
-    # ── 图4: 总收益单调性条形图 ──────────────────────────────────────────────
-    ax = axes[1, 1]
-    total_rets = (result.nav[q_labels].iloc[-1] - 1) * 100
-    ax.bar(q_labels, total_rets.values, color=colors, alpha=0.85, edgecolor="white")
-    for i, v in enumerate(total_rets.values):
-        ax.text(i, v + 0.5, f"{v:.1f}%", ha="center", va="bottom", fontsize=9)
-    ax.axhline(0, color="black", lw=0.8)
-    if "benchmark" in result.nav.columns:
-        bm_ret = (result.nav["benchmark"].iloc[-1] - 1) * 100
-        ax.axhline(bm_ret, color="gray", ls="--", lw=1.2,
-                   label=f"基准 {bm_ret:.1f}%")
-        ax.legend(fontsize=9)
-    ax.set_title("各组总收益（单调性直观图）")
-    ax.grid(alpha=0.3, axis="y")
-    ax.set_ylabel("总收益（%）")
-
-    plt.tight_layout(rect=[0, 0, 1, 0.97])
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"图表已保存: {save_path}")
-    else:
-        plt.show()
-    plt.close()
+    open_ = pd.DataFrame({"A": [10.0, 11.0, 11.55], "B": [20.0, 21.0, 21.0]}, index=dates)
+    rules = TradeRules(config=BacktestConfig(use_open_execution=True))
+    hold = dates
+    ret, nav = simulate_period(close, hold, ["A", "B"], dates[0], open_, rules, 0.0)
+    expected = 0.5 * 1.155 + 0.5 * 1.05 - 1.0
+    assert abs(ret - expected) < 1e-9, f"got {ret}, want {expected}"
+    print(f"2-stock buy-hold OK: period_return={ret:.4%} (expected {expected:.4%})")
 
 
-def print_quantile_summary(result: QuantileResult):
-    """打印分组回测摘要到终端"""
-    q_labels = [c for c in result.nav.columns if c.startswith("Q")]
-    total_rets = (result.nav[q_labels].iloc[-1] - 1) * 100
+def _smoke_test_full_loop() -> None:
+    """Minimal multi-period backtest on synthetic panel."""
+    rng = np.random.default_rng(42)
+    dates = pd.bdate_range("2023-01-01", periods=120)
+    codes = [f"{i:06d}" for i in range(1, 51)]
+    close = pd.DataFrame(
+        10.0 * np.cumprod(1 + rng.normal(0.001, 0.02, (len(dates), len(codes))), axis=0),
+        index=dates, columns=codes,
+    )
+    open_ = close.shift(1).bfill() * 0.999
+    scores = pd.DataFrame(rng.normal(0, 1, close.shape), index=dates, columns=codes)
+    result = run_quantile_backtest(
+        close, scores, rebalance_freq="ME", open_prices=open_, top_n=10, min_stocks=3,
+    )
+    assert not result.nav.empty
+    assert result.turnover_detail is not None
+    print(f"Full loop OK: nav shape={result.nav.shape}, monotonicity={result.ic_monotonicity:.3f}")
 
-    print("\n" + "=" * 60)
-    print("  分组回测摘要")
-    print("=" * 60)
-    print(f"  {'组别':<8} {'累计收益':>10} {'年化收益':>10}")
-    print("-" * 60)
-    n_years = (result.nav.index[-1] - result.nav.index[0]).days / 365
-    for q in q_labels:
-        cum  = total_rets[q]
-        ann  = ((1 + cum / 100) ** (1 / max(n_years, 0.5)) - 1) * 100
-        bar  = "█" * max(0, int(ann / 5))
-        print(f"  {q:<8} {cum:>9.1f}%  {ann:>9.1f}%  {bar}")
-    if "benchmark" in result.nav.columns:
-        bm_cum = (result.nav["benchmark"].iloc[-1] - 1) * 100
-        bm_ann = ((1 + bm_cum / 100) ** (1 / max(n_years, 0.5)) - 1) * 100
-        print(f"\n  {'基准':<8} {bm_cum:>9.1f}%  {bm_ann:>9.1f}%")
-    print(f"\n  多空累计: {(result.long_short_nav.iloc[-1]-1)*100:.1f}%")
-    mono = result.ic_monotonicity
-    color = "\033[92m" if mono > 0.8 else "\033[93m" if mono > 0.5 else "\033[91m"
-    print(f"  单调性:   {color}{mono:.3f}{chr(27)}[0m"
-          f"  ({'优秀' if mono>0.8 else '一般' if mono>0.5 else '较差'})")
-    print("=" * 60)
+
+if __name__ == "__main__":
+    _smoke_test_2stock_math()
+    _smoke_test_full_loop()
+    print("quantile smoke test passed.")
