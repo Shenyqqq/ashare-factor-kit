@@ -1,6 +1,10 @@
 """
 data/download_northbound.py  —  北向资金个股持股数据下载
 
+⚠️ 北向持股披露已于 2024-08 起实质停更（监管口径调整）。
+本模块产物仅作历史归档；默认因子/IC/白名单路径**不再加载**北向数据
+（见 run.py / research.ic.load_data）。勿把停更后的稀疏/空值当成有效信号。
+
 接口：ak.stock_hsgt_individual_em(symbol)
       按股票代码拉取沪深股通历史持股数量（全量历史，约从2017年开始）
 
@@ -29,6 +33,16 @@ from loguru import logger
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import RAW_DIR, UNIVERSE_DIR
 
+# 北向个股持股公开披露实质停更日（约）；此日后数据不可信/常为空
+NORTHBOUND_DISCLOSURE_STOP = pd.Timestamp("2024-08-19")
+
+
+def _warn_northbound_deprecated() -> None:
+    logger.warning(
+        f"北向持股披露已于约 {NORTHBOUND_DISCLOSURE_STOP.date()} 停更；"
+        "本下载仅归档历史。默认管线不加载 northbound（勿误用停更后区间做因子/IC）。"
+    )
+
 
 def _load_existing(path: Path) -> dict:
     if path.exists():
@@ -38,6 +52,7 @@ def _load_existing(path: Path) -> dict:
 
 
 def download_northbound(codes: list, save_every: int = 100) -> tuple:
+    _warn_northbound_deprecated()
     hold_path = RAW_DIR / "northbound_holding.parquet"
     val_path  = RAW_DIR / "northbound_value.parquet"
 
@@ -108,6 +123,7 @@ def _save(hold_data, val_data, hold_path, val_path):
 
 
 def main(sample: int = 0):
+    _warn_northbound_deprecated()
     RAW_DIR.mkdir(parents=True, exist_ok=True)
     universe = pd.read_parquet(UNIVERSE_DIR / "stock_list.parquet")
     codes = universe["code"].tolist()

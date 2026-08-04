@@ -1,0 +1,29 @@
+# Top-24 by ICIR from IC h5 (OpenSourceAP batch2 run)
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - WQ_013
+  - WQ_055
+  - WQ_050
+  - WQ_040
+  - WQ_015
+  - WQ_027
+  - WQ_088
+  - WQ_003
+  - WQ_026
+  - WQ_012
+  - 月最大收益
+  - WQ_002
+  - WQ_018
+  - WQ_094
+  - WQ_004
+  - 综合股权融资
+  - WQ_019
+  - WQ_001
+  - 行业相对强度_20d
+  - WQ_068
+  - 换手率加速度
+  - AR_26d
+  - 融资余额变化_20d
+  - 换手率行业中性_20d

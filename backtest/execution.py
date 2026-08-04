@@ -15,6 +15,7 @@ from config.settings import (
     BID_ASK_SPREAD_BPS,
     COMMISSION_RATE,
     EXCLUDE_ST,
+    MIN_LISTING_DAYS,
     SLIPPAGE_RATE,
     STAMP_DUTY,
 )
@@ -30,7 +31,7 @@ class BacktestConfig:
     bid_ask_spread_bps: float = BID_ASK_SPREAD_BPS  # 单边 spread（bp），10bp=A股小盘股典型
     cost_bps: float = 3.5          # legacy single-side fallback (bp)
     exclude_st: bool = EXCLUDE_ST
-    min_listing_days: int = 60     # 0 = disabled
+    min_listing_days: int = MIN_LISTING_DAYS  # 与 IC/ML 同口径；0 = disabled
     min_lot_100: bool = False      # stub: lot rounding not applied yet
     strict_limit_mode: bool = True # True=一字板; False=any limit day blocks trade
     use_open_execution: bool = True
@@ -41,6 +42,15 @@ class BacktestConfig:
     #   rank_pct < (1 - threshold) 视为「排名大幅下降」，触发换仓
     turnover_limit: float = 1.0
     rank_change_threshold: float = 0.0
+    # ── 组合权重优化（v1：在已选集合上分配权重；默认 ew = 旧等权路径）────────
+    # portfolio_opt: ew | score | rank | mv | invvol | rp
+    # max_weight: 单票上限（0~1，如 0.1=10%）；None/≥1 = 不限制
+    # cov_lookback: mv/invvol/rp 用近期收益估计 Σ / σ 的交易日数
+    # risk_aversion: MV 目标中的 λ（越大越保守）
+    portfolio_opt: str = "ew"
+    max_weight: float | None = None
+    cov_lookback: int = 60
+    risk_aversion: float = 1.0
 
 
 @dataclass
@@ -107,6 +117,78 @@ class TradeRules:
             if pd.isna(vol) or vol <= 0:
                 return True
         return False
+
+    def buyable_mask(
+        self,
+        stocks: list[str] | pd.Index,
+        date: pd.Timestamp,
+        close: pd.DataFrame,
+    ) -> np.ndarray:
+        """Vectorized ``can_buy`` for one date × many stocks (bool array)."""
+        stocks = list(stocks)
+        n = len(stocks)
+        if n == 0:
+            return np.zeros(0, dtype=bool)
+        ok = np.ones(n, dtype=bool)
+
+        # delisted
+        if self.delist_dates:
+            for j, s in enumerate(stocks):
+                if not ok[j]:
+                    continue
+                if self.is_delisted(s, date):
+                    ok[j] = False
+
+        # ST
+        if self.config.exclude_st:
+            if self.st_schedule is not None and date in self.st_schedule.index:
+                cols = [s for s in stocks if s in self.st_schedule.columns]
+                if cols:
+                    st_row = self.st_schedule.loc[date, cols]
+                    st_map = {
+                        s: bool(st_row[s]) if pd.notna(st_row[s]) else False
+                        for s in cols
+                    }
+                    for j, s in enumerate(stocks):
+                        if ok[j] and st_map.get(s, False):
+                            ok[j] = False
+            elif self.st_codes:
+                for j, s in enumerate(stocks):
+                    if ok[j] and s in self.st_codes:
+                        ok[j] = False
+
+        # listing age
+        min_days = self.config.min_listing_days
+        if min_days > 0 and self.listing_dates:
+            for j, s in enumerate(stocks):
+                if not ok[j]:
+                    continue
+                listed = self.listing_dates.get(s)
+                if listed is not None and (date - listed).days < min_days:
+                    ok[j] = False
+
+        # suspension (vectorized)
+        sub_close = close.reindex(columns=stocks)
+        if date not in sub_close.index:
+            return np.zeros(n, dtype=bool)
+        px = sub_close.loc[date].to_numpy(dtype=np.float64, copy=False)
+        susp = ~np.isfinite(px) | (px <= 0)
+        if self.volume is not None and date in self.volume.index:
+            vol = self.volume.reindex(columns=stocks).loc[date].to_numpy(
+                dtype=np.float64, copy=False,
+            )
+            susp |= ~np.isfinite(vol) | (vol <= 0)
+        ok &= ~susp
+
+        # limit-up block
+        if self.masks is not None:
+            key = "limit_up_open" if self.config.strict_limit_mode else "limit_up"
+            lu = self.masks.get(key)
+            if lu is not None and date in lu.index:
+                lu_row = lu.reindex(columns=stocks).loc[date]
+                blocked = lu_row.fillna(False).to_numpy(dtype=bool)
+                ok &= ~blocked
+        return ok
 
     def passes_listing_filter(self, stock: str, date: pd.Timestamp) -> bool:
         min_days = self.config.min_listing_days
@@ -221,19 +303,29 @@ def build_st_schedule(
     dates: pd.DatetimeIndex,
     is_st_current: pd.Series | None = None,
     delist_dates: dict[str, pd.Timestamp] | None = None,
+    st_history: pd.DataFrame | None = None,
 ) -> pd.DataFrame | None:
-    """构建时间序列 ST 状态表（M4 修复：消除「所有历史日期都用当前 ST 状态」的失真）。
+    """构建时间序列 ST 状态表（M4 修复 + P0-2 真实历史接入）。
 
-    当前为保守实现：对当前 ST 股，假设其在所有回测日期均为 ST。
-    这比旧逻辑「所有历史日期都用当前状态」在方向上一致，但提供了 hook
-    让未来接入真实 ST 历史接口（如 ak.stock_zh_a_st_em）时只需替换本函数实现。
+    优先使用真实 ST 历史长表 ``st_history``（由 ``data/download_st_history.py``
+    产出，含 ``code / start_date / end_date / st_type`` 列，``end_date=NaT``
+    表示至今未摘帽）；按 ``[start_date, end_date]`` 区间在回测交易日上构建
+    wide bool DataFrame，精确还原每只股票的 ST/摘帽时点。
+
+    未提供 ``st_history`` 时，回退到 M4 保守实现（当前 ST 股在所有回测日期
+    均标 ST），保持向后兼容。
 
     Parameters
     ----------
-    stock_names : code → name（来自 universe/stock_list.parquet）
+    stock_names : code → name（来自 universe/stock_list.parquet）；仅在
+        ``st_history`` 为 None 时用于推断 ST 集合
     dates : 回测全部交易日索引
-    is_st_current : code → bool；可选，由 stock_list['is_st_current'] 提供
-    delist_dates : code → delist_date；可选，已退市股在退市后不标记为 ST（已不可交易）
+    is_st_current : code → bool；可选，由 stock_list['is_st_current'] 提供；
+        仅在 ``st_history`` 为 None 时使用
+    delist_dates : code → delist_date；可选，已退市股在退市后不标记为 ST
+    st_history : pd.DataFrame | None，真实 ST 历史长表（P0-2）。列：
+        code(str), start_date(Timestamp), end_date(Timestamp|NaT),
+        st_type(str), source(str)。优先于保守推断。
 
     Returns
     -------
@@ -241,6 +333,13 @@ def build_st_schedule(
         wide bool DataFrame：index=dates, columns=ST 股票代码, True=当日为 ST。
         无 ST 股时返回 None（下游回退到 st_codes 集合逻辑）。
     """
+    # ── P0-2：真实 ST 历史路径 ───────────────────────────────────────────
+    if st_history is not None and not st_history.empty:
+        return _build_st_schedule_from_history(
+            st_history, dates, delist_dates=delist_dates,
+        )
+
+    # ── 回退：M4 保守实现（当前 ST 全程标 ST）─────────────────────────────
     st_codes: set[str] = set()
     if is_st_current is not None and not is_st_current.empty:
         st_codes = {
@@ -253,10 +352,8 @@ def build_st_schedule(
         return None
 
     cols = sorted(c for c in st_codes)
-    # 保守实现：当前 ST 股在所有回测日期均标记为 ST
     schedule = pd.DataFrame(True, index=pd.DatetimeIndex(dates), columns=cols)
 
-    # 可选：退市股在退市后不再标记 ST（已不可交易，标记与否对回测无影响，但更准确）
     if delist_dates:
         for code in cols:
             d = delist_dates.get(code)
@@ -268,6 +365,74 @@ def build_st_schedule(
             except Exception:
                 pass
     return schedule
+
+
+def _build_st_schedule_from_history(
+    st_history: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    delist_dates: dict[str, pd.Timestamp] | None = None,
+) -> pd.DataFrame | None:
+    """从真实 ST 历史长表构建 wide bool 时间序列。
+
+    st_history 期望列：code(str), start_date, end_date(NaT=至今),
+    st_type, source。end_date=NaT 视为 +∞。
+    """
+    date_index = pd.DatetimeIndex(dates)
+    cols = sorted(st_history["code"].astype(str).str.zfill(6).unique())
+    if not cols:
+        return None
+
+    schedule = pd.DataFrame(False, index=date_index, columns=cols, dtype=bool)
+
+    for row in st_history.itertuples(index=False):
+        code = str(getattr(row, "code")).zfill(6)
+        if code not in schedule.columns:
+            continue
+        start = pd.Timestamp(getattr(row, "start_date"))
+        end_raw = getattr(row, "end_date")
+        end = pd.Timestamp(end_raw) if pd.notna(end_raw) else date_index[-1]
+        if pd.isna(start):
+            continue
+        mask = (date_index >= start) & (date_index <= end)
+        if mask.any():
+            schedule.loc[mask, code] = True
+
+    # 退市后不再标 ST（已不可交易；标记与否对回测无影响，但更准确）
+    if delist_dates:
+        for code in schedule.columns:
+            d = delist_dates.get(code)
+            if d is None or pd.isna(d):
+                continue
+            try:
+                after = schedule.index > pd.Timestamp(d)
+                schedule.loc[after, code] = False
+            except Exception:
+                pass
+
+    # 全 False 的列（回测期间无 ST）保留——下游 st_schedule 非空即按表查询，
+    # 全 False 列等价于「该股在回测期非 ST」，语义正确。
+    return schedule
+
+
+def build_listing_dates_from_stock_list(
+    stock_list: pd.DataFrame,
+) -> dict[str, pd.Timestamp]:
+    """从 stock_list.parquet 提取 code → list_date 字典（次新过滤）。
+
+    仅返回有有效 list_date 的股票。
+    """
+    if stock_list is None or stock_list.empty or "list_date" not in stock_list.columns:
+        return {}
+    sub = stock_list.dropna(subset=["list_date"])
+    if sub.empty:
+        return {}
+    out: dict[str, pd.Timestamp] = {}
+    for _, row in sub.iterrows():
+        code = str(row["code"]).zfill(6)
+        d = pd.to_datetime(row["list_date"], errors="coerce")
+        if pd.notna(d):
+            out[code] = d
+    return out
 
 
 def build_delist_dates_from_stock_list(

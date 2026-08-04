@@ -4,7 +4,14 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from research.ic.statistics import ic_stats, icir, newey_west_t, prepare_ic_for_stats, win_rates
+from research.ic.statistics import (
+    ic_direction_sign,
+    ic_stats,
+    icir,
+    newey_west_t,
+    prepare_ic_for_stats,
+    win_rates,
+)
 
 
 def _assert_close(a, b, tol=1e-4, msg=""):
@@ -25,6 +32,9 @@ def test_win_rate_sign_aware():
     _assert_close(aligned_p, pos_r, msg="positive mean → positive win rate")
     _assert_close(aligned_n, (neg < 0).mean(), msg="negative mean → negative win rate")
     assert pos_r > 0.5 and neg_r < 0.5
+    assert ic_direction_sign(float(pos.mean())) == 1.0
+    assert ic_direction_sign(float(neg.mean())) == -1.0
+    assert ic_direction_sign(0.0) == 0.0
 
 
 def test_ic_clip():

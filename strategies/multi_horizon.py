@@ -102,6 +102,7 @@ def run_multi_horizon(
     factor_whitelist: list | None = None,
     train_windows: list | None = None,
     train_window_units: str = "months",
+    val_window: int | None = None,
     artifact_dir=None,
     wf_selection: str = "ic_weighted",
     label_mode: str = "cs_zscore",
@@ -114,6 +115,10 @@ def run_multi_horizon(
     industry_map: pd.Series | None = None,
     regime_states: pd.Series | None = None,
     show_report: bool = False,
+    enable_shap: bool = False,
+    shap_top: int = 20,
+    shap_max_samples: int = 500,
+    shap_max_dates: int = 12,
 ) -> tuple[pd.DataFrame, dict]:
     """
     多期限集成训练。
@@ -178,6 +183,7 @@ def run_multi_horizon(
             factor_whitelist=factor_whitelist,
             train_windows=train_windows,
             train_window_units=train_window_units,
+            val_window=val_window,
             artifact_dir=sub_artifact,
             rebalance_freq=rebalance_freq,
             wf_selection=wf_selection,
@@ -190,6 +196,10 @@ def run_multi_horizon(
             industry_map=industry_map,
             device=device,
             regime_states=regime_states,
+            enable_shap=enable_shap,
+            shap_top=shap_top,
+            shap_max_samples=shap_max_samples,
+            shap_max_dates=shap_max_dates,
             **extra_kwargs,
             **cache_kwargs,
         )

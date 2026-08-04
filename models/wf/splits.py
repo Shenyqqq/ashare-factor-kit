@@ -27,24 +27,33 @@ def get_window_splits(
     """
     Return (train_start, train_end, val_start, val_end) slice indices.
 
-    ``window_specific_val=True`` (v2 default): validation sits immediately
-    after each window's training span; longer windows use an earlier val block
-    (not one shared global val ending at ``idx``):
+    ``window_specific_val=True`` (default): shared recent validation ending
+    at ``idx`` for every train window; only train length ``W`` differs::
+
+        val_window=V, predict at idx:
+          any W:  train [idx-V-W, idx-V),  val [idx-V, idx)
+
+        val_window=0 (no independent val):
+          any W:  train [idx-W, idx),  val []  (val_start == val_end == idx)
+          Caller still applies purge/embargo against pred to avoid label leak.
+
+    ``window_specific_val=False`` (deprecated / tests only): legacy offset
+    layout where longer windows push val earlier::
 
         min_w=6, val_window=6, predict at idx:
           W=6:  train [idx-12, idx-6),  val [idx-6, idx)
           W=12: train [idx-24, idx-12), val [idx-12, idx-6)
 
-    ``window_specific_val=False``: v1-compatible — shared val [idx-val, idx).
-
     All intervals satisfy ``val_end <= idx`` (no lookahead at prediction).
     """
     if window_specific_val:
+        # Shared recent val for all train windows (V=0 → train abuts pred).
+        t = idx - val_window
+    else:
+        # Legacy: longer train windows shift val earlier (deprecated).
         min_w = min_train_window if min_train_window is not None else window
         offset = max(0, window - min_w)
         t = idx - val_window - offset
-    else:
-        t = idx - val_window
 
     train_end = t
     train_start = max(0, train_end - window)
@@ -109,14 +118,16 @@ def purge_train_indices(
     ``date_pos_map``（可选）: 预构建的 ``{date: position}`` 字典，避免在循环内
     反复调用 ``list.index()``（O(N) → O(1)）。未传入时回退到 ``list.index()``。
     """
-    if not train_dates or not val_dates:
+    if not train_dates:
         return train_dates
     if date_pos_map is None:
         date_pos_map = {d: i for i, d in enumerate(rebalance_dates)}
-    val_start = val_dates[0]
+    val_start = val_dates[0] if val_dates else None
     kept = []
     for d in train_dates:
-        if _label_overlap_periods(d, val_start, rebalance_dates, hold_period_days, date_pos_map):
+        if val_start is not None and _label_overlap_periods(
+            d, val_start, rebalance_dates, hold_period_days, date_pos_map,
+        ):
             continue
         if pred_date is not None and _label_overlap_periods(
             d, pred_date, rebalance_dates, hold_period_days, date_pos_map,

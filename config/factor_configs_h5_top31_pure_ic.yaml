@@ -1,0 +1,37 @@
+﻿# STALE / 已过时：新兴剔除主池后请改用 factor_configs_h5_top24_pure_ic.yaml（来源 selected_factors_h5.json 2026-07-19）
+# Top-31 by ICIR from IC h5 (OpenSourceAP batch2 run)
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - WQ_013
+  - WQ_044
+  - WQ_055
+  - WQ_050
+  - WQ_040
+  - WQ_015
+  - WQ_027
+  - WQ_088
+  - WQ_003
+  - WQ_026
+  - WQ_012
+  - 未来30日解禁次数
+  - 月最大收益
+  - WQ_002
+  - WQ_018
+  - WQ_094
+  - WQ_004
+  - 综合股权融资
+  - WQ_019
+  - 跌停弱势_20d
+  - WQ_011
+  - WQ_001
+  - 行业相对强度_20d
+  - WQ_068
+  - 换手率加速度
+  - AR_26d
+  - 融资余额变化_20d
+  - 换手率行业中性_20d
+  - 涨停强度_20d
+  - 涨跌停净强度_20d
+  - 龙虎榜连续上榜

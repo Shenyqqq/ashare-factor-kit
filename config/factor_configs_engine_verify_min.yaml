@@ -1,0 +1,10 @@
+# Minimal factor config for engine-fix verification (low memory)
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - 反转_20d
+  - 动量_20d
+  - 波动率_20d
+  - 换手率行业中性_20d
+  - 价值_PB

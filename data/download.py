@@ -6,20 +6,23 @@ data/download.py  —  下载历史数据，存为 parquet
     open_hfq.parquet     — 后复权开盘价
     high_hfq.parquet     — 后复权最高价
     low_hfq.parquet      — 后复权最低价
-    volume.parquet       — 成交量（股）
+    volume.parquet       — 成交量（**手**；1 手 = 100 股；AKShare stock_zh_a_hist 原口径）
     amount.parquet       — 成交额（元）
-    prices_raw.parquet   — 不复权收盘价（计算PB用）
+    prices_raw.parquet   — 不复权收盘价（计算 PB / 自算市值用）
     financial_indicators.parquet — 季报财务指标
 
 特性：
   - 断点续传：中断后重跑自动跳过已下载的股票
   - 增量更新：已有数据只补充最新部分，不重复下载历史
   - OHLCV 一次请求全取，不重复调用 API
+  - **hfq / raw 对齐**：不复权下载会对照 close_hfq 末日，强制补齐落后股票；
+    主流程结束后校验覆盖率，防止 raw 相对 hfq 静默塌缩（拖垮 circ_mv）
 
 用法:
-    python -m data.download                    # 全量（首次）
-    python -m data.download --update           # 增量更新到今天
+    python -m data.download                    # 增量补齐到今天（已有则只补新区间）
+    python -m data.download --start 2018-01-01 # 指定起始（默认即此）
     python -m data.download --sample 100       # 调试：只下载前100只
+    # 注意：没有 --update 开关；日常直接跑本模块即增量。详见 data/DATA_UPDATE.md
 """
 import argparse
 import threading
@@ -93,6 +96,80 @@ def _save_wide(data: dict, path: Path):
     df.index = pd.to_datetime(df.index)
     df.sort_index().to_parquet(path)
     return df
+
+
+def _last_valid_by_code(path: Path) -> dict[str, pd.Timestamp]:
+    """宽表 parquet → {code: last_valid_index}；文件不存在则 {}。"""
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_parquet(path)
+    except Exception as e:
+        logger.warning(f"读取 peer 面板失败 {path}: {e}")
+        return {}
+    df.index = pd.to_datetime(df.index)
+    df.columns = df.columns.astype(str).str.zfill(6)
+    out: dict[str, pd.Timestamp] = {}
+    for c in df.columns:
+        s = df[c].dropna()
+        if len(s):
+            out[c] = pd.Timestamp(s.index[-1])
+    return out
+
+
+def report_raw_hfq_coverage(
+    hfq_path: Path | None = None,
+    raw_path: Path | None = None,
+    max_lag_days: int = 3,
+    raise_on_gap: bool = False,
+) -> dict:
+    """对比 close_hfq vs prices_raw 覆盖；raw 落后时 WARNING（可选 raise）。
+
+    根因场景：hfq / raw 分两次增量下载，raw 中断或被限流后，约一半股票停在旧末日，
+    而 ``circ_mv = prices_raw × circ_shares`` 会随 raw 塌缩。
+    """
+    hfq_path = hfq_path or (RAW_DIR / "close_hfq.parquet")
+    raw_path = raw_path or (RAW_DIR / "prices_raw.parquet")
+    if not hfq_path.exists() or not raw_path.exists():
+        logger.warning("raw/hfq 覆盖校验跳过：文件缺失")
+        return {}
+    hfq = pd.read_parquet(hfq_path)
+    raw = pd.read_parquet(raw_path)
+    hfq.index = pd.to_datetime(hfq.index)
+    raw.index = pd.to_datetime(raw.index)
+    hfq.columns = hfq.columns.astype(str).str.zfill(6)
+    raw.columns = raw.columns.astype(str).str.zfill(6)
+    common = hfq.columns.intersection(raw.columns)
+    if len(common) == 0:
+        logger.warning("raw/hfq 无共同列，覆盖校验跳过")
+        return {}
+    hn = hfq[common].notna()
+    rn = raw[common].notna()
+    miss = hn & ~rn
+    last_h = hfq[common].apply(lambda s: s.last_valid_index())
+    last_r = raw[common].apply(lambda s: s.last_valid_index())
+    lag = (last_h - last_r).dt.days
+    behind = int((lag > max_lag_days).sum())
+    stats = {
+        "hfq_overall": float(hn.mean().mean()),
+        "raw_overall": float(rn.mean().mean()),
+        "cells_hfq_ok_raw_miss": int(miss.sum().sum()),
+        "stocks_raw_behind_hfq": behind,
+        "max_lag_days_allowed": max_lag_days,
+    }
+    msg = (
+        f"prices_raw vs hfq 覆盖: overall hfq={stats['hfq_overall']:.4f} "
+        f"raw={stats['raw_overall']:.4f}; "
+        f"hfq有值raw缺={stats['cells_hfq_ok_raw_miss']}; "
+        f"raw落后>{max_lag_days}日的股票={behind}"
+    )
+    if behind > 0 or stats["cells_hfq_ok_raw_miss"] > 0:
+        logger.warning(msg + " — 请重跑 `python -m data.download` 补齐不复权")
+        if raise_on_gap:
+            raise RuntimeError(msg)
+    else:
+        logger.info(msg + " ✓")
+    return stats
 
 
 # ── 股票列表 ──────────────────────────────────────────────────────────────────
@@ -380,14 +457,19 @@ def download_ohlcv(
     end: str,
     adjust: str = "hfq",
     save_every: int = 200,
+    peer_last: dict[str, pd.Timestamp] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """
     下载日线 OHLCV，一次 API 请求取 open/close/high/low/volume/amount。
 
     adjust: "hfq"=后复权, ""=不复权
+    peer_last: 可选对照面板末日 {code: Timestamp}。用于不复权下载时强制补齐
+        相对 close_hfq 落后的股票（防止 raw/hfq 分次下载导致覆盖塌缩）。
     返回: {field_name: DataFrame(date×stock)}
         后复权: open_hfq, close_hfq, high_hfq, low_hfq, volume, amount
         不复权: close_raw（仅 close）
+
+    单位：volume = **手**（1手=100股）；amount = 元。
     """
     suffix = "_hfq" if adjust == "hfq" else "_raw"
     # 文件路径映射
@@ -411,13 +493,26 @@ def download_ohlcv(
     last_trade = get_last_trade_date()  # 已排除今日（盘后数据未发布）
     target_end = min(last_trade, pd.Timestamp(end))
 
-    # 判断哪些股票需要更新（以 close 为准）
+    # 判断哪些股票需要更新（以 close 为准；不复权额外对照 peer/hfq）
     close_col = "收盘"
     need = []
+    peer_forced = 0
     for code in codes:
         series = data[close_col].get(code)
-        if series is None or len(series) == 0 or series.index[-1] < target_end:
+        last = (
+            pd.Timestamp(series.index[-1])
+            if series is not None and len(series) > 0
+            else None
+        )
+        behind_calendar = last is None or last < target_end
+        peer_ts = peer_last.get(code) if peer_last else None
+        behind_peer = (
+            peer_ts is not None and (last is None or last < pd.Timestamp(peer_ts))
+        )
+        if behind_calendar or behind_peer:
             need.append(code)
+            if behind_peer and not behind_calendar:
+                peer_forced += 1
 
     if not need:
         label = "后复权" if adjust == "hfq" else "不复权"
@@ -426,11 +521,38 @@ def download_ohlcv(
                 for ak_col, (key, _) in paths.items()}
 
     label = "后复权" if adjust == "hfq" else "不复权"
-    logger.info(f"OHLCV ({label}): 需下载/更新 {len(need)}/{len(codes)} 只（并发={OHLCV_WORKERS}线程）")
+    extra = f"，其中对照 hfq 强制补齐 {peer_forced} 只" if peer_forced else ""
+    logger.info(
+        f"OHLCV ({label}): 需下载/更新 {len(need)}/{len(codes)} 只"
+        f"（并发={OHLCV_WORKERS}线程{extra}）"
+    )
 
     lock = threading.Lock()
     failed = []
     done_count = 0
+
+    def _code_to_sina_symbol(code: str) -> str:
+        c = str(code).zfill(6)
+        if c.startswith(("6", "9")):
+            return f"sh{c}"
+        return f"sz{c}"
+
+    def _fetch_raw_via_sina(code: str, code_start: str, code_end: str) -> pd.DataFrame | None:
+        """东财不可用时：新浪 stock_zh_a_daily(adjust='') 补不复权收盘价。"""
+        sym = _code_to_sina_symbol(code)
+        sdf = ak.stock_zh_a_daily(
+            symbol=sym,
+            start_date=code_start,
+            end_date=code_end,
+            adjust="",
+        )
+        if sdf is None or sdf.empty:
+            return None
+        out = pd.DataFrame({
+            "日期": pd.to_datetime(sdf["date"]),
+            "收盘": pd.to_numeric(sdf["close"], errors="coerce"),
+        })
+        return out.dropna(subset=["日期"])
 
     def _fetch_ohlcv(code: str):
         series = data[close_col].get(code)
@@ -439,16 +561,29 @@ def download_ohlcv(
             if series is not None and len(series) > 0
             else start.replace("-", "")
         )
+        code_end = end.replace("-", "")
         try:
             df = ak.stock_zh_a_hist(
                 symbol=code, period="daily",
                 start_date=code_start,
-                end_date=end.replace("-", ""),
+                end_date=code_end,
                 adjust=adjust,
             )
             time.sleep(0.05)
+            if (df is None or df.empty) and adjust == "":
+                df = _fetch_raw_via_sina(code, code_start, code_end)
+                time.sleep(0.05)
             return code, df, None
         except Exception as e:
+            # 不复权：东财失败时回退新浪（hfq 仍只走东财，避免复权口径混用）
+            if adjust == "":
+                try:
+                    df = _fetch_raw_via_sina(code, code_start, code_end)
+                    time.sleep(0.05)
+                    if df is not None and not df.empty:
+                        return code, df, None
+                except Exception as e2:
+                    return code, None, e2
             return code, None, e
 
     with ThreadPoolExecutor(max_workers=OHLCV_WORKERS) as executor:
@@ -463,8 +598,9 @@ def download_ohlcv(
                     failed.append(code)
                     logger.warning(f"OHLCV 下载失败 {code}: {err}")
                 elif df is not None and not df.empty:
-                    df["日期"] = pd.to_datetime(df["日期"])
-                    df = df.set_index("日期")
+                    date_col = "日期" if "日期" in df.columns else "date"
+                    df[date_col] = pd.to_datetime(df[date_col])
+                    df = df.set_index(date_col)
                     for ak_col in paths:
                         if ak_col not in df.columns:
                             continue
@@ -650,7 +786,7 @@ def _save_financial(records: list, out_path: Path) -> pd.DataFrame:
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
-def main(start: str, end: str, sample: int = 0):
+def main(start: str, end: str, sample: int = 0, quality_report: bool = False):
     ensure_dirs()
 
     stock_list = get_stock_list()
@@ -671,10 +807,12 @@ def main(start: str, end: str, sample: int = 0):
     if "close_hfq" in hfq:
         hfq["close_hfq"].to_parquet(RAW_DIR / "prices_hfq.parquet")
 
-    # 不复权收盘价（计算 PB 用）
-    logger.info("=== 不复权收盘价 ===")
-    download_ohlcv(codes, start, end, adjust="")
+    # 不复权收盘价（PB / 自算市值）：对照 hfq 末日强制对齐，避免覆盖塌缩
+    logger.info("=== 不复权收盘价（对照 hfq 对齐）===")
+    peer_last = _last_valid_by_code(RAW_DIR / "close_hfq.parquet")
+    download_ohlcv(codes, start, end, adjust="", peer_last=peer_last)
     # 向后兼容：prices_raw.parquet 已在 download_ohlcv 里保存
+    report_raw_hfq_coverage()
 
     # 财务季报
     logger.info("=== 财务指标（季报）===")
@@ -688,11 +826,24 @@ def main(start: str, end: str, sample: int = 0):
         size_mb = f.stat().st_size / 1024 / 1024
         logger.info(f"  {f.name:35s} {size_mb:.1f} MB")
 
+    # P1-3: 下载完成后生成数据质量报告
+    if quality_report:
+        logger.info("=== 生成数据质量报告 ===")
+        try:
+            from data.quality_report import generate_quality_report
+            report_path = generate_quality_report(data_dir=str(RAW_DIR))
+            if report_path:
+                logger.info(f"质量报告: {report_path}")
+        except Exception as e:
+            logger.warning(f"质量报告生成失败（忽略）: {e}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--start",  default="2018-01-01")
     parser.add_argument("--end",    default=pd.Timestamp.today().strftime("%Y-%m-%d"))
     parser.add_argument("--sample", type=int, default=0)
+    parser.add_argument("--quality-report", action="store_true",
+                        help="下载完成后生成 data/quality_report_YYYYMMDD.md")
     args = parser.parse_args()
-    main(args.start, args.end, args.sample)
+    main(args.start, args.end, args.sample, quality_report=args.quality_report)

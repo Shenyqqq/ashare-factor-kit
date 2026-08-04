@@ -1,0 +1,41 @@
+# raw-IC h5 因子白名单（30 稠密 + 4 稀疏）
+# 由 research/output/_select_raw_h5.py 生成；对照轨 = config/factor_configs.yaml (barra pure)
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - GTJA_099
+  - GTJA_176
+  - GTJA_064
+  - WQ_050
+  - GTJA_042
+  - GTJA_032
+  - GTJA_140
+  - WQ_027
+  - GTJA_070
+  - A158_CORD20
+  - WQ_003
+  - WQ_026
+  - GTJA_074
+  - GTJA_179
+  - A158_CORR20
+  - WQ_012
+  - A158_VSUMP60
+  - 融资余额变化_20d
+  - AR_26d
+  - GTJA_001
+  - 月最大收益
+  - GTJA_156
+  - A158_KLEN
+  - A158_VMA60
+  - A158_KLOW
+  - GTJA_094
+  - GTJA_061
+  - A158_IMAX30
+  - WQ_002
+  - A158_KUP
+  factors_sparse:
+  - 龙虎榜连续上榜
+  - 涨跌停净强度_20d
+  - 未来30日解禁次数
+  - 龙虎榜净买额_20d

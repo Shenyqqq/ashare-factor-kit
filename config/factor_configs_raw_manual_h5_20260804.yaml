@@ -1,0 +1,47 @@
+# raw 手工因子池 h5（周频）— ridge 对照实验
+# dense 33（去重后）+ sparse 4（经 --special-factors 按名注入，非全量 sparse pack）
+# 名称修正：WQ_40→WQ_040, GTJA_42→GTJA_042, WQ_44→WQ_044, A158_LOWO→A158_LOW0
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - GTJA_159
+  - 振幅_20d
+  - 波动率_20d
+  - 特质波动率_60d
+  - 融券余额变化_20d
+  - 月最大收益
+  - A158_KLEN
+  - WQ_040
+  - GTJA_042
+  - GTJA_185
+  - GTJA_140
+  - GTJA_189
+  - GTJA_083
+  - WQ_016
+  - 价值_PB
+  - GTJA_099
+  - A158_LOW0
+  - A158_STD5
+  - A158_STD20
+  - A158_CORR10
+  - AR_26d
+  - GTJA_156
+  - A158_MIN60
+  - A158_VSUMN60
+  - A158_VSUMP60
+  - WQ_044
+  - WQ_013
+  - WQ_050
+  - WQ_088
+  - WQ_006
+  - 资产市值比
+  - 营收市值比
+  - 融资余额流通市值比
+  # 训练侧不会读 factors_sparse；须配合 CLI：
+  # --special-factors 解禁定增压力_60d,连板数,龙虎榜跌幅上榜规避_20d,大宗交易频次_20d
+  factors_sparse:
+  - 解禁定增压力_60d
+  - 连板数
+  - 龙虎榜跌幅上榜规避_20d
+  - 大宗交易频次_20d

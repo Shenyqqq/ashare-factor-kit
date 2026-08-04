@@ -1,0 +1,17 @@
+# sparse-only companion; inject via --special-factors sparse --sparse-from-ic research/output/selected_factors_h5_cap_micro_small_100.json
+# n=10
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors: []
+  factors_sparse:
+  - 龙虎榜连续上榜
+  - 连板数
+  - 涨跌停净强度_20d
+  - 龙虎榜涨幅上榜_20d
+  - 龙虎榜换手上榜_20d
+  - 龙虎榜跌幅上榜规避_20d
+  - 龙虎榜净买占比_20d
+  - 未来30日解禁次数
+  - 龙虎榜机构净买入_20d
+  - 解禁定增压力_60d

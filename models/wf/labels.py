@@ -9,6 +9,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from utils.wls import wls_residual
+
 
 def cross_sectional_rank(y: np.ndarray) -> np.ndarray:
     """Percentile rank in [0, 1]."""
@@ -28,6 +30,112 @@ def cross_sectional_zscore(y: np.ndarray) -> np.ndarray:
     if sigma < 1e-12:
         return np.zeros_like(y, dtype=float)
     return (y - mu) / sigma
+
+
+def top_cs_zscore_label(
+    y: np.ndarray,
+    top_frac: float = 0.4,
+    fill_value: float = 0.0,
+) -> np.ndarray:
+    """
+    截面前 ``top_frac`` 保留全截面 ``cs_zscore``，其余置常数。
+
+    公式（每个调仓日截面、无泄漏）：
+      z    = cs_zscore(y)                 # 全截面 μ/σ，与默认 cs_zscore 同口径
+      keep = rank_pct(y) >= 1 - top_frac  # top_frac=0.4 → 分位 ≥ 0.60
+      y'   = where(keep, z, fill_value)   # 默认 fill_value=0
+
+    阈上保留的是全截面 z-score 幅度（非区内 re-rank / 区内再 z-score）。
+    """
+    y_f = np.asarray(y, dtype=float)
+    if len(y_f) == 0:
+        return y_f.astype(np.float32)
+    if not (0.0 < float(top_frac) <= 1.0):
+        raise ValueError(f"top_frac 须在 (0, 1]，收到 {top_frac}")
+    z = cross_sectional_zscore(y_f)
+    rank_pct = cross_sectional_rank(y_f)
+    thr = 1.0 - float(top_frac)
+    out = np.where(rank_pct >= thr, z, float(fill_value))
+    return out.astype(np.float32)
+
+
+def long_bias_sample_weights(
+    y: np.ndarray,
+    top_frac: float = 0.4,
+    bottom_weight: float = 0.25,
+    curve: str = "smooth",
+    transition: float = 0.10,
+) -> np.ndarray:
+    """
+    多头偏置样本权重（标签本身保持连续，不在此函数改 y）。
+
+    按截面 ``rank_pct(y)`` 赋权，使 top 区 loss 权重大、bottom 区仍保留
+    对比信息（权重 > 0，避免 60% 硬置 0 主导 MSE）。
+
+    Parameters
+    ----------
+    y : ndarray
+        原始截面收益（或任意可排序量）；权重只依赖其截面秩。
+    top_frac : float
+        多头区占比；``thr = 1 - top_frac``（默认 0.4 → thr=0.60）。
+    bottom_weight : float
+        下侧基准权重，须在 ``(0, 1]``；默认 0.25。
+    curve : ``"smooth"`` | ``"step"``
+        ``step``：rank≥thr → 1，否则 → bottom_weight。
+        ``smooth``：在 thr 附近用 hermite smoothstep 过渡（带宽
+        ``2*transition``），避免权重悬崖。
+    transition : float
+        仅 ``smooth``：过渡半宽（rank 单位），默认 0.10。
+    """
+    y_f = np.asarray(y, dtype=float)
+    n = len(y_f)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    if not (0.0 < float(top_frac) <= 1.0):
+        raise ValueError(f"top_frac 须在 (0, 1]，收到 {top_frac}")
+    bw = float(bottom_weight)
+    if not (0.0 < bw <= 1.0):
+        raise ValueError(f"bottom_weight 须在 (0, 1]，收到 {bottom_weight}")
+    rank_pct = cross_sectional_rank(y_f)
+    thr = 1.0 - float(top_frac)
+    if curve == "step":
+        return np.where(rank_pct >= thr, 1.0, bw).astype(np.float64)
+    if curve == "smooth":
+        half = max(float(transition), 1e-6)
+        t = np.clip((rank_pct - (thr - half)) / (2.0 * half), 0.0, 1.0)
+        s = t * t * (3.0 - 2.0 * t)  # hermite smoothstep
+        return (bw + (1.0 - bw) * s).astype(np.float64)
+    raise ValueError(f"未知 curve: {curve}，可选 smooth | step")
+
+
+def soft_truncate_rank_label(
+    y: np.ndarray,
+    top_frac: float = 0.4,
+    floor_slope: float = 0.25,
+) -> np.ndarray:
+    """
+    软截断多头标签：连续、无 60% 常数零平台。
+
+    公式（截面 rank_pct ∈ [0,1]，``τ = 1 - top_frac``）：
+      r ≥ τ :  y' = (r - τ) / (1 - τ)          ∈ [0, 1]
+      r < τ :  y' = floor_slope * (r - τ) / τ   ∈ [-floor_slope, 0)
+
+    在 τ 处连续（y'=0）；下侧为小负斜率而非硬置 0，保留排序对比。
+    """
+    y_f = np.asarray(y, dtype=float)
+    if len(y_f) == 0:
+        return y_f.astype(np.float32)
+    if not (0.0 < float(top_frac) <= 1.0):
+        raise ValueError(f"top_frac 须在 (0, 1]，收到 {top_frac}")
+    slope = float(floor_slope)
+    if slope < 0.0:
+        raise ValueError(f"floor_slope 须 ≥ 0，收到 {floor_slope}")
+    r = cross_sectional_rank(y_f)
+    tau = 1.0 - float(top_frac)
+    above = (r - tau) / max(1.0 - tau, 1e-12)
+    below = slope * (r - tau) / max(tau, 1e-12)
+    out = np.where(r >= tau, above, below)
+    return out.astype(np.float32)
 
 
 def triple_barrier_label(
@@ -189,16 +297,23 @@ def transform_labels(
     *,
     barra_factors: pd.DataFrame | None = None,
     industry_dummies: pd.DataFrame | None = None,
+    top_frac: float = 0.4,
+    floor_slope: float = 0.25,
 ) -> np.ndarray:
     """
     Transform forward-return labels for training.
 
     Parameters
     ----------
-    mode : ``raw`` | ``cs_rank`` | ``cs_zscore`` | ``barra_residual`` | ``triple_barrier``
+    mode : ``raw`` | ``cs_rank`` | ``cs_zscore`` | ``top40_cs_zscore``
+          | ``cs_rank_softlong`` | ``barra_residual`` | ``triple_barrier``
     barra_factors, industry_dummies :
         仅 ``mode='barra_residual'`` 时使用，需为对齐到当期股票索引的
         DataFrame（stock × control）。省略时退化为 ``cs_zscore``。
+    top_frac :
+        ``top40_cs_zscore`` / ``cs_rank_softlong``：多头区占比（默认 0.4）。
+    floor_slope :
+        仅 ``cs_rank_softlong``：下侧负斜率幅度（默认 0.25）。
 
     ``mode='triple_barrier'`` 时，``y`` 应已是预计算的当期 triple-barrier
     标签（sign 或 return，由调用方从 ``triple_barrier_label`` 面板按当期
@@ -210,6 +325,12 @@ def transform_labels(
         return cross_sectional_rank(y.astype(float)).astype(np.float32)
     if mode == "cs_zscore":
         return cross_sectional_zscore(y.astype(float)).astype(np.float32)
+    if mode == "top40_cs_zscore":
+        return top_cs_zscore_label(y, top_frac=top_frac, fill_value=0.0)
+    if mode == "cs_rank_softlong":
+        return soft_truncate_rank_label(
+            y, top_frac=top_frac, floor_slope=floor_slope,
+        )
     if mode == "triple_barrier":
         # y 已是当期预计算的 triple-barrier 标签；做截面标准化供回归训练
         return cross_sectional_zscore(y.astype(float)).astype(np.float32)
@@ -217,26 +338,52 @@ def transform_labels(
         if barra_factors is None and industry_dummies is None:
             # 无控制变量时退化为截面 z-score（保留向后兼容）
             return cross_sectional_zscore(y.astype(float)).astype(np.float32)
-        y_series = pd.Series(y)
+        # trainer 传入的 y 是 ndarray（无股票索引）；控制矩阵已按 stock_idx 对齐，
+        # 必须用控制矩阵的 index 挂到 y 上，否则 residual_return_label 的 reindex
+        # 对不上股票代码 → 控制列全 0 → 静默退化成 cs_zscore（ablation 失效）。
+        y_arr = np.asarray(y, dtype=float)
+        if isinstance(y, pd.Series) and len(y) == len(y_arr):
+            y_series = y.astype(float)
+        elif barra_factors is not None and len(barra_factors) == len(y_arr):
+            y_series = pd.Series(y_arr, index=barra_factors.index)
+        elif industry_dummies is not None and len(industry_dummies) == len(y_arr):
+            y_series = pd.Series(y_arr, index=industry_dummies.index)
+        else:
+            y_series = pd.Series(y_arr)
         resid = residual_return_label(y_series, barra_factors, industry_dummies)
         # 残差再做截面 z-score，保证训练稳定性（与 cs_zscore 同尺度）
         return cross_sectional_zscore(resid.values.astype(float)).astype(np.float32)
     raise ValueError(
-        f"未知 label_mode: {mode}，可选 raw | cs_rank | cs_zscore | triple_barrier | barra_residual"
+        f"未知 label_mode: {mode}，可选 raw | cs_rank | cs_zscore | top40_cs_zscore "
+        f"| cs_rank_softlong | triple_barrier | barra_residual"
     )
+
+
+def _align_controls(ctrl: pd.DataFrame, target_index: pd.Index) -> pd.DataFrame:
+    """按股票索引对齐控制矩阵；无标签重叠且长度相同时退化为位置对齐。"""
+    aligned = ctrl.reindex(target_index)
+    if aligned.isna().all().all() and len(ctrl) == len(target_index):
+        # 索引完全错位（常见：RangeIndex vs 股票代码）→ 按位置挂目标索引
+        aligned = pd.DataFrame(
+            np.asarray(ctrl, dtype=np.float32),
+            index=target_index,
+            columns=ctrl.columns,
+        )
+    return aligned.fillna(0.0)
 
 
 def residual_return_label(
     y: pd.Series,
     barra_factors: pd.DataFrame | None = None,
     industry_dummies: pd.DataFrame | None = None,
+    weights: pd.Series | None = None,
 ) -> pd.Series:
     """
     Barra + industry neutralized residual return label.
 
-    对单个截面做 OLS ``y ~ [const, Barra_*, industry_dummies_*]``，取残差作为
-    剔除系统性风格/行业暴露后的"纯 alpha"标签。参考 ``research/ic/barra.py``
-    的纯 IC 残差化实现（同样的控制变量构造方式）。
+    对单个截面做 WLS ``y ~ [const, Barra_*, industry_dummies_*]``（权重 = √市值），
+    取残差作为剔除系统性风格/行业暴露后的"纯 alpha"标签。参考
+    ``research/ic/barra.py`` 的纯 IC 残差化实现（同样的控制变量与权重口径）。
 
     Parameters
     ----------
@@ -246,6 +393,8 @@ def residual_return_label(
         当期 Barra 风格因子值（stock × 9 Barra 因子，已截面 z-score）。
     industry_dummies : pd.DataFrame | None
         当期行业哑变量（stock × (n_industries - 1)，已 drop_first）。
+    weights : pd.Series | None
+        当期回归权重（= √市值，索引为股票代码）。None → 等权 OLS。
 
     Returns
     -------
@@ -261,9 +410,9 @@ def residual_return_label(
 
     controls = []
     if barra_factors is not None and not barra_factors.empty:
-        controls.append(barra_factors.reindex(y_s.index).fillna(0.0))
+        controls.append(_align_controls(barra_factors, y_s.index))
     if industry_dummies is not None and not industry_dummies.empty:
-        controls.append(industry_dummies.reindex(y_s.index).fillna(0.0))
+        controls.append(_align_controls(industry_dummies, y_s.index))
 
     if not controls:
         return y_s
@@ -273,11 +422,12 @@ def residual_return_label(
     if len(y_s) < 2 * (X_df.shape[1] + 1) or len(y_s) < 30:
         return y_s
 
-    A = np.column_stack([np.ones(len(y_s), dtype=np.float64), X_df.values.astype(np.float64)])
-    try:
-        coef, _, _, _ = np.linalg.lstsq(A, y_s.values.astype(np.float64), rcond=None)
-        resid = y_s.values.astype(np.float64) - A @ coef
-    except Exception:
+    w_v = None
+    if weights is not None:
+        w_v = pd.Series(weights).reindex(y_s.index).values
+
+    resid = wls_residual(y_s.values.astype(np.float64), X_df.values, w_v)
+    if resid is None:
         return y_s
 
     return pd.Series(resid.astype(np.float32), index=y_s.index)
@@ -289,14 +439,15 @@ def residualize_panel(
     industry_map: pd.Series | None,
     rebalance_dates: pd.DatetimeIndex,
     min_stocks: int = 30,
+    weight_panel: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    逐截面 OLS: ``factor ~ [1, Barra_*, industry_dummies]``，返回残差面板。
+    逐截面 WLS: ``factor ~ [1, Barra_*, industry_dummies]``，返回残差面板。
 
     与 ``research/ic/barra.py::compute_pure_ic_fast`` 用同一套控制变量
-    （Barra 9 风格 + 行业哑变量 drop_first），保证 IC 筛选与 ML 训练口径
-    一致——IC 阶段剔除系统性敞口后筛选出的因子，进入 ML 时特征同样被
-    中性化，避免模型把 Size/Beta 系统性敞口当成 alpha 学习。
+    （Barra 9 风格 + 行业哑变量 drop_first）**与同一套回归权重（√市值）**，
+    保证 IC 筛选与 ML 训练口径一致——IC 阶段剔除系统性敞口后筛选出的因子，
+    进入 ML 时特征同样被中性化，避免模型把 Size/Beta 系统性敞口当成 alpha 学习。
 
     Parameters
     ----------
@@ -310,6 +461,10 @@ def residualize_panel(
         需要做残差化的截面日期；非这些日期的行返回 NaN。
     min_stocks : int, default 30
         截面有效股票数低于此值则该截面返回 NaN。
+    weight_panel : pd.DataFrame | None
+        截面回归权重面板 (date × stock)，本仓库口径 = **√市值**
+        （见 ``factors/barra_risk.py::barra_regression_weights``）。
+        None 时退化为等权 OLS（朴素全市场 OLS 会被小微盘噪声主导）。
 
     Returns
     -------
@@ -377,12 +532,18 @@ def residualize_panel(
 
         f_v = f_series.values[valid].astype(np.float64)
         X_v = X_df.values[valid].astype(np.float64)
-        A = np.column_stack([np.ones(len(f_v), dtype=np.float64), X_v])
 
-        try:
-            coef, _, _, _ = np.linalg.lstsq(A, f_v, rcond=None)
-            resid = f_v - A @ coef
-        except Exception:
+        w_v = None
+        if weight_panel is not None and date in weight_panel.index:
+            w_v = (
+                weight_panel.loc[date]
+                .reindex(X_df.index)
+                .values[valid]
+                .astype(np.float64)
+            )
+
+        resid = wls_residual(f_v, X_v, w_v)
+        if resid is None:
             continue
 
         # 把残差填回该截面（仅 valid 位置，其余 NaN）

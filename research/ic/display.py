@@ -97,13 +97,41 @@ def print_decay(decay_df: pd.DataFrame):
     print(decay_df.to_string())
 
 
-def print_selection_result(kept: list, exclusions: dict):
+def print_selection_result(
+    kept: list,
+    exclusions: dict,
+    categories: dict | None = None,
+    sparse_kept: list | None = None,
+    emerging_kept: list | None = None,
+    labels: dict | None = None,
+):
+    n_sparse = len(sparse_kept or [])
+    n_emerg = len(emerging_kept or [])
     print(f"\n{BOLD}{'='*72}{RESET}")
-    print(f"{BOLD}  因子筛选 (v2){RESET}  "
-          f"保留 {GREEN}{len(kept)}{RESET} 剔除 {RED}{len(exclusions)}{RESET}")
+    print(
+        f"{BOLD}  因子筛选 (v2){RESET}  "
+        f"稠密 {GREEN}{len(kept)}{RESET} 稀疏 {GREEN}{n_sparse}{RESET} "
+        f"新兴观察 {YELLOW}{n_emerg}{RESET} "
+        f"剔除 {RED}{len(exclusions)}{RESET}"
+    )
     print(f"{'='*72}")
+
+    def _tag(name: str, default: str = "") -> str:
+        cat = (categories or {}).get(name, default)
+        labs = (labels or {}).get(name) or []
+        parts = [p for p in [cat, *labs] if p]
+        return f" ({', '.join(parts)})" if parts else ""
+
     for n in kept:
-        print(f"    [OK] {n}")
+        print(f"    [OK] {n}{_tag(n)}")
+    if sparse_kept:
+        print(f"  --- 稀疏轨道 ---")
+        for n in sparse_kept:
+            print(f"    [SPARSE] {n}{_tag(n, '稀疏因子')}")
+    if emerging_kept:
+        print(f"  --- 新兴观察（不进 factors 主池）---")
+        for n in emerging_kept:
+            print(f"    [EMERGING] {n}{_tag(n, '新兴因子')}")
     for n, reason in exclusions.items():
         print(f"    [X]  {n:<20} {reason}")
 
@@ -130,6 +158,53 @@ def print_barra_comparison(summary_df: pd.DataFrame, pure_ic_means: dict):
                 judge, color = "方向反转!", RED
         pure_s = f"{pure_ic:>10.4f}" if not np.isnan(pure_ic) else f"{'nan':>10}"
         print(f"  {color}{name:<18}{RESET}  {raw_ic:>8.4f}  {pure_s}  {ret_str:>8}  {color}{judge}{RESET}")
+
+
+def print_quantile_ls(quantile_df: pd.DataFrame, *, y_mode: str = "residual", top: int = 15):
+    """打印 Barra pure 路径下的 Q1/Q5 多头空头贡献摘要。"""
+    if quantile_df is None or quantile_df.empty:
+        return
+    print(f"\n{BOLD}{'='*80}{RESET}")
+    print(
+        f"{BOLD}  多头/空头贡献（Q5 vs Q1，已 IC 方向对齐，y_mode={y_mode}）{RESET}"
+    )
+    print(f"{'='*80}")
+    print(
+        f"  {'因子':<18} {'多头超额':>10} {'空头贡献':>10} "
+        f"{'long_share':>10} {'多空来源':<8} {'spread':>10}"
+    )
+    # 按 |spread| 降序展示，便于先看多空拉开的因子
+    view = quantile_df.copy()
+    if "spread" in view.columns:
+        view = view.reindex(view["spread"].abs().sort_values(ascending=False).index)
+    n_show = 0
+    for name, row in view.iterrows():
+        if top > 0 and n_show >= top:
+            break
+        le = row.get("多头超额", np.nan)
+        sc = row.get("空头贡献", np.nan)
+        share = row.get("long_share", np.nan)
+        src = row.get("多空来源", "无效")
+        sp = row.get("spread", np.nan)
+        if src == "多头主导":
+            color = GREEN
+        elif src == "空头主导":
+            color = YELLOW
+        elif src == "双边":
+            color = ""
+        else:
+            color = RED
+        le_s = f"{le:>10.4f}" if np.isfinite(le) else f"{'nan':>10}"
+        sc_s = f"{sc:>10.4f}" if np.isfinite(sc) else f"{'nan':>10}"
+        sh_s = f"{share:>10.2f}" if np.isfinite(share) else f"{'nan':>10}"
+        sp_s = f"{sp:>10.4f}" if np.isfinite(sp) else f"{'nan':>10}"
+        print(
+            f"  {color}{str(name):<18}{RESET}  {le_s}  {sc_s}  {sh_s}  "
+            f"{color}{str(src):<8}{RESET}  {sp_s}"
+        )
+        n_show += 1
+    if top > 0 and len(view) > top:
+        print(f"  ... 共 {len(view)} 个因子（仅展示 |spread| Top {top}）")
 
 
 def plot_rolling_ic(all_ic: dict, period: int, window: int = 12):

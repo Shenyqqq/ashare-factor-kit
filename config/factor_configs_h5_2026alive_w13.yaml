@@ -1,0 +1,22 @@
+# DIAGNOSTIC (not prod): h5 dense-only, 2026-alive from nolongshare_20260804
+# Source pool: config/factor_configs_h5_nolongshare_20260804.yaml (dense=45)
+# Gate: yearly pure IC h5 2026 > 0.01 (factor_depth_raw_pure_20260803_allfactors/ic_yearly_pure_h5.csv)
+# Kept: 13 dense; sparse skipped (dense>=8)
+# Weak/negative 2026 pure dense dropped; no raw fallback needed
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - GTJA_125
+  - 动量_120d
+  - A158_VSUMN60
+  - GTJA_016
+  - GTJA_064
+  - GTJA_032
+  - GTJA_029
+  - WQ_037
+  - A158_VMA60
+  - GTJA_058
+  - GTJA_099
+  - WQ_026
+  - GTJA_006

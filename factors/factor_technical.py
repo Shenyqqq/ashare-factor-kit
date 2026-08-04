@@ -117,9 +117,26 @@ def factor_br(prices: pd.DataFrame, high: pd.DataFrame, low: pd.DataFrame,
 
 def factor_turnover_neutral(volume: pd.DataFrame,
                             industry_map: pd.Series,
-                            window: int = 20) -> pd.DataFrame:
+                            window: int = 20,
+                            industry_panel: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Industry-Adjusted Turnover：剔除行业整体资金活跃度后的个股相对异动。
+
+    industry_map:     静态 Series(stock_code → industry_label)，向后兼容
+    industry_panel:   PIT 行业长表；传入时按截面日期取当期行业做去均值，
+                      消除用全样本静态行业映射的未来信息。优先于 industry_map。
+    """
     avg_vol = volume.rolling(window, min_periods=window // 2).mean()
-    # 行业内去均值
+    if industry_panel is not None:
+        try:
+            from factors.factor_alpha import _pit_industry_wide, _pit_industry_demean
+            ind_wide = _pit_industry_wide(industry_panel, avg_vol.index, level="sw_l2")
+            neutral = _pit_industry_demean(avg_vol, ind_wide)
+            logger.info("换手率行业中性_20d: 启用 PIT 行业面板")
+            return _normalize(neutral)
+        except Exception as e:
+            logger.warning(f"换手率行业中性 PIT 路径失败，回退静态: {e}")
+    # 行业内去均值（静态）
     neutral = _industry_demean(avg_vol, industry_map)
     # 不预设方向（高相对换手可能是买入信号也可能是过热反转）
     return _normalize(neutral)
@@ -154,12 +171,29 @@ def factor_turnover_acceleration(volume: pd.DataFrame,
 def factor_industry_relative_strength(prices: pd.DataFrame,
                                        industry_map: pd.Series,
                                        window: int = 20,
-                                       clean_ret: pd.DataFrame = None) -> pd.DataFrame:
+                                       clean_ret: pd.DataFrame = None,
+                                       industry_panel: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Industry-Relative Price Strength：个股动量剔除行业整体动量后的超额部分。
+
+    industry_map:     静态 Series(stock_code → industry_label)，向后兼容
+    industry_panel:   PIT 行业长表；传入时按截面日期取当期行业做去均值，
+                      消除用全样本静态行业映射的未来信息。优先于 industry_map。
+    """
     if clean_ret is not None:
         ret = (1 + clean_ret).rolling(window, min_periods=window // 2).apply(
             lambda x: np.nanprod(x) - 1, raw=True)
     else:
         ret = prices.pct_change(window)
+    if industry_panel is not None:
+        try:
+            from factors.factor_alpha import _pit_industry_wide, _pit_industry_demean
+            ind_wide = _pit_industry_wide(industry_panel, ret.index, level="sw_l2")
+            irs = _pit_industry_demean(ret, ind_wide)
+            logger.info("行业相对强度_20d: 启用 PIT 行业面板")
+            return _normalize(irs)
+        except Exception as e:
+            logger.warning(f"行业相对强度 PIT 路径失败，回退静态: {e}")
     irs = _industry_demean(ret, industry_map)
     return _normalize(irs)
 
@@ -176,10 +210,14 @@ def get_technical_factors(
     high: pd.DataFrame = None,
     low: pd.DataFrame = None,
     clean_ret: pd.DataFrame = None,
+    industry_panel: pd.DataFrame = None,
 ) -> dict:
     """
     返回 {因子名: DataFrame} 字典，供 get_factor_registry() 合并。
     所有因子均有对应文献来源，可在 IC 分析中按需筛选。
+
+    industry_panel: PIT 行业长表；传入时换手率行业中性 / 行业相对强度
+                    按截面日期取当期行业做去均值（PIT 安全）。
     """
     reg = {}
 
@@ -198,20 +236,22 @@ def get_technical_factors(
     # 换手率变体：需要 volume
     if volume is not None:
         reg["换手率加速度"] = factor_turnover_acceleration(volume, short=5, long=20)
-        if industry_map is not None:
+        if industry_map is not None or industry_panel is not None:
             if isinstance(industry_map, pd.DataFrame):
                 ind_s = industry_map.get("sw_l2", industry_map.iloc[:, 0])
             else:
                 ind_s = industry_map
-            reg["换手率行业中性_20d"] = factor_turnover_neutral(volume, ind_s, window=20)
+            reg["换手率行业中性_20d"] = factor_turnover_neutral(
+                volume, ind_s, window=20, industry_panel=industry_panel)
 
-    # 行业相对强度：需要 industry_map
-    if industry_map is not None:
+    # 行业相对强度：需要 industry_map 或 industry_panel
+    if industry_map is not None or industry_panel is not None:
         if isinstance(industry_map, pd.DataFrame):
             ind_s = industry_map.get("sw_l2", industry_map.iloc[:, 0])
         else:
             ind_s = industry_map
         reg["行业相对强度_20d"] = factor_industry_relative_strength(
-            prices, ind_s, window=20, clean_ret=clean_ret)
+            prices, ind_s, window=20,
+            clean_ret=clean_ret, industry_panel=industry_panel)
 
     return reg

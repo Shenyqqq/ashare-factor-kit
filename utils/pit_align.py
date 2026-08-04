@@ -1,17 +1,23 @@
 """
 utils/pit_align.py — Point-in-Time 财务数据对齐
 
-A 股财报按法定披露窗口做保守 PIT 对齐：
+A 股财报默认按**法定披露窗口**做保守 PIT 对齐（近似，非真实公告日）：
   报告期 + 披露窗口 → 可用日下界
 然后对可用日做 reindex + ffill 到日频价格序列。
 
-不依赖 AKShare 公告日（接口不提供 ann_date），用法定披露截止日作保守下界。
+【ann_date 可用性说明 — 2026-07-29】
+  - ``ak.stock_financial_analysis_indicator`` **不提供** ann_date（「日期」=报告期）。
+  - ``ak.stock_yjbb_em`` 的「最新公告日期」是**最近一次修订/公告日**，不是首次披露日；
+    用作 PIT 会在财报修订后过度推迟可用日，故**不接入主链**。
+  - 若长表已带真实 ``ann_date`` 列（外部/付费源），``pit_pivot_ffill`` 优先用它；
+    否则走法定窗并打一次性 WARNING（见 ``PIT_MODE_STATUTORY``）。
 
-A 股法定披露窗口（保守取上限）：
-  - Q1 季报（03-31）：截止 04-30（+30 天，实际常延迟，取 +45 天保守）
-  - 半年报（06-30）：截止 08-31（+62 天，取 +75 天保守）
-  - Q3 季报（09-30）：截止 10-31（+31 天，取 +45 天保守）
-  - 年报（12-31）：截止 04-30（+120 天，取 +120 天保守）
+A 股法定披露窗口（偏实务、仍略保守）：
+  - Q1 季报（03-31）：法定截止 04-30（+30 天）→ 取 **+30**
+  - 半年报（06-30）：法定截止 08-31（+62 天）→ 取 **+60**（贴近实务）
+  - Q3 季报（09-30）：法定截止 10-31（+31 天）→ 取 **+30**
+  - 年报（12-31）：法定截止次年 04-30（+120 天）→ 取 **+90**
+    （用户未点名年报；+90 比原 +120 更贴近多数公司实务披露，仍偏保守）
 
 修复 `factors/factor.py:_pivot_financial` 与 `factors/barra_risk.py:_pivot_ffill`
 原 `pivot(trade_date).reindex(prices.index, method="ffill")` 把报告期数据
@@ -20,26 +26,34 @@ ffill 到该日之后所有日子，造成 look-ahead bias（季报 ~15-25 个�
 """
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 import numpy as np
 
+logger = logging.getLogger(__name__)
 
-# 报告期月份 → 法定披露窗口天数（保守上限）
+# 报告期月份 → 法定披露窗口天数（偏实务；年报 +90 见模块头注释）
 _DISCLOSURE_WINDOWS: dict[int, int] = {
-    3: 45,    # Q1 季报
-    6: 75,    # 半年报
-    9: 45,    # Q3 季报
-    12: 120,  # 年报
+    3: 30,    # Q1 季报
+    6: 60,    # 半年报
+    9: 30,    # Q3 季报
+    12: 90,   # 年报（比法定 +120 略松，仍偏保守）
 }
+
+PIT_MODE_ANN_DATE = "ann_date"
+PIT_MODE_STATUTORY = "statutory_window_approx"
+
+_statutory_warned = False
 
 
 def disclosure_window(report_period: pd.Period | pd.Timestamp) -> int:
     """
     按报告期月份返回披露窗口天数：
-      03 → 45（Q1）
-      06 → 75（半年报）
-      09 → 45（Q3）
-      12 → 120（年报）
+      03 → 30（Q1）
+      06 → 60（半年报）
+      09 → 30（Q3）
+      12 → 90（年报）
     其他月份取最近季末。
     """
     if isinstance(report_period, pd.Period):
@@ -69,21 +83,65 @@ def pit_shift_report_dates(report_periods: pd.DatetimeIndex) -> pd.DatetimeIndex
     return periods + pd.to_timedelta(days, unit="D")
 
 
+def _warn_statutory_once() -> None:
+    global _statutory_warned
+    if _statutory_warned:
+        return
+    _statutory_warned = True
+    msg = (
+        "财务 PIT 使用法定披露窗口近似（Q1/Q3=+30、半年报=+60、年报=+90），"
+        "非真实公告日。AKShare 主接口无可靠 first-ann_date；"
+        "yjbb「最新公告日期」=修订日不可用。详见 utils/pit_align.py / docs/PIT_AUDIT.md"
+    )
+    try:
+        from loguru import logger as _lg
+        _lg.warning(msg)
+    except Exception:
+        logger.warning(msg)
+
+
+def resolve_pit_available_dates(
+    financial_df: pd.DataFrame,
+    date_col: str = "trade_date",
+    ann_date_col: str = "ann_date",
+) -> tuple[pd.DatetimeIndex, str]:
+    """解析每行财务记录的 PIT 可用日。
+
+    Returns
+    -------
+    (available_dates, mode)
+      mode = ``ann_date`` | ``statutory_window_approx``
+    """
+    if ann_date_col in financial_df.columns:
+        ann = pd.to_datetime(financial_df[ann_date_col], errors="coerce")
+        if ann.notna().mean() >= 0.8:
+            # 缺 ann_date 的行回退法定窗
+            report = pd.DatetimeIndex(pd.to_datetime(financial_df[date_col]))
+            statutory = pit_shift_report_dates(report)
+            available = ann.where(ann.notna(), statutory)
+            return pd.DatetimeIndex(available), PIT_MODE_ANN_DATE
+
+    _warn_statutory_once()
+    report = pd.DatetimeIndex(pd.to_datetime(financial_df[date_col]))
+    return pit_shift_report_dates(report), PIT_MODE_STATUTORY
+
+
 def pit_pivot_ffill(
     financial_df: pd.DataFrame,
     prices_index: pd.DatetimeIndex,
     date_col: str = "trade_date",
     value_cols: list | None = None,
+    ann_date_col: str = "ann_date",
 ) -> pd.DataFrame:
     """
     PIT 安全的财务数据 pivot + ffill。
 
     输入长表 financial_df，含 date_col 列（值为报告期，如 2024-03-31）。
     流程：
-      1. 把 date_col 替换为 报告期 + disclosure_window（PIT 可用日下界）
+      1. 若有可靠 ``ann_date`` 列 → 用公告日作为可用日；否则报告期 + 法定披露窗口
       2. pivot_table(index=PIT可用日, columns=股票, values=数值)
       3. reindex(prices_index, method="ffill")
-    这样某报告期的数据只会在披露窗口后才出现在日频序列中，
+    这样某报告期的数据只会在披露后才出现在日频序列中，
     消除「用报告期日做 ffill 起点」的 look-ahead bias。
 
     若 financial_df 缺少 date_col 或 code 列，回退为普通 pivot ffill
@@ -104,12 +162,19 @@ def pit_pivot_ffill(
         return pivot.reindex(prices_index, method="ffill")
 
     df = financial_df.copy()
-    report_periods = pd.DatetimeIndex(pd.to_datetime(df[date_col]))
-    df[date_col] = pit_shift_report_dates(report_periods)
+    available, mode = resolve_pit_available_dates(df, date_col=date_col, ann_date_col=ann_date_col)
+    df[date_col] = available
+    if mode == PIT_MODE_ANN_DATE:
+        try:
+            from loguru import logger as _lg
+            _lg.info("财务 PIT: 使用 ann_date 列（真实公告日）")
+        except Exception:
+            logger.info("财务 PIT: 使用 ann_date 列（真实公告日）")
 
     if value_cols is None:
-        # 取第一个数值列（非 date_col、非 code）
-        num_cols = [c for c in df.columns if c not in (date_col, "code")]
+        # 取第一个数值列（非 date_col、非 code、非 ann_date）
+        skip = {date_col, "code", ann_date_col}
+        num_cols = [c for c in df.columns if c not in skip]
         if not num_cols:
             raise ValueError("financial_df 缺少数值列")
         value_col = num_cols[0]
@@ -134,13 +199,14 @@ def pit_reindex_ffill(
     例如 institution_holding.parquet（index=季报日期）。
 
     流程：
-      1. 把 wide_df 的 index（报告期）按 disclosure_window 平移
+      1. 把 wide_df 的 index（报告期）按 disclosure_window 平移（法定窗近似）
       2. reindex(prices_index, method="ffill")
     """
     prices_index = pd.DatetimeIndex(pd.to_datetime(prices_index))
     if wide_df.empty:
         return pd.DataFrame(np.nan, index=prices_index, columns=wide_df.columns)
 
+    _warn_statutory_once()
     shifted = wide_df.copy()
     shifted.index = pit_shift_report_dates(pd.DatetimeIndex(pd.to_datetime(wide_df.index)))
     return shifted.reindex(prices_index, method="ffill")

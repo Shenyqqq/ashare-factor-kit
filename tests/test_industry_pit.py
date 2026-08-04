@@ -2,7 +2,11 @@
 import pandas as pd
 import numpy as np
 
-from research.ic.barra import _industry_dummies, precompute_ctrl_matrices
+from research.ic.barra import (
+    _industry_dummies,
+    precompute_ctrl_matrices,
+    unpack_date_ctrl,
+)
 from data.industry.download_industry import (
     build_industry_panel,
     load_industry_as_of,
@@ -74,8 +78,8 @@ def test_precompute_pit_and_static():
         barra, fwd, industry_map=None, dates=dates, industry_panel=panel,
     )
     assert len(dc) == 2
-    arr_2019, idx_2019, _ = dc[pd.Timestamp("2019-06-03")]
-    arr_2021, idx_2021, _ = dc[pd.Timestamp("2021-06-03")]
+    arr_2019, idx_2019, _, _ = unpack_date_ctrl(dc[pd.Timestamp("2019-06-03")])
+    arr_2021, idx_2021, _, _ = unpack_date_ctrl(dc[pd.Timestamp("2021-06-03")])
     # 2019: 1 barra col + 1 ind dummy (_ind_6401) = 2 cols
     assert arr_2019.shape == (3, 2), arr_2019.shape
     # 2021: 1 barra col + 2 ind dummies (_ind_4402, _ind_6401) = 3 cols
@@ -87,7 +91,7 @@ def test_precompute_pit_and_static():
     dc2 = precompute_ctrl_matrices(
         barra, fwd, industry_map=static, dates=dates,
     )
-    arr_s, _, _ = dc2[pd.Timestamp("2019-06-03")]
+    arr_s, _, _, _ = unpack_date_ctrl(dc2[pd.Timestamp("2019-06-03")])
     # Static: 1 barra col + 2 ind dummies (4401 ref dropped, 4402 & 6401 present) = 3 cols
     assert arr_s.shape == (3, 3), arr_s.shape
     print(f"[OK] precompute static: shape={arr_s.shape}")
@@ -99,8 +103,9 @@ def test_no_industry():
     fwd = pd.DataFrame({"A": [0.01], "B": [0.0]}, index=dates)
     barra = {"size": pd.DataFrame({"A": [1.0], "B": [3.0]}, index=dates)}
     dc = precompute_ctrl_matrices(barra, fwd, industry_map=None, dates=dates)
-    arr, _, _ = dc[pd.Timestamp("2021-06-03")]
+    arr, _, _, w = unpack_date_ctrl(dc[pd.Timestamp("2021-06-03")])
     assert arr.shape == (2, 1), arr.shape
+    assert w is None, "未传 weight_panel 时应为 None（等权 OLS）"
     print(f"[OK] precompute no-industry: shape={arr.shape}")
 
 

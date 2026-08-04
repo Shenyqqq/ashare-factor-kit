@@ -1,0 +1,39 @@
+# EXPERIMENT ONLY — dense top24 + emerging(6) into whitelist
+# Source: selected_factors_h5.json after decay-relax (2026-07-26)
+# Emerging is annotate-only by default; this YAML explicitly includes them.
+# Do NOT promote to production factor_configs.yaml without review.
+# dense=24, emerging_added=6, total=30
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - WQ_013
+  - WQ_055
+  - WQ_050
+  - WQ_040
+  - WQ_015
+  - WQ_027
+  - WQ_088
+  - WQ_003
+  - WQ_026
+  - WQ_012
+  - 换手率行业中性_20d
+  - 融资余额变化_20d
+  - AR_26d
+  - 月最大收益
+  - WQ_002
+  - WQ_018
+  - WQ_094
+  - WQ_004
+  - 换手率加速度
+  - 综合股权融资
+  - WQ_068
+  - 行业相对强度_20d
+  - WQ_019
+  - WQ_001
+  - 动量_skip
+  - 年龄动量
+  - 股东户数变化率_年
+  - 股东户数变化率_季
+  - 一年股本扩张
+  - WQ_075

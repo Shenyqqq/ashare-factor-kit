@@ -16,9 +16,12 @@ def _to_float32_panel(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _rank_panel(df: pd.DataFrame) -> pd.DataFrame:
-    """Cross-sectional rank; method from IC_RANK_METHOD config."""
+    """Cross-sectional rank; method from IC_RANK_METHOD config.
+
+    返回 float32 以降低内存（pandas ``rank()`` 默认返回 float64，单面板 95MB → 48MB）。
+    """
     method = IC_RANK_METHOD if IC_RANK_METHOD in ("average", "dense", "first") else "average"
-    return df.rank(axis=1, method=method, na_option="keep")
+    return df.rank(axis=1, method=method, na_option="keep").astype(np.float32)
 
 
 def compute_ic_series(
@@ -28,9 +31,10 @@ def compute_ic_series(
     min_stocks: int | None = None,
 ) -> pd.Series:
     """
-    Vectorized Spearman IC per cross-section date.
+    Vectorized Spearman IC per cross-section date（全日频有效交易日，非调仓日子集）。
 
     Skips dates with valid_stocks < min_stocks (default MIN_IC_STOCKS from settings).
+    胜率 / payoff_hit 与本序列共用同一日期索引。
     """
     min_n = MIN_IC_STOCKS if min_stocks is None else min_stocks
     f, r = apply_tradable_mask(factor, forward_return, tradable)

@@ -1,0 +1,35 @@
+# h5 long_share>0.4 ∧ corr_dedup ON（IC∧ICIR∧t/FDR∧ls>0.4∧IC序列相关去重）
+# select_factors_raw + pure IC；long_share=.tmp/quantile_ls_h5_aligned.csv
+# dense=28；sparse 不进 YAML，run 时 --sparse-from-ic selected_factors_h5_barra_em_20260730.json
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - A158_CNTN10
+  - A158_CORD30
+  - A158_CORR30
+  - A158_CORR5
+  - A158_IMIN10
+  - A158_IMIN5
+  - A158_MAX30
+  - A158_ROC60
+  - A158_VSUMD60
+  - GTJA_039
+  - GTJA_041
+  - GTJA_042
+  - GTJA_055
+  - GTJA_061
+  - GTJA_074
+  - GTJA_092
+  - GTJA_103
+  - GTJA_105
+  - GTJA_125
+  - GTJA_157
+  - GTJA_160
+  - WQ_015
+  - WQ_019
+  - WQ_026
+  - WQ_037
+  - WQ_055
+  - WQ_057
+  - 波动率_20d

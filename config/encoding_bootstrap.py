@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 
 def bootstrap_stdio_utf8() -> None:
@@ -51,4 +52,25 @@ def configure_loguru() -> None:
 
     if os.environ.get("LOGURU_COLORIZE") == "0":
         logger.remove()
+        # stderr already UTF-8 via bootstrap_stdio_utf8(); keep console readable
         logger.add(sys.stderr, colorize=False)
+
+
+def add_utf8_file_sink(path: str | Path, *, level: str = "DEBUG") -> int:
+    """Add a loguru file sink that always writes UTF-8.
+
+    Windows note: without encoding=\"utf-8\", open() may use the ANSI code page
+    (often GBK). PowerShell Tee-Object / ``>`` often write UTF-16 LE and can also
+    mis-decode UTF-8 pipes as GBK — prefer this sink over shell redirection.
+    """
+    from loguru import logger
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return logger.add(
+        path,
+        level=level,
+        encoding="utf-8",  # Windows: must be explicit (default may be GBK)
+        enqueue=True,
+        colorize=False,
+    )

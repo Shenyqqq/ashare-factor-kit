@@ -19,12 +19,16 @@ def get_rebalance_dates(
     dates: pd.DatetimeIndex,
     rebalance_freq: str,
 ) -> pd.DatetimeIndex:
-    """Last actual trading day in each resample bucket."""
+    """Last actual trading day in each resample bucket.
+
+    Period labels from ``resample`` (calendar ME / W-FRI / …) may fall on
+    weekends or holidays.  Those labels must not be used as rebalance dates:
+    take the last *trading* timestamp in each bucket instead.
+    """
     dates = pd.DatetimeIndex(dates).sort_values()
-    return (
-        pd.Series(1, index=dates)
-        .resample(rebalance_freq)
-        .last()
-        .index
-        .intersection(dates)
-    )
+    if len(dates) == 0:
+        return dates
+    # Values are trading timestamps; resample index is the (possibly non-trading)
+    # period label — keep the values, drop empty buckets.
+    bucket_last = pd.Series(dates, index=dates).resample(rebalance_freq).last().dropna()
+    return pd.DatetimeIndex(bucket_last.to_numpy()).sort_values()

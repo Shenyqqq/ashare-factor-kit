@@ -1,0 +1,32 @@
+# dense-only companion of mcap30 20260804; n=26
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - WQ_016
+  - GTJA_140
+  - GTJA_042
+  - WQ_050
+  - A158_VSUMP20
+  - A158_KLEN
+  - GTJA_064
+  - A158_CORR5
+  - WQ_055
+  - GTJA_179
+  - A158_CORR20
+  - GTJA_074
+  - A158_CORD20
+  - GTJA_118
+  - GTJA_145
+  - A158_VSUMP10
+  - GTJA_105
+  - GTJA_061
+  - A158_VSTD60
+  - WQ_045
+  - WQ_018
+  - A158_QTLD5
+  - GTJA_001
+  - A158_VSUMN5
+  - GTJA_092
+  - GTJA_171
+  factors_sparse: []

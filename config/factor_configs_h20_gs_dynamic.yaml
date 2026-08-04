@@ -1,0 +1,33 @@
+# h20 Gram-Schmidt dynamic config (18 orth factors)
+# Generated from selected_factors_h20.json after IC v2 --gram-schmidt
+h20:
+  horizon: 20
+  rebalance_freq: ME
+  factors: &id001
+  - 龙虎榜连续上榜
+  - 涨跌停净强度_20d
+  - WQ_044
+  - WQ_003
+  - WQ_055
+  - WQ_040
+  - 换手率行业中性_20d
+  - WQ_088
+  - 月最大收益
+  - WQ_083
+  - WQ_071
+  - 龙虎榜净买额_20d
+  - WQ_094
+  - 价值_PB
+  - WQ_068
+  - WQ_018
+  - 综合股权融资
+  - 净债务市值比
+  factors_orth: *id001
+  orthogonalization:
+    method: gram_schmidt
+    max_factors: 30
+    ic_threshold: 0.015
+    icir_threshold: 0.15
+    pre_filter_pool_size: 33
+    selected_count: 18
+    rejected_in_orthogonalization: 15

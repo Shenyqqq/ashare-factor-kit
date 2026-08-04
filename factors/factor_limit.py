@@ -9,6 +9,7 @@ masks 由 data.clean.clean_ohlcv() 统一生成，通过 get_factor_registry() �
   跌停弱势_20d     — 近20日跌停次数取负
   连板数           — 当前连续涨停天数
   涨跌停净强度_20d — 涨停次数 - 跌停次数（多空对比）
+  涨跌停状态       — 信号日涨跌停序数（1=跌停/2=正常/3=涨停，截面 winsor+zscore）
   开板反转_5d      — 开板后N日收益取负（供应压力释放信号）
 """
 import pandas as pd
@@ -16,6 +17,32 @@ import numpy as np
 from loguru import logger
 
 from factors.factor import _normalize
+
+
+def factor_limit_state(masks: dict) -> pd.DataFrame:
+    """
+    涨跌停状态 dummy（越高越好：涨停=3 > 非涨跌停=2 > 跌停=1）。
+
+    基于 masks["limit_up"] / masks["limit_down"] 逐日赋值；
+    同日 limit_up 与 limit_down 均为 True 时优先 limit_up（→3）。
+    """
+    limit_up = masks["limit_up"].fillna(False).astype(bool)
+    limit_down = masks["limit_down"].fillna(False).astype(bool)
+    state = pd.DataFrame(
+        2.0,
+        index=limit_up.index,
+        columns=limit_up.columns,
+        dtype=np.float64,
+    )
+    state = state.mask(limit_down, 1.0)
+    state = state.mask(limit_up, 3.0)
+    both = limit_up & limit_down
+    n_both = int(both.sum().sum())
+    if n_both:
+        logger.warning(
+            f"涨跌停状态: {n_both} 格同日涨跌停，按涨停(3)优先编码"
+        )
+    return _normalize(state)
 
 
 def factor_limit_up_count(
@@ -65,6 +92,7 @@ def factor_post_limit_reversion(
     close: pd.DataFrame,
     masks: dict,
     hold_days: int = 5,
+    clean_ret: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     开板反转因子：开板日已实现的历史收益取负（供应压力释放信号）。
@@ -75,9 +103,16 @@ def factor_post_limit_reversion(
 
     连续涨停后开板，套牢盘解套抛售，往往大幅回调；已发生的回调幅度
     可作为后续继续承压的反向信号（收益越低 → 取负后分越高 → 规避）。
+
+    clean_ret : 有则用屏蔽涨跌停日的日收益滚动复合（与动量/反转因子同口径）。
     """
     # 截至当前 t 的已实现收益（仅用 t 及之前的信息）
-    realized_ret = close.pct_change(hold_days)
+    if clean_ret is not None:
+        realized_ret = (1 + clean_ret).rolling(
+            hold_days, min_periods=max(1, hold_days // 2),
+        ).apply(lambda x: np.nanprod(x) - 1, raw=True)
+    else:
+        realized_ret = close.pct_change(hold_days)
     # 开板信号滞后 hold_days，保证 t 时刻只用 t-hold_days 之前已知的开板事件
     broke_lagged = masks["broke_limit"].shift(hold_days)
     # 仅在滞后开板窗口激活，向前不填充（避免再次引入未来信息）
@@ -85,7 +120,11 @@ def factor_post_limit_reversion(
     return _normalize(-signal)
 
 
-def get_limit_factors(close: pd.DataFrame, masks: dict) -> dict:
+def get_limit_factors(
+    close: pd.DataFrame,
+    masks: dict,
+    clean_ret: pd.DataFrame | None = None,
+) -> dict:
     """
     计算所有涨跌停信号因子，返回 {因子名: DataFrame}。
     masks 由 data.clean.clean_ohlcv() 提供，此处直接使用。
@@ -96,7 +135,10 @@ def get_limit_factors(close: pd.DataFrame, masks: dict) -> dict:
         factors["跌停弱势_20d"]    = factor_limit_down_count(masks, window=20)
         factors["连板数"]           = factor_consecutive_limit_up(masks)
         factors["涨跌停净强度_20d"] = factor_limit_strength(masks, window=20)
-        factors["开板反转_5d"]      = factor_post_limit_reversion(close, masks, hold_days=5)
+        factors["涨跌停状态"]       = factor_limit_state(masks)
+        factors["开板反转_5d"]      = factor_post_limit_reversion(
+            close, masks, hold_days=5, clean_ret=clean_ret,
+        )
         logger.info(f"涨跌停因子: {list(factors.keys())}")
     except Exception as e:
         logger.error(f"涨跌停因子计算失败: {e}")

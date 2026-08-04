@@ -1,0 +1,8 @@
+{
+  "cat": {
+    "depth": 5,
+    "learning_rate": 0.08927180304353628,
+    "l2_leaf_reg": 7.587945476302646,
+    "iterations": 280
+  }
+}

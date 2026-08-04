@@ -35,6 +35,45 @@ from data.download import (
     get_stock_list,
 )
 
+# 网络重试相关异常（akshare 内部用 requests，requests 依赖 urllib3）
+try:
+    import requests.exceptions as _req_exc
+    import urllib3.exceptions as _url3_exc
+
+    _NETWORK_RETRY_EXCEPTIONS: tuple = (
+        _req_exc.ProxyError,
+        _req_exc.ConnectionError,
+        _req_exc.Timeout,
+        _req_exc.SSLError,
+        _req_exc.ChunkedEncodingError,
+        _req_exc.RequestException,
+        _url3_exc.MaxRetryError,
+        ConnectionError,  # builtin，ProxyError 是其子类
+        TimeoutError,     # builtin
+    )
+except ImportError:  # pragma: no cover
+    _NETWORK_RETRY_EXCEPTIONS = (ConnectionError, TimeoutError)
+
+# 网络错误重试退避（秒），指数退避：2s -> 4s -> 8s，最后一次失败后归类为网络失败
+_RETRY_DELAYS: tuple[int, ...] = (2, 4, 8)
+
+
+def _classify_error(e: Exception) -> str:
+    """错误分类：'network'（可重试）vs 'data'（跳过不重试）。
+
+    网络错误：ProxyError / ConnectionError / Timeout / MaxRetries / SSLError 等。
+    数据错误：其余一律视为不可重试（如接口返回字段异常、symbol 不存在）。
+    """
+    if isinstance(e, _NETWORK_RETRY_EXCEPTIONS):
+        return "network"
+    msg = str(e).lower()
+    net_keywords = ("proxy", "max retries", "timeout", "connection",
+                    "remotedisconnected", "remote end closed", "sserror",
+                    "handshake", "read timed out", "connectionpool")
+    if any(k in msg for k in net_keywords):
+        return "network"
+    return "data"
+
 
 def _current_codes() -> set[str]:
     """当前在市股票代码集合（不调用包含退市股的 get_stock_list，避免循环）。"""
@@ -130,32 +169,71 @@ def download_delisted_ohlcv(
     )
 
     lock = threading.Lock()
-    failed: list[str] = []
+    failed: list[str] = []           # 网络最终失败
+    skipped_no_data: list[str] = []  # 数据不存在（不重试）
+    success_count = 0
     done = 0
 
     def _fetch(code: str):
-        try:
-            df = ak.stock_zh_a_hist(
-                symbol=code, period="daily",
-                start_date=start.replace("-", ""),
-                end_date=end.replace("-", ""),
-                adjust=adjust,
-            )
-            time.sleep(0.05)
-            return code, df, None
-        except Exception as e:
-            return code, None, e
+        """单股下载，带网络错误重试。
+
+        返回 (code, df, err, kind)：
+          kind='network' 表示网络错误（已重试仍失败）；
+          kind='data'    表示数据错误（不重试，直接跳过）；
+          err=None       表示成功。
+        """
+        last_err: Exception | None = None
+        last_kind = "data"
+        # 首次尝试 + _RETRY_DELAYS 次重试
+        for attempt, delay in enumerate([0] + list(_RETRY_DELAYS)):
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=code, period="daily",
+                    start_date=start.replace("-", ""),
+                    end_date=end.replace("-", ""),
+                    adjust=adjust,
+                )
+                time.sleep(0.05)
+                return code, df, None, None
+            except Exception as e:
+                last_err = e
+                last_kind = _classify_error(e)
+                if last_kind == "data":
+                    # 数据错误不重试
+                    return code, None, e, "data"
+                # 网络错误：log 后继续下一次重试
+                if attempt < len(_RETRY_DELAYS):
+                    logger.debug(
+                        f"退市股 {code} 网络错误（第 {attempt+1} 次失败，"
+                        f"{_RETRY_DELAYS[attempt]}s 后重试）: {e}"
+                    )
+                continue
+        return code, None, last_err, "network"
 
     with ThreadPoolExecutor(max_workers=OHLCV_WORKERS) as ex:
         futures = {ex.submit(_fetch, c): c for c in need}
         for fut in as_completed(futures):
-            code, df, err = fut.result()
+            code, df, err, kind = fut.result()
             with lock:
                 done += 1
                 if err is not None:
-                    failed.append(code)
-                    logger.warning(f"退市股下载失败 {code}: {err}")
-                elif df is not None and not df.empty:
+                    if kind == "data":
+                        skipped_no_data.append(code)
+                        logger.info(f"退市股无数据/跳过 {code}: {err}")
+                    else:
+                        failed.append(code)
+                        logger.warning(
+                            f"退市股网络失败（已重试 {_RETRY_DELAYS} 次）"
+                            f" {code}: {err}"
+                        )
+                elif df is None or df.empty:
+                    # 接口返回空 DataFrame：视为无数据，跳过不重试
+                    skipped_no_data.append(code)
+                    logger.info(f"退市股无数据 {code}: 接口返回空")
+                else:
+                    success_count += 1
                     df["日期"] = pd.to_datetime(df["日期"])
                     df = df.set_index("日期")
                     for ak_col in paths:
@@ -168,8 +246,16 @@ def download_delisted_ohlcv(
                         if data[ak_col]:
                             _save_wide(data[ak_col], path)
 
+    # 失败统计汇总
+    logger.info(
+        f"退市股下载：成功 {success_count} 只，"
+        f"跳过 {len(skipped_no_data)} 只（无数据），"
+        f"失败 {len(failed)} 只（网络）"
+    )
+    if skipped_no_data:
+        logger.info(f"  跳过列表（前 10）: {skipped_no_data[:10]}")
     if failed:
-        logger.warning(f"失败 {len(failed)} 只: {failed[:10]}")
+        logger.warning(f"  网络失败列表（前 10）: {failed[:10]}")
 
     # 合并保存：与已有宽表对齐，新列追加
     for ak_col, (key, path) in paths.items():
@@ -182,16 +268,25 @@ def download_delisted_ohlcv(
             combined = existing.reindex(
                 index=existing.index.union(new_df.index)
             )
-            # 仅写入退市股的列（已有列保持不变）
-            for col in new_df.columns:
-                if col not in combined.columns:
-                    combined[col] = new_df[col]
-                else:
-                    # 已有列里缺失的行用新数据补齐
-                    combined[col] = combined[col].where(
-                        combined[col].notna(), new_df[col]
-                    )
+            # 把 new_df 对齐到 combined.index，避免逐列赋值触发碎片化警告
+            new_df_aligned = new_df.reindex(index=combined.index)
+            new_cols = [c for c in new_df.columns if c not in existing.columns]
+            overlap_cols = [c for c in new_df.columns if c in existing.columns]
+
+            # 批量 concat 新列（一次性追加，避免 frame.insert 多次触发 PerformanceWarning）
+            if new_cols:
+                combined = pd.concat(
+                    [combined, new_df_aligned[new_cols]], axis=1
+                )
+            # 仅对重叠列做 fillna 补齐（退市股场景一般无重叠，循环成本极低）
+            for col in overlap_cols:
+                combined[col] = combined[col].where(
+                    combined[col].notna(), new_df_aligned[col]
+                )
+
             combined = combined.sort_index()
+            # 官方建议：concat 后 copy() 一次性去碎片化
+            combined = combined.copy()
             combined.to_parquet(path)
             logger.info(f"  {path.name}: 合并后 {combined.shape}")
         else:

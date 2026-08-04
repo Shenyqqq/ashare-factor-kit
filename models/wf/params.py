@@ -23,6 +23,11 @@ LGBM_PARAMS = dict(
     random_state=42, verbose=-1, n_jobs=-1,
 )
 
+# LGBMRanker：NDCG@K 评估截断（选股看 top-K；默认 [1..5] 过窄）。
+# label_gain 不在此固化——细秩下 max label ≈ 截面股票数，默认 2^rel-1 会溢出；
+# 由 fit_model 按 max label 注入线性增益 list(range(max_label+1))。
+LGBM_RANK_EVAL_AT = [50]
+
 XGB_PARAMS = dict(
     n_estimators=300, max_depth=4, learning_rate=0.05,
     subsample=0.8, colsample_bytree=0.8, min_child_weight=30,

@@ -134,17 +134,15 @@ def frac_diff_ffd(series: pd.DataFrame, d: float,
         # 不可能（weights 至少含 w_0=1.0），保险起见
         return pd.DataFrame(np.nan, index=series.index, columns=series.columns)
 
-    # 向量化卷积：用 sliding_window_view + einsum，避免 Python 循环
-    from numpy.lib.stride_tricks import sliding_window_view
-
-    # sliding_window_view(arr, L, axis=0) -> (T-L+1, N, L)
-    windows = sliding_window_view(arr, window_shape=L, axis=0)  # (T-L+1, N, L)
-    # windows[i, :, m] 对应 arr[i + m]，m=0 是最早（应乘以 weights[0]?）
-    # 我们要 out[t] = Σ_k w_k * arr[t-k]，t = i + L - 1
-    # 即 out[i+L-1] = Σ_{k=0}^{L-1} w_k * arr[i+L-1-k]
-    #              = Σ_{m=0}^{L-1} w_{L-1-m} * arr[i+m]
-    # 所以 windows[i, :, m] * weights[L-1-m]，对 m 求和
-    out = (windows * weights[::-1][None, None, :]).sum(axis=-1)  # (T-L+1, N)
+    # 逐时间步卷积，避免 sliding_window_view 向量化导致 (T-L+1, N, L) 巨型中间数组。
+    # 对 (2059, 5803) + L=1458 的全市场面板，向量化版本会 materialize ~40GB
+    # （(602, 5803, 1458) float64），直接 OOM。逐步版本每步仅 (L, N)=67MB。
+    weights_rev = weights[::-1]  # w_{L-1}..w_0，与 arr[i:i+L] 行对齐
+    n_out = T - L + 1
+    out = np.empty((n_out, N), dtype=np.float64)
+    for i in range(n_out):
+        # (L,) @ (L, N) -> (N,)，BLAS 加速，单步内存 = L*N*8 bytes
+        out[i] = weights_rev @ arr[i:i + L]
 
     full = np.full_like(arr, np.nan)
     full[L - 1:] = out

@@ -1,0 +1,40 @@
+# Top-30 pure alpha factors for h5 ablation, sorted by |ICIR| descending
+# from research/output/selected_factors_h5.json (factors pool, barra_factors_used=[]).
+# Generated for regime ablation on 2026-07-07.
+# No market*/HMM_* regime factors, no Barra_* factors in this whitelist.
+# A group (with regime): 30 alpha + 18 auto-injected regime = 48 features
+# B group (--no-regime): 30 pure alpha features only
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - 龙虎榜连续上榜
+  - 涨跌停净强度_20d
+  - 龙虎榜上榜次数_20d
+  - WQ_013
+  - 涨停强度_20d
+  - WQ_016
+  - WQ_044
+  - WQ_055
+  - WQ_050
+  - WQ_015
+  - WQ_040
+  - WQ_027
+  - WQ_088
+  - WQ_003
+  - WQ_026
+  - WQ_012
+  - 换手率行业中性_20d
+  - AR_26d
+  - 融资余额变化_20d
+  - 个股融资余额变化_20d
+  - 未来30日解禁次数
+  - WQ_045
+  - WQ_006
+  - BR_26d
+  - 振幅_20d
+  - 波动率_20d
+  - WQ_002
+  - WQ_075
+  - WQ_083
+  - 未来60日解禁市值占比

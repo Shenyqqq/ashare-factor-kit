@@ -213,3 +213,14 @@ A 股法定披露窗口：
 - `python -c "import data.download; import data.clean; print('imports OK')"` → ✓ `imports OK`
 - 报告中所有文件:行号引用均来自本次 Read 实际读取的源码内容（见审计过程的工具调用记录）。
 - `factors/factor_alpha101.py` 经 Grep 确认不含 `financial`/`trade_date`/`reindex.*method`，纯量价因子，未列入风险清单。
+
+---
+
+## 七、2026-07-29 状态更新
+
+初版（2026-07-01）为只读审计。后续已落地：
+
+- **M1 财务 PIT**：`utils/pit_align.py` 法定披露窗口（**近似**，非真实公告日；Q1/Q3=+30、半年报=+60、年报=+90）。AKShare 主接口仍无可靠 first-ann_date；`stock_yjbb_em`「最新公告日期」=修订日，**不接入**主链。长表若带 `ann_date` 则优先。
+- **M2 行业 PIT**：`industry_map_panel.parquet`；IC `--barra` **严格要求** panel（`--allow-static-industry` 才允许静态退化）。
+- **M4 退市股 + ST**：深交所精确 `sz_name_change`；沪/北 `sh_bj_current_st_conservative_fallback`（自 list_date 保守标 ST）。
+- 详见 AGENTS.md 注意事项 15–22、[DATA_CLEANING_AUDIT.md](DATA_CLEANING_AUDIT.md) §七。

@@ -141,7 +141,12 @@ class MLAnalyzer:
         return nav_df
 
     def plot_shap(self, model_type="lgbm", window=None, sample_size=200):
-        import shap
+        """单模型末折可视化；完整 WF 汇总请用 ``export_shap`` / 训练期 ``--shap``。"""
+        from models.wf.shap_analysis import (
+            compute_fold_shap_summary,
+            subsample_rows,
+        )
+
         if window is None:
             window = self.trainer.train_windows[-1]
         model = self.trainer.models.get((window, model_type))
@@ -155,43 +160,85 @@ class MLAnalyzer:
         if X_sample is None:
             return
 
-        X_np = X_sample.values[:sample_size]
+        X_sample = X_sample.reindex(columns=feature_names).fillna(0)
+        summary, method = compute_fold_shap_summary(
+            model, model_type, X_sample.values, feature_names,
+            max_samples=sample_size,
+        )
+        if summary.empty:
+            if model_type == "ridge":
+                # 与旧行为兼容：LinearExplainer 失败时仍画 |coef|
+                coef_arr = (
+                    model.coef_ if hasattr(model, "coef_")
+                    else model.named_steps["model"].coef_
+                )
+                coef = pd.Series(
+                    np.abs(coef_arr), index=feature_names[: len(coef_arr)]
+                ).sort_values(ascending=True)
+                fig, ax = plt.subplots(figsize=(8, max(4, len(coef) * 0.4)))
+                coef.plot(kind="barh", ax=ax, color="steelblue", edgecolor="white")
+                ax.set_title(f"Ridge |coef|（SHAP 不可用: {method}）")
+                plt.tight_layout()
+                plt.show()
+                return coef
+            logger.warning(f"SHAP 计算失败: {method}")
+            return
 
-        if model_type == "ridge":
-            # build_model 对 ridge 返回裸 Ridge（无 Pipeline），直接访问 coef_
-            coef_arr = model.coef_ if hasattr(model, "coef_") else model.named_steps["model"].coef_
-            coef = pd.Series(
-                np.abs(coef_arr),
-                index=feature_names
-            ).sort_values(ascending=True)
-            fig, ax = plt.subplots(figsize=(8, max(4, len(coef) * 0.4)))
-            coef.plot(kind="barh", ax=ax, color="steelblue", edgecolor="white")
-            ax.set_title("Ridge 因子权重绝对值")
-            plt.tight_layout()
-            plt.show()
-            return coef
+        mean_abs = summary.set_index("feature")["mean_abs_shap"].sort_values()
+        fig, axes = plt.subplots(1, 2, figsize=(14, max(4, len(mean_abs) * 0.4)))
+        fig.suptitle(f"SHAP 分析（{model_type}, {method}）", fontsize=11)
+        mean_abs.plot(kind="barh", ax=axes[0], color="steelblue", edgecolor="white")
+        axes[0].set_title("平均 |SHAP值|")
+        axes[0].set_xlabel("mean_|SHAP|")
 
+        # 右图：若仍能拿到 raw SHAP 再画 beeswarm；否则画 share 条形
         try:
-            explainer   = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_np)
-            if isinstance(shap_values, list):
-                shap_values = shap_values[0]
+            import shap
+            from models.wf.shap_analysis import compute_shap_values
 
-            mean_abs = pd.Series(
-                np.abs(shap_values).mean(axis=0), index=feature_names
-            ).sort_values(ascending=True)
-
-            fig, axes = plt.subplots(1, 2, figsize=(14, max(4, len(mean_abs) * 0.4)))
-            fig.suptitle(f"SHAP 分析（{model_type}）", fontsize=11)
-            mean_abs.plot(kind="barh", ax=axes[0], color="steelblue", edgecolor="white")
-            axes[0].set_title("平均 |SHAP值|")
-            shap.summary_plot(shap_values, X_np, feature_names=feature_names,
-                              show=False, plot_size=None)
-            plt.tight_layout()
-            plt.show()
-            return mean_abs
+            X_np = subsample_rows(X_sample.values, max_samples=sample_size)
+            sv, _ = compute_shap_values(
+                model, model_type, X_np, feature_names,
+                max_samples=sample_size,
+            )
+            if sv is not None and model_type != "ridge":
+                shap.summary_plot(
+                    sv, X_np, feature_names=feature_names,
+                    show=False, plot_size=None,
+                )
+            else:
+                share = summary.set_index("feature")["share"].sort_values()
+                share.plot(kind="barh", ax=axes[1], color="coral", edgecolor="white")
+                axes[1].set_title("占比 share")
         except Exception as e:
-            logger.warning(f"SHAP 计算失败: {e}")
+            logger.debug(f"SHAP summary_plot 跳过: {e}")
+            share = summary.set_index("feature")["share"].sort_values()
+            share.plot(kind="barh", ax=axes[1], color="coral", edgecolor="white")
+            axes[1].set_title("占比 share")
+
+        plt.tight_layout()
+        plt.show()
+        return mean_abs
+
+    def export_shap(
+        self,
+        top_n: int = 20,
+        max_samples: int = 500,
+        max_dates: int = 12,
+    ) -> pd.DataFrame:
+        """
+        导出 SHAP 汇总到 ``artifact_dir``（若训练期已 ``--shap`` 则已有产物；
+        本方法用末折模型 + 最近 OOS 截面补算/覆盖轻量路径）。
+        """
+        from models.wf.shap_analysis import compute_trainer_shap_recent
+
+        return compute_trainer_shap_recent(
+            self.trainer,
+            max_samples=max_samples,
+            max_dates=max_dates,
+            top_n=top_n,
+            export=True,
+        )
 
     def plot_feature_importance(self):
         feature_names = self.trainer._dataset.feature_names
@@ -320,6 +367,14 @@ class MLAnalyzer:
         self.plot_model_comparison()
         self.plot_quantile_returns(prices, benchmark=benchmark)
         self.plot_feature_importance()
-        self.plot_shap(model_type="lgbm")
-        self.plot_shap(model_type="ridge")
+        # SHAP：优先画树模型；ridge 走 LinearExplainer / |coef| fallback
+        for mt in self.trainer.model_types:
+            if mt in ("lgbm", "xgb", "cat", "rf", "ridge"):
+                self.plot_shap(model_type=mt)
+        # 若训练期未开 --shap，用末折模型补一份 CSV/JSON
+        if not getattr(self.trainer, "_shap_rows", None):
+            try:
+                self.export_shap()
+            except Exception as e:
+                logger.warning(f"SHAP 导出跳过: {e}")
         self.plot_clustered_importance(model_type="lgbm")

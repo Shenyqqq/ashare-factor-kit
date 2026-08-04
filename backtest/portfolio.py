@@ -50,16 +50,25 @@ def select_top_n(
     """
     Rank by score descending; skip unbuyable names and backfill 31, 32, …
     until *n* stocks selected or candidates exhausted.
+
+    Ties are broken by code ascending so equal scores (e.g. LGBM ranker
+    leaf ties) yield a deterministic Top-N set.
     """
-    ranked = scores.sort_values(ascending=False)
+    tmp = scores.rename("score").to_frame()
+    tmp["_code"] = tmp.index.astype(str)
+    ranked = tmp.sort_values(["score", "_code"], ascending=[False, True])["score"]
+    # 批量 buyable，避免 Top 扫描时逐票 Python can_buy
+    ranked_in = [s for s in ranked.index if s in close.columns]
+    if not ranked_in:
+        return []
+    ok = rules.buyable_mask(ranked_in, execution_date, close)
     selected: list[str] = []
-    for stock in ranked.index:
+    for stock, m in zip(ranked_in, ok):
+        if not m:
+            continue
+        selected.append(stock)
         if len(selected) >= n:
             break
-        if stock not in close.columns:
-            continue
-        if rules.can_buy(stock, execution_date, close):
-            selected.append(stock)
     return selected
 
 
@@ -223,11 +232,30 @@ def assign_quantile_groups(
     q_labels: list[str],
     min_stocks: int,
 ) -> dict[str, list[str]] | None:
-    """Return {Q1: [codes], …} or None if insufficient names."""
-    if len(scores) < n_quantiles * min_stocks:
+    """Return {Q1: [codes], …} or None if insufficient names.
+
+    Score ties (common with LGBM ranker leaf outputs) used to make
+    ``pd.qcut(..., duplicates='drop')`` collapse bin edges and raise when
+    *labels* length no longer matches the reduced bin count — callers then
+    skipped the whole rebalance day.  Instead we break ties into a
+    deterministic total order (score ascending, then code) and ``qcut`` on
+    ``rank(method='first')``, so we still get up to *n_quantiles* groups
+    whenever ``len(scores) >= n_quantiles * min_stocks``.
+
+    Note: ``duplicates='drop'`` alone can yield fewer than *n_quantiles*
+    bins under heavy ties; the rank approach is preferred for calendar
+    continuity.  Returns None only for truly insufficient data.
+    """
+    clean = scores.dropna()
+    if len(clean) < n_quantiles * min_stocks:
         return None
+    # Deterministic total order → unique ranks → stable qcut edges
+    ordered = clean.rename("score").to_frame()
+    ordered["_code"] = ordered.index.astype(str)
+    ordered = ordered.sort_values(["score", "_code"], ascending=[True, True])
+    ranks = ordered["score"].rank(method="first")
     try:
-        groups = pd.qcut(scores, n_quantiles, labels=q_labels, duplicates="drop")
+        groups = pd.qcut(ranks, n_quantiles, labels=q_labels)
     except ValueError:
         return None
     result: dict[str, list[str]] = {q: [] for q in q_labels}

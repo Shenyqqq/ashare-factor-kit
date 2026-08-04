@@ -210,7 +210,8 @@ def _extract_first_fold(dataset, train_windows: list, val_window: int,
     embargo_periods = hold_period_to_embargo_periods(hold_period, dates)
     date_to_pos = {d: i for i, d in enumerate(dates)}
 
-    predict_start = max(windows) + val_window + (max(windows) - min_w)
+    # 共用近期 val：首折起点 = max(W)+V（不再加旧错位 offset）
+    predict_start = max(windows) + val_window
     for idx in range(predict_start, n_dates):
         for window in windows:
             ts, te, vs, ve = get_window_splits(
@@ -226,11 +227,25 @@ def _extract_first_fold(dataset, train_windows: list, val_window: int,
                 train_dates, val_dates, dates[idx], dates, hold_period,
                 date_pos_map=date_to_pos,
             )
-            if len(train_dates) < max(8, window // 3) or len(val_dates) < 2:
+            no_val = val_window == 0
+            if len(train_dates) < max(8, window // 3):
+                continue
+            if not no_val and len(val_dates) < 2:
                 continue
             tr = _stack_sections(dataset, train_dates, label_mode)
+            if tr is None:
+                continue
+            if no_val:
+                # Optuna 需要 eval 指标；无独立 val 时从 train 尾部切一小段作 surrogate
+                # （仅 tuning；正式 WF 无 val 时关闭 early stop）
+                X_tr, y_tr, w_tr = tr
+                n = len(y_tr)
+                cut = max(int(n * 0.85), 1)
+                if cut >= n:
+                    continue
+                return X_tr[:cut], y_tr[:cut], w_tr[:cut], X_tr[cut:], y_tr[cut:]
             va = _stack_sections(dataset, val_dates, label_mode)
-            if tr is None or va is None:
+            if va is None:
                 continue
             X_tr, y_tr, w_tr = tr
             X_va, y_va, _ = va
@@ -307,8 +322,8 @@ def _cli_main(argv: list | None = None) -> None:
                         help="每模型 Optuna 搜索轮数（默认 15）")
     parser.add_argument("--train-windows", default="6,12",
                         help="训练窗口月数，逗号分隔（默认 6,12）")
-    parser.add_argument("--val-window", type=int, default=6,
-                        help="验证窗口月数（默认 6）")
+    parser.add_argument("--val-window", type=int, default=2,
+                        help="验证窗口月数（默认 2；两窗共用近期 val）")
     parser.add_argument("--factor-config", default=None,
                         help="因子白名单 YAML/JSON（与 run.py 一致）")
     parser.add_argument("--skip-download", action="store_true")

@@ -105,13 +105,26 @@ def build_industry_panel(raw_df: pd.DataFrame) -> pd.DataFrame:
     """
     df = raw_df[["symbol", "start_date", "industry_code"]].copy()
     df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
-    df = df.dropna(subset=["start_date", "symbol", "industry_code"])
+    # P1-4: 未分类股票保留为 "UNKNOWN" 而非删除，避免幸存者偏差式行业缺失。
+    # 下游 Barra 行业哑变量对 UNKNOWN 单独成一列或作为参照基线。
+    # 仅丢弃 symbol / start_date 物理缺失的行，industry_code 缺失保留为 UNKNOWN。
+    df = df.dropna(subset=["start_date", "symbol"])
+    df["symbol"] = df["symbol"].astype(str)
+    df["industry_code"] = df["industry_code"].astype(str)
+    # 原始 industry_code 缺失（NaN→'nan' 字符串 / 空串）统一标记为 UNKNOWN
+    df["industry_code"] = df["industry_code"].where(
+        df["industry_code"].str.strip().str.len().ge(1) & (df["industry_code"] != "nan"),
+        "UNKNOWN",
+    )
     df = df.rename(columns={"symbol": "code", "start_date": "effective_date"})
 
     # 申万2021分类：6位代码，前4位=L2，前2位=L1
-    df["industry_code"] = df["industry_code"].astype(str).str.zfill(6)
-    df["sw_l2"] = df["industry_code"].str[:4]
-    df["sw_l1"] = df["industry_code"].str[:2]
+    # UNKNOWN / 非6位代码：sw_l1 / sw_l2 保持 "UNKNOWN"，下游哑变量单独成一列
+    is_unknown = df["industry_code"] == "UNKNOWN"
+    padded = df["industry_code"].str.zfill(6)
+    df["industry_code"] = padded.where(~is_unknown, "UNKNOWN")
+    df["sw_l2"] = padded.str[:4].where(~is_unknown, "UNKNOWN")
+    df["sw_l1"] = padded.str[:2].where(~is_unknown, "UNKNOWN")
 
     # 同 code 同 effective_date 去重（保留最后一条，防止接口偶发重复）
     df = (

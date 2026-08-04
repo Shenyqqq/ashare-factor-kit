@@ -390,14 +390,14 @@ rebalance_dates = groupby(to_period(period_freq)).last()
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
 | `TRAIN_WINDOWS_MONTHS` | `[6, 12]` | 训练窗口（日历月；构造时按调仓频率转为期数） |
-| `VAL_WINDOW_MONTHS` | `6` | 验证窗口（日历月，同上转换） |
+| `VAL_WINDOW_MONTHS` | `2` | 验证窗口（日历月，同上转换；两窗共用近期 val） |
 | `TIME_DECAY` | `0.015` | 训练样本指数衰减权重 |
-| `min_history` | `max(windows)+val`（期数） | 首个预测调仓日索引；h20 月频≈18，h5 周频≈78 |
+| `min_history` | `max(windows)+val`（期数） | 首个预测调仓日索引；h20 月频≈14，h5 周频≈61（V=2） |
 
-每个预测调仓日 `pred_date`：
+每个预测调仓日 `pred_date`（idx）：
 
-1. 验证集：前 `val_window` 个调仓日
-2. 对每个 `train_window`：再往前取 `window` 个调仓期训练（窗口月数在 `WalkForwardTrainer` 构造时已转换）
+1. 共用验证集：`[idx-V, idx)`（长短窗相同，紧贴预测日）
+2. 对每个 `train_window` W：训练 `[idx-V-W, idx-V)`（只是 W 不同；月数在构造时已转换）
 3. 对每个 `(window, model_type)` 训练 → 预测当期截面 → 转 rank
 4. 同模型多窗口 rank-average → 多模型 rank-average → 最终得分
 5. 记录样本外 Spearman IC → `ic_series`
@@ -580,7 +580,7 @@ Dynamic 的 `lookback=6` 指 **6 个 rebalance_dates**，不是 6 个日历月/�
 ### 13.10 2026-07-02 优化（PIT + AFML + IC v2 上线）
 
 - **IC v2 已上线 driver**：`logs/driver.py::run_ic` 默认调 `research.ic_analysis_v2`。生产路径享受 Newey-West HAC t、可交易池 mask（剔除 ST/涨跌停/停牌）、IC clip/winsorize、BH-FDR 多重检验校正、rolling ICIR、IC 衰减表（含 ICIR/t/half-life）、扣成本 IC、JSON 元数据补全（universe_size / ic_series_length / sample_period / config_snapshot）。v1 `ic_analysis.py` 保留为后备。
-- **PIT 财务披露日对齐**：`utils/pit_align.py` 按法定披露窗口（Q1/Q3=+45 天、半年报=+75 天、年报=+120 天）延迟财务因子可用日期，消除 look-ahead bias。修改 `factors/factor.py::_pivot_financial`、`factors/barra_risk.py::_pivot_ffill`、`factors/factor_alpha.py::factor_institution_change`。审计见 [docs/PIT_AUDIT.md](PIT_AUDIT.md)。
+- **PIT 财务披露日对齐**：`utils/pit_align.py` 按法定披露窗口（Q1/Q3=+30 天、半年报=+60 天、年报=+90 天）延迟财务因子可用日期，消除 look-ahead bias。修改 `factors/factor.py::_pivot_financial`、`factors/barra_risk.py::_pivot_ffill`、`factors/factor_alpha.py::factor_institution_change`。审计见 [docs/PIT_AUDIT.md](PIT_AUDIT.md)。
 - **退市股 + ST 时间序列**：`data/download_delisted.py` 下载历史退市股 OHLCV；`data/download.py::get_stock_list` 保留退市股；ST 状态从静态集合改为按日期查询的时间序列（`backtest/execution.py`、`backtest/quantile.py`、`research/ic/universe.py`、`research/ic/load_data.py`、`research/ic/cli.py`）。
 - **行业 PIT 时间序列**：`data/industry/download_industry.py` 重写产出 `industry_map_panel.parquet`（date × code → sw_l2）；`research/ic/barra.py::_industry_dummies` 按截面日期取当期行业；`tests/test_industry_pit.py`。
 - **AFML 方法论**：
@@ -603,7 +603,7 @@ Dynamic 的 `lookback=6` 指 **6 个 rebalance_dates**，不是 6 个日历月/�
 | `N_STOCKS` | 30 | `config/settings.py` |
 | `MIN_MARKET_CAP` | 20 亿 | `config/settings.py` |
 | `TRAIN_WINDOWS_MONTHS` | [6, 12] | `models/trainer.py` |
-| `VAL_WINDOW_MONTHS` | 6 | `models/trainer.py` |
+| `VAL_WINDOW_MONTHS` | 2 | `models/trainer.py` |
 | `MODEL_TYPES` | lgbm, xgb | `models/trainer.py` |
 | `TIME_DECAY` | 0.015 | `models/trainer.py` |
 | IC 筛选 ic_threshold | 0.02 | `research/ic_analysis.py` / `research/ic/selection.py` |

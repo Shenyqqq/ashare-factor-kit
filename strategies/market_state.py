@@ -89,18 +89,44 @@ def download_csi_all(start: str = "2017-01-01",
     from loguru import logger
 
     logger.info("下载中证全指指数(sh000985)...")
-    # 优先东方财富源（数据更新），失败回退到原源
-    try:
-        df = ak.stock_zh_index_daily_em(symbol=CSI_ALL_SYMBOL)
-    except Exception:
-        df = ak.stock_zh_index_daily(symbol=CSI_ALL_SYMBOL)
-    df.index = pd.to_datetime(df["date"])
-    df = df.sort_index()
+    # 优先东方财富源（数据更新）；失败再试新浪。新浪历史常止于 ~2016，
+    # 若按 start 过滤后为空则不得覆盖已有缓存。
+    df = None
+    last_err: Exception | None = None
+    for label, fn in (
+        ("eastmoney", lambda: ak.stock_zh_index_daily_em(symbol=CSI_ALL_SYMBOL)),
+        ("sina", lambda: ak.stock_zh_index_daily(symbol=CSI_ALL_SYMBOL)),
+    ):
+        try:
+            cand = fn()
+            if cand is None or cand.empty:
+                raise RuntimeError(f"{label} 返回空表")
+            cand = cand.copy()
+            cand.index = pd.to_datetime(cand["date"])
+            cand = cand.sort_index()
+            if start:
+                cand = cand[cand.index >= start]
+            if end:
+                cand = cand[cand.index <= end]
+            if cand.empty:
+                raise RuntimeError(
+                    f"{label} 在 start={start!r}/end={end!r} 过滤后为空"
+                )
+            df = cand
+            logger.info(f"中证全指来源={label}, 末日={df.index.max().date()}, n={len(df)}")
+            break
+        except Exception as e:
+            last_err = e
+            logger.warning(f"中证全指 {label} 失败: {e}")
 
-    if start:
-        df = df[df.index >= start]
-    if end:
-        df = df[df.index <= end]
+    if df is None or df.empty:
+        if CSI_ALL_PATH.exists():
+            logger.error(
+                f"中证全指下载失败，保留已有缓存 {CSI_ALL_PATH} "
+                f"(last_err={last_err})"
+            )
+            return pd.read_parquet(CSI_ALL_PATH)["close"]
+        raise RuntimeError(f"中证全指下载失败且无缓存: {last_err}")
 
     CSI_ALL_PATH.parent.mkdir(parents=True, exist_ok=True)
     df[["open", "high", "low", "close", "volume"]].to_parquet(CSI_ALL_PATH)
