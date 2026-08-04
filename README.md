@@ -1,82 +1,83 @@
-# A 股多因子量化选股框架
+# A 股多因子选股研究框架
 
-面向研究与辅助选股的 A 股多因子流水线：**数据下载 → 因子计算 → IC 筛选 → ML / 动态加权 → 分组回测 → 候选股输出**。
+用 Python 做 A 股「多因子选股」研究的脚手架：算因子、检验哪些有用、训练打分模型、做分组回测，最后给出一份候选股排名，方便你自己再筛。
 
-## 这是什么 / 不是什么
+## 能做什么 / 不能做什么
 
-| 是 | 不是 |
-|----|------|
-| 可复现的研究框架与实验脚手架 | 全自动交易系统 / 券商下单接口 |
-| 输出得分排名与 Top-N 候选池，供人工二次筛选 | 投资建议或收益承诺 |
-| 强调 PIT、可交易口径、成本与过拟合检验 | 「一键复现完整历史曲线」的数据快照仓库 |
+**能帮你：**
 
-数据需自行通过 AKShare（等）下载；不同机器、不同下载时点与接口变更会导致结果不可逐点复现。过拟合风险真实存在，请用样本外与 PBO/DSR 等工具自检，勿盲信单次最优实验。
+- 把「下载数据 → 算因子 → 检验因子 → 训练模型 → 回测 → 看候选股」串成一条可复现的流程
+- 输出股票得分与 Top-N 名单，供人工二次筛选后手动下单
+- 在研究里尽量对齐真实可交易约束（涨跌停、停牌、退市等），并提醒过拟合风险
 
----
+**不能当成：**
 
-## 特色与特别实现
+- 全自动交易系统或券商下单接口
+- 「保证赚钱」的荐股服务
+- 开箱即有完整历史数据、一键复现别人曲线的数据包（数据要自己下，见下文）
 
-- **PIT 数据保护**：财务因子按法定披露窗口近似对齐（Q1/Q3=+30、半年报=+60、年报=+90；有 `ann_date` 则优先）；行业映射用 `industry_map_panel.parquet`；股票池保留退市股；ST 按时间序列查询。详见 [docs/PIT_AUDIT.md](docs/PIT_AUDIT.md)。
-- **`clean_ret`**：涨跌停日收益置 NaN，量价/Barra Beta·ResVol 等统一走该口径，避免限价日系统性失真。
-- **研究口径 vs 严格执行**：默认 research——IC/ML 信号日可交易池保留涨跌停、标签不做 execution mask；回测仍拦截买日一字涨停等；得分宇宙默认 `strict`，避免训练池膨胀泄漏进基准。可用 `--tradable-strict` / `--label-exec-mask` 恢复旧口径。
-- **IC v2 生产筛选**：Newey-West HAC t、BH-FDR、corr-dedup、可交易池 mask、rolling ICIR、扣成本 IC、稀疏因子轨与 `long_share` 稠密门；支持 `--cap-band` 市值缩域（如 `micro_30` / `micro_small_100`）。
-- **Barra + WLS 纯化**：√市值加权截面回归控制风格+行业；`--feature-neutralize` 让 ML 特征与纯 IC 同口径。
-- **Walk-Forward**：purged training + embargo；默认多窗共用近期 val；`--val-window 0` 可关闭独立验证（多窗须 `wf_selection=average`）；多窗×多模型 IC 加权 Z-score 集成。
-- **分位回测与成本**：Q1–Q5 + Top-N；佣金/印花税/滑点 + bid-ask spread（默认 10bp）。
-- **因子注册与面板缓存**：`get_factor_registry()` 统一注册；因子面板 / Barra 残差化缓存（`neut_v6`，含 horizon·频率指纹）。
-- **其它**：rolling-pool 轮动定池、AFML 分数差分 / Clustered FI / 可选 SHAP、事件与 special factors 注入等。
+## 和「随便写个回测脚本」相比，特别在哪
 
-Agent 与开发约定见 [AGENTS.md](AGENTS.md)（内部速查，非对外教程）。
+很多脚本能画出漂亮净值，却悄悄用了当时还拿不到的信息，或忽略了买不进去的日子。这套框架刻意把这些坑写进流水线：
 
----
+1. **防未来函数（PIT）**：财务、行业等数据按「当时能看到」的日期对齐，避免用到公告前还不知道的信息。详见 [docs/PIT_AUDIT.md](docs/PIT_AUDIT.md)。
+2. **涨跌停与可交易**：涨跌停日的收益会特殊处理；回测里也会拦截买不进、卖不出的情况，而不是假装每天都能成交。
+3. **股票池含退市股**：降低「只看活下来的股票」造成的幸存者偏差。
+4. **先检验因子再建模**：用信息系数（IC，衡量因子与未来收益的相关性）等工具筛选因子，而不是把几百个指标一股脑扔进模型。
+5. **滚动训练（Walk-Forward）**：按时间向前滚动训练与预测，并处理训练标签与预测日重叠等问题；细节与统计校正见 [docs/PIPELINE.md](docs/PIPELINE.md)。
+6. **成本与过拟合自检**：回测计入佣金、印花税与买卖价差；另有工具检查「挑出来的最优结果是否太好看」。
 
-## 目录结构速览
+开发约定与内部参数速查见 [AGENTS.md](AGENTS.md)（给维护者看的，不是入门教程）。
+
+## 目录长什么样
 
 ```
 quant_trading/
-├── run.py                 # 主入口 CLI
-├── config/                # settings.py、因子白名单 YAML
-├── data/                  # 下载 / 清洗 / 行业 / 市值（raw 不进库）
-├── factors/               # 因子实现 + registry + 面板缓存
-├── models/                # Walk-Forward / dynamic / industry（含 wf/）
-├── strategies/            # linear / ml 调度
-├── backtest/              # 分组回测引擎与成本
-├── research/              # IC v2、rolling_pool、pbo
-├── utils/                 # rebalance / PIT / WLS / universe(cap-band)
-├── tests/
-├── docs/                  # 命令与流水线文档
-├── logs/driver.py         # IC → YAML → 批量实验编排
-└── results/<tag>/         # 本地实验产物（默认 gitignore）
+├── run.py          # 主入口：一条命令跑训练/回测
+├── config/         # 全局参数、因子名单
+├── data/           # 下载与清洗（本地数据默认不进 git）
+├── factors/        # 各类因子
+├── models/         # 滚动训练与模型
+├── strategies/     # 线性 / 机器学习等策略调度
+├── backtest/       # 分组回测与成本
+├── research/       # 因子检验、定池、过拟合检验
+├── docs/           # 教程与流水线说明
+└── results/        # 你跑出来的实验结果（本地生成）
 ```
 
----
+## 怎么跑起来
 
-## 快速开始
+需要会一点 Python / 命令行。Windows 示例：
 
 ```bash
 python -m venv .venv
-# Windows
 .venv\Scripts\activate
 pip install -r requirements.txt
 
-# 复制环境变量模板（可选：TUSHARE_TOKEN、DATA_ROOT）
+# 可选：复制环境变量模板（如数据目录、第三方 token）
 copy .env.example .env
 
-# 冒烟：下载 + 前 100 只股票跑通
+# 冒烟：下载样本并跑通前 100 只股票
 python run.py --sample 100
 ```
 
-日常训练、IC 筛选、cap-band、编排与高级开关见：
+更完整的流程（准备数据、筛因子、正式训练）见：
 
-- **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** — 从数据到回测的推荐流程
-- **[docs/CLI_QUICKSTART.md](docs/CLI_QUICKSTART.md)** — 最短命令与默认开关
-- **[docs/PIPELINE.md](docs/PIPELINE.md)** — 端到端流水线与陷阱
-- `python run.py --help` / `--help-advanced`
+- [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) — 从零到回测的推荐步骤
+- [docs/CLI_QUICKSTART.md](docs/CLI_QUICKSTART.md) — 常用最短命令
 
----
+也可随时：`python run.py --help`。
+
+## 关于数据
+
+本仓库**不附带**完整行情与财务数据包。运行时会通过 AKShare 等公开接口下载到本地（如 `data/raw/`）。
+
+请注意：
+
+- 首次跑依赖网络；接口变更或限流时可能失败，需自行重试或检查本地文件
+- 不同下载时点、股票覆盖范围会导致结果无法与他人逐点一致——这是研究框架的常态，不是「一键复现别人曲线」
+- 研究用完整数据时，通常还要补退市股、市值、行业等，步骤写在入门文档里
 
 ## 许可与免责
 
-本仓库以 [MIT License](LICENSE) 发布。
-
-**免责声明**：本项目仅供学习与研究，不构成任何投资建议。证券投资有风险，据此操作造成的盈亏由使用者自行承担。
+本仓库以 [MIT License](LICENSE) 发布。仅供学习与研究，不构成投资建议；据此操作的盈亏自负。

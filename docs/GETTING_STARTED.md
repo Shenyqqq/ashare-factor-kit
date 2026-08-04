@@ -1,6 +1,7 @@
 # Getting Started
 
-从零跑通本框架的推荐路径。最短命令速查见 [CLI_QUICKSTART.md](CLI_QUICKSTART.md)；流水线细节见 [PIPELINE.md](PIPELINE.md)。
+如果你会一点 Python、想亲手跑通「下载 → 选因子 → 训练 → 回测」，按下面顺序做即可。  
+项目是什么、能做什么，先看根目录 [README.md](../README.md)；最短命令速查见 [CLI_QUICKSTART.md](CLI_QUICKSTART.md)；流水线细节见 [PIPELINE.md](PIPELINE.md)。
 
 ## 1. 环境
 
