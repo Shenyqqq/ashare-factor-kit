@@ -57,11 +57,16 @@ research/output/rolling_pool_schedule_*
 research/output/ic_*.log
 research/output/ic_*.err
 research/output/osap_*.txt
+research/output/factor_configs_*.yaml
 
-# 配置备份
+# 配置备份 / 一次性调参快照（主文件 tuned_params.json 仍可跟踪）
 config/*.bak*
 config/*_backup.json
 config/*backup*.json
+config/tuned_params_*_*.json
+
+# 本地数据质量快照（脚本 quality_report.py 已入库）
+data/quality_report_*.md
 
 # 其它输出
 *.png
