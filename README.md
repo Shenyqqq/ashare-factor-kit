@@ -35,7 +35,7 @@ Agent 与开发约定见 [AGENTS.md](AGENTS.md)（内部速查，非对外教程
 ```
 quant_trading/
 ├── run.py                 # 主入口 CLI
-├── ui/app.py              # 可选 Streamlit 简易面板（包装 run.py）
+├── ui/app.py              # 可选 Streamlit 简易面板（回测 run.py + IC 筛选）
 ├── config/                # settings.py、因子白名单 YAML
 ├── data/                  # 下载 / 清洗 / 行业 / 市值（raw 不进库）
 ├── factors/               # 因子实现 + registry + 面板缓存
@@ -76,7 +76,7 @@ python run.py --sample 100
 
 ### 图形界面（可选）
 
-不想记命令时，可用本地 Streamlit 面板改常用参数并调用 `run.py`（**仍须**先装 Python / 依赖，并自行准备数据；全市场很慢，建议先 sample 冒烟）。不做券商下单或 IC 全量编排。
+不想记命令时，可用本地 Streamlit 面板改常用参数并调用 `run.py`（回测）或 `research.ic_analysis_v2`（因子筛选）（**仍须**先装 Python / 依赖，并自行准备数据；全市场 / IC 全量很慢，建议先 sample 或短名单冒烟）。不做券商下单或 `logs/driver.py` 编排。
 
 ```bash
 streamlit run ui/app.py
