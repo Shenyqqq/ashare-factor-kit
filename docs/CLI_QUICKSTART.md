@@ -3,6 +3,8 @@
 新人只看本节即可开跑。完整流程见 [GETTING_STARTED.md](GETTING_STARTED.md)。  
 全部参数：`python run.py --help` / `--help-advanced`，或 `python -m research.ic_analysis_v2 --help` / `--help-advanced`。
 
+可选本地图形面板（包装常用 `run.py` 参数，仍需自备数据）：见 [UI.md](UI.md)，`streamlit run ui/app.py`。
+
 ## 日常最短命令
 
 ```bash

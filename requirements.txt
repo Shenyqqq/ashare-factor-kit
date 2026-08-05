@@ -25,6 +25,7 @@ cvxpy>=1.4.0             # 凸优化（均值-方差/风险平价）
 matplotlib>=3.7.0
 seaborn>=0.12.0
 plotly>=5.17.0
+streamlit>=1.28.0        # 可选本地 UI：streamlit run ui/app.py
 
 # ── 工具 ──────────────────────────────────────
 python-dotenv>=1.0.0     # 管理 token/密钥
