@@ -53,7 +53,7 @@ class IndustryWalkForwardTrainer:
     train_windows : list[int]
         Walk-Forward 训练窗口月数，默认 TRAIN_WINDOWS_MONTHS（构造时按调仓频率转为期数）。
     val_window : int
-        验证窗口月数，默认 VAL_WINDOW_MONTHS（2）。
+        验证窗口月数，默认 VAL_WINDOW_MONTHS（6）。
     rebalance_freq : str
         调仓频率（与 run.py horizon 推断一致），用于月数→调仓期数转换。
     min_stocks : int

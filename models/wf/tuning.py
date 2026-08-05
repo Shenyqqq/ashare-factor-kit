@@ -322,8 +322,8 @@ def _cli_main(argv: list | None = None) -> None:
                         help="每模型 Optuna 搜索轮数（默认 15）")
     parser.add_argument("--train-windows", default="6,12",
                         help="训练窗口月数，逗号分隔（默认 6,12）")
-    parser.add_argument("--val-window", type=int, default=2,
-                        help="验证窗口月数（默认 2；两窗共用近期 val）")
+    parser.add_argument("--val-window", type=int, default=6,
+                        help="验证窗口月数（默认 6；两窗共用近期 val）")
     parser.add_argument("--factor-config", default=None,
                         help="因子白名单 YAML/JSON（与 run.py 一致）")
     parser.add_argument("--skip-download", action="store_true")

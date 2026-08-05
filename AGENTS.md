@@ -36,7 +36,7 @@ A 股多因子量化选股框架，定位 **辅助人工选股，不做全自动
 | **clean_ret** | 量价因子必须用 `clean_ret`（涨跌停日 return=NaN），禁用 `prices.pct_change()`；Barra_Beta/Barra_ResVol 也已切换 |
 | **rebalance_dates** | `groupby(period).last()` 取周期末实际交易日，不用日历 `ME`/`W-FRI` 虚拟日期 |
 | **forward_return** | `close[t+N] / open[t+1] - 1`（有 open_ 时），信号日收盘后次日开盘买入 |
-| **Walk-Forward split** | purged training + embargo（AFML Ch.7）；默认两窗共用近期 val `[idx-V, idx)`、train `[idx-V-W, idx-V)`（`VAL_WINDOW_MONTHS=2`）；`val_window=0` → train `[idx-W, idx)`、无 val（仍 purge/embargo；多窗须 `wf_selection=average`）；`hold_period_to_embargo_periods()` 自动换算 |
+| **Walk-Forward split** | purged training + embargo（AFML Ch.7）；默认两窗共用近期 val `[idx-V, idx)`、train `[idx-V-W, idx-V)`（`VAL_WINDOW_MONTHS=6`）；`val_window=0` → train `[idx-W, idx)`、无 val（仍 purge/embargo；多窗须 `wf_selection=average`）；`hold_period_to_embargo_periods()` 自动换算 |
 | **集成方式** | 多训练窗口 × 多模型 → IC 加权 Z-score 平均（非盲 rank average） |
 | **Clustered FI** | `models/wf/clustered_importance.py`（AFML Ch.6）按相关因子聚类算重要性，避免相关因子重要性分裂 |
 | **SHAP** | `models/wf/shap_analysis.py`；CLI `--shap`（默认关）；折内 Tree/Linear SHAP → `results/<tag>/shap_*.csv`；与 FI/Clustered FI 并存 |
@@ -120,7 +120,7 @@ python logs/analyze_results.py
 - **AKShare 接口修复**（2026-07-02）：`_fetch_stock_list_with_metadata` 重复列名 + SZ symbol + 退市接口名。
 - 中证全指已接入作市场代理与基准。
 - Barra 残差化标签（`label_mode='barra_residual'`）已实现，控制 9 风格 + 行业哑变量。
-- Walk-Forward 已实现 purged split + embargo + 两窗共用近期 val（默认 V=2 月）+ IC 加权多窗口集成。
+- Walk-Forward 已实现 purged split + embargo + 两窗共用近期 val（默认 V=6 月）+ IC 加权多窗口集成。
 - 实验产物统一落 `results/<tag>/`，命名 `tag = {mode}_h{horizon}[_w{windows}][_m{models}][_blend][_v2]`。
 
 ## 注意事项（最容易踩坑）

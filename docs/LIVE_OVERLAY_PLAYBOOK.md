@@ -88,7 +88,7 @@ cat 诊断：`2026-06-18` 仅 6 个唯一分、最高分并列约 41 只；`2026
 | 组合加权 | **已有** | `--portfolio-opt ew\|score\|rank\|invvol\|mv\|rp` + `--max-weight` | L2；小资金优先 ew/rank/invvol |
 | 换手约束 | **已有** | `--turnover-limit` / `--rank-change-threshold` | L2；周频建议开 |
 | special factors | **已有** | `--special-factors sparse\|size\|event` | 激进时可加 `size`（跳过中性化） |
-| val 窗 | **已有** | `--val-window`（默认 2） | 训练口径，非实盘动作 |
+| val 窗 | **已有** | `--val-window`（默认 6） | 训练口径，非实盘动作 |
 | 仓位体制（0.3–1.0） | **已有** | `--position-regime` / `--force-exposure` | L3 **半成品**：历史实验 mean exposure≈0.64 |
 | 杠杆 >1 / 1.5× | **缺** | `force_exposure` 硬限制 `[0,1]` | 需开发才谈 1.5 |
 | Moreira 式 vol-target（∝ 1/σ²） | **缺** | 现有是离散计分，非连续 vol 缩放 | M |

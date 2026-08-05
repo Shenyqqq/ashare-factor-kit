@@ -390,7 +390,7 @@ rebalance_dates = groupby(to_period(period_freq)).last()
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
 | `TRAIN_WINDOWS_MONTHS` | `[6, 12]` | 训练窗口（日历月；构造时按调仓频率转为期数） |
-| `VAL_WINDOW_MONTHS` | `2` | 验证窗口（日历月，同上转换；两窗共用近期 val） |
+| `VAL_WINDOW_MONTHS` | `6` | 验证窗口（日历月，同上转换；两窗共用近期 val） |
 | `TIME_DECAY` | `0.015` | 训练样本指数衰减权重 |
 | `min_history` | `max(windows)+val`（期数） | 首个预测调仓日索引；h20 月频≈14，h5 周频≈61（V=2） |
 
@@ -603,7 +603,7 @@ Dynamic 的 `lookback=6` 指 **6 个 rebalance_dates**，不是 6 个日历月/�
 | `N_STOCKS` | 30 | `config/settings.py` |
 | `MIN_MARKET_CAP` | 20 亿 | `config/settings.py` |
 | `TRAIN_WINDOWS_MONTHS` | [6, 12] | `models/trainer.py` |
-| `VAL_WINDOW_MONTHS` | 2 | `models/trainer.py` |
+| `VAL_WINDOW_MONTHS` | 6 | `models/trainer.py` |
 | `MODEL_TYPES` | lgbm, xgb | `models/trainer.py` |
 | `TIME_DECAY` | 0.015 | `models/trainer.py` |
 | IC 筛选 ic_threshold | 0.02 | `research/ic_analysis.py` / `research/ic/selection.py` |

@@ -1343,7 +1343,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--val-window", type=int, default=None,
         help=_h(
-            "验证窗口月数（默认 2；0=无独立 val，train 贴 pred；多窗须 --wf-selection average；"
+            "验证窗口月数（默认 6；0=无独立 val，train 贴 pred；多窗须 --wf-selection average；"
             "两窗共用近期 val，与 --train-windows 同单位）",
             advanced=True,
         ),

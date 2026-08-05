@@ -91,7 +91,7 @@ N_CORES = os.cpu_count() or 4
 # ── 超参数（集中配置）────────────────────────────────────────────────────────
 
 TRAIN_WINDOWS_MONTHS = [6, 12]   # 日历月；WalkForwardTrainer 构造时转为调仓期数
-VAL_WINDOW_MONTHS    = 2         # 日历月；两窗共用近期 val（h5 周频 ≈ round(2*52/12)=9 期）
+VAL_WINDOW_MONTHS    = 6         # 日历月；两窗共用近期 val（h5 周频 ≈ round(6*52/12)=26 期）
 TIME_DECAY           = 0.015
 MIN_STOCKS_PER_DATE  = 30
 REBALANCE_FREQ       = "ME"
