@@ -45,14 +45,14 @@ python -m data.download_delisted
 
 | 入口 | 默认 |
 |------|------|
-| `run.py` | `--feature-neutralize`、`BID_ASK_SPREAD_BPS=10`、research tradable、`--label-mode cs_zscore`、`--bt-score-universe strict` |
+| `run.py` | `--feature-neutralize`、`BID_ASK_SPREAD_BPS=10`、research tradable、`--label-mode cs_zscore`、`--bt-score-universe strict`、`--retrain-every 4`（周频≈月度重训；每期用 `1`） |
 | `ic_analysis_v2` | `--use-fdr`、`--t-threshold 2.5`、`--corr-dedup`、decay/emerging/sparse 标注轨；`--gram-schmidt` 默认 OFF |
 
 关闭示例：`--no-feature-neutralize`、`--no-use-fdr`、`--no-corr-dedup`。GS 显式开：`--gram-schmidt`。
 
 ## 高级开关（一行）
 
-`run.py`：`--label-mode` / `--objective` / `--train-windows` / `--val-window`（默认 6 月共用近期 val；`0`=无独立 val，多窗须 `--wf-selection average`）/ `--cap-band`（`all` / `micro_30` / `micro_small_100` 等）/ `--sparse-from-ic` / `--rolling-pool-*` / `--position-regime` / `--portfolio-opt` / `--two-stage` / `--special-factors` / `--tradable-strict` / `--shap*` / `--tune` / `--multi-horizon` 等 → `--help-advanced`。
+`run.py`：`--label-mode` / `--objective` / `--train-windows` / `--val-window`（默认 6 月共用近期 val；`0`=无独立 val，多窗须 `--wf-selection average`）/ `--retrain-every`（默认 4≈月度；`1`=每期）/ `--cap-band`（`all` / `micro_30` / `micro_small_100` 等）/ `--sparse-from-ic` / `--rolling-pool-*` / `--position-regime` / `--portfolio-opt` / `--two-stage` / `--special-factors` / `--tradable-strict` / `--shap*` / `--tune` / `--multi-horizon` 等 → `--help-advanced`。
 
 `ic_analysis_v2`：阈值门、`--universe` / `--cap-band`、decay/emerging/sparse 旋钮、`--resume`/`--fresh`、增量补录 `--only-new`/`--factors`（merge `ic_series`；`barra_pure` 指纹匹配时只补新区并 merge，仍重跑 selection）、`--plot-rolling-ic`（滚动 IC 折线 → `research/output/figs/`，复用已算序列）、workers → `--help-advanced`（详例见 `docs/操作手册.md`）。
 

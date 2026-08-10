@@ -47,7 +47,7 @@ warnings.filterwarnings("ignore")
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config.settings import PROCESSED_DIR, TRAIN_MAX_WORKERS, TRAIN_N_JOBS
+from config.settings import PROCESSED_DIR, TRAIN_MAX_WORKERS, TRAIN_N_JOBS, RETRAIN_EVERY
 from utils.rebalance_dates import get_rebalance_dates
 
 # Hyperparams live in models/wf/params.py to avoid circular imports with wf/models.py
@@ -484,7 +484,7 @@ class WalkForwardTrainer:
         long_weight_ratio: float = 0.25,
         long_weight_curve: str = "smooth",
         softlong_floor_slope: float = 0.25,
-        retrain_every: int = 1,
+        retrain_every: int = RETRAIN_EVERY,
     ):
         # 默认 train_windows/val_window 为日历月；units=periods 时直接当调仓期数
         self.train_windows, self.val_window = resolve_train_windows(

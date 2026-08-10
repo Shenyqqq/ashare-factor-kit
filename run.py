@@ -50,6 +50,7 @@ from config.settings import (
     FACTOR_WEIGHTS,
     RISK_FREE_RATE,
     N_STOCKS,
+    RETRAIN_EVERY,
 )
 
 PRICES_PATH     = RAW_DIR / "prices_hfq.parquet"
@@ -347,7 +348,7 @@ def main(mode="linear", skip_download=False, sample=0,
       long_weight_ratio: float = 0.25,
       long_weight_curve: str = "smooth",
       softlong_floor_slope: float = 0.25,
-      retrain_every: int = 1,
+      retrain_every: int = RETRAIN_EVERY,
       tradable_limit_mode: str | None = None,
       exclude_limit_on_signal: bool | None = None,
       apply_exec_mask: bool | None = None,
@@ -1357,9 +1358,10 @@ if __name__ == "__main__":
         help=_h("训练窗口单位：months（默认）| periods", advanced=True),
     )
     parser.add_argument(
-        "--retrain-every", type=int, default=1,
+        "--retrain-every", type=int, default=RETRAIN_EVERY,
         help=_h(
-            "每 N 个调仓期重训一次（默认 1=每期重训；周频约一季用 13）；"
+            f"每 N 个调仓期重训一次（默认 {RETRAIN_EVERY}=周频≈月度；"
+            "每期重训用 1；周频约一季用 13）；"
             "中间预测日复用最近重训日模型",
             advanced=True,
         ),

@@ -56,6 +56,9 @@ BARRA_IC_WORKERS    = int(os.getenv("BARRA_IC_WORKERS", "1"))   # Barra 纯 IC O
 # DynamicFactorTrainer：按调仓日并行（单线程 ~4.5GB；线程池共享缓存但 >4 并行仍易 OOM）
 # 32GB 且同时跑 ML 建议 1；仅 dynamic 时可设 4（默认上限）
 DYNAMIC_MAX_WORKERS = int(os.getenv("DYNAMIC_MAX_WORKERS", "4"))
+# Walk-Forward 重训间隔（调仓期数）：默认 4 ≈ 周频月度重训；每期重训用 --retrain-every 1
+RETRAIN_EVERY       = int(os.getenv("RETRAIN_EVERY", "4"))
+
 
 # ── 股票池过滤 ────────────────────────────────────────────────────────────────
 MIN_MARKET_CAP      = 20e8        # 最小市值 20亿，过滤壳股

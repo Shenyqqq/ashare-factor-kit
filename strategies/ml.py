@@ -15,6 +15,7 @@ from config.settings import (
     BACKTEST_START,
     BACKTEST_END,
     FWD_RETURN_WINSOR,
+    RETRAIN_EVERY,
     resolve_apply_exec_mask,
     resolve_exclude_limit_on_signal,
 )
@@ -1011,7 +1012,7 @@ def run(
     long_weight_ratio: float = 0.25,
     long_weight_curve: str = "smooth",
     softlong_floor_slope: float = 0.25,
-    retrain_every: int = 1,
+    retrain_every: int = RETRAIN_EVERY,
 ) -> tuple[pd.DataFrame, object]:
     """
     训练 ML 策略并返回样本外预测得分。
