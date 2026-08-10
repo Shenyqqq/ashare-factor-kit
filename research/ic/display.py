@@ -1,6 +1,8 @@
 """Terminal / matplotlib output for IC analysis v2."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -207,46 +209,176 @@ def print_quantile_ls(quantile_df: pd.DataFrame, *, y_mode: str = "residual", to
         print(f"  ... 共 {len(view)} 个因子（仅展示 |spread| Top {top}）")
 
 
-def plot_rolling_ic(all_ic: dict, period: int, window: int = 12):
-    import matplotlib.pyplot as plt
+def _default_rolling_ic_window(period: int) -> int:
+    """约半年滚动窗：周频 h5→26 期，月频 h20→6 期。"""
+    p = max(1, int(period))
+    return max(6, int(round(126 / p)))
+
+
+def _configure_matplotlib_cjk():
     import matplotlib
-    matplotlib.rcParams["font.family"] = "SimHei"
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     matplotlib.rcParams["axes.unicode_minus"] = False
+    for family in ("SimHei", "Microsoft YaHei", "Noto Sans CJK SC", "Arial Unicode MS"):
+        try:
+            matplotlib.rcParams["font.family"] = family
+            break
+        except Exception:
+            continue
+    return plt
 
-    valid = {k: v for k, v in all_ic.items() if v.abs().mean() >= 0.03}
-    if not valid:
-        print("无IC>0.03的因子，跳过图表")
-        return
 
-    fig, axes = plt.subplots(2, 1, figsize=(16, 10))
-    fig.suptitle(f"因子IC分析 v2（持仓期={period}日）", fontsize=13, fontweight="bold")
+def resolve_rolling_ic_names(
+    all_ic: dict,
+    *,
+    names: list[str] | None = None,
+    selected: list[str] | None = None,
+    summary_df: pd.DataFrame | None = None,
+    top_n: int = 30,
+) -> list[str]:
+    """Pick a short factor list for line charts (avoid 500-line spaghetti).
+
+    Priority: explicit ``names`` → ``selected`` (intersection with ``all_ic``) →
+    ``|IC|`` Top-N from ``summary_df`` / mean abs IC.
+    """
+    if names:
+        out = [n for n in names if n in all_ic]
+        missing = [n for n in names if n not in all_ic]
+        if missing:
+            print(f"  [plot-rolling-ic] 名单中 {len(missing)} 个无 IC 序列，已跳过")
+        return out
+
+    if selected:
+        out = [n for n in selected if n in all_ic]
+        if out:
+            if top_n > 0 and len(out) > top_n:
+                # keep selection order but cap
+                return out[:top_n]
+            return out
+
+    ranked: list[tuple[str, float]] = []
+    if summary_df is not None and not summary_df.empty and "|IC|均值" in summary_df.columns:
+        for name, row in summary_df.iterrows():
+            if name not in all_ic:
+                continue
+            val = row.get("|IC|均值", np.nan)
+            if pd.isna(val):
+                continue
+            ranked.append((str(name), float(abs(val))))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+    else:
+        for name, ic in all_ic.items():
+            s = ic.dropna()
+            if s.empty:
+                continue
+            ranked.append((name, float(s.abs().mean())))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+
+    n = top_n if top_n and top_n > 0 else 30
+    return [name for name, _ in ranked[:n]]
+
+
+def plot_rolling_ic_lines(
+    all_ic: dict,
+    period: int,
+    *,
+    names: list[str] | None = None,
+    selected: list[str] | None = None,
+    summary_df: pd.DataFrame | None = None,
+    top_n: int = 30,
+    window: int | None = None,
+    source_label: str = "raw",
+    out_dir: str | Path | None = None,
+    tag: str = "",
+    show: bool = False,
+) -> Path | None:
+    """Save rolling-mean IC line chart for a short factor list.
+
+    Writes ``research/output/figs/rolling_ic_{source}_h{period}[_{tag}].png``.
+    Designed for resume: pass already-computed ``all_ic`` / pure series; no recompute.
+    """
+    pick = resolve_rolling_ic_names(
+        all_ic,
+        names=names,
+        selected=selected,
+        summary_df=summary_df,
+        top_n=top_n,
+    )
+    if not pick:
+        print("  [plot-rolling-ic] 无可用因子，跳过折线图")
+        return None
+
+    win = int(window) if window and window > 0 else _default_rolling_ic_window(period)
+    plt = _configure_matplotlib_cjk()
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 9), sharex=False)
+    title_src = source_label or "raw"
+    fig.suptitle(
+        f"滚动 IC（{title_src}，持仓期={period}日，窗={win}，n={len(pick)}）",
+        fontsize=13,
+        fontweight="bold",
+    )
+
     ax = axes[0]
-    for name, ic in valid.items():
-        ic.rolling(window).mean().plot(ax=ax, label=name, alpha=0.8, lw=1.2)
+    for name in pick:
+        ic = all_ic[name].dropna()
+        if ic.empty:
+            continue
+        ic.rolling(win, min_periods=max(3, win // 2)).mean().plot(
+            ax=ax, label=name, alpha=0.85, lw=1.2,
+        )
     ax.axhline(0, color="black", lw=0.8)
-    ax.axhline(0.05, color="green", lw=0.8, ls="--", alpha=0.5)
-    ax.axhline(-0.05, color="green", lw=0.8, ls="--", alpha=0.5)
-    ax.set_title(f"{window}期滚动IC均值")
-    ax.legend(fontsize=8, ncol=4)
+    ax.axhline(0.05, color="green", lw=0.8, ls="--", alpha=0.45)
+    ax.axhline(-0.05, color="green", lw=0.8, ls="--", alpha=0.45)
+    ax.set_title(f"{win} 期滚动 IC 均值")
+    ax.legend(fontsize=7, ncol=min(4, max(1, len(pick))), loc="best")
     ax.grid(alpha=0.3)
 
     ax = axes[1]
-    yearly = pd.DataFrame({name: ic_by_year(ic) for name, ic in valid.items()}).T
-    yearly.plot(kind="bar", ax=ax, width=0.8, alpha=0.8)
-    ax.axhline(0, color="black", lw=0.8)
-    ax.set_title("逐年IC均值对比")
-    ax.legend(fontsize=8, ncol=5, loc="upper right")
-    plt.xticks(rotation=45)
-    ax.grid(alpha=0.3, axis="y")
+    yearly = pd.DataFrame({name: ic_by_year(all_ic[name]) for name in pick}).T
+    if not yearly.empty:
+        yearly.plot(kind="bar", ax=ax, width=0.8, alpha=0.85, legend=len(pick) <= 12)
+        ax.axhline(0, color="black", lw=0.8)
+        ax.set_title("逐年 IC 均值")
+        if len(pick) <= 12:
+            ax.legend(fontsize=7, ncol=min(4, len(pick)), loc="upper right")
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+        ax.grid(alpha=0.3, axis="y")
+
     plt.tight_layout()
-    plt.show()
+    figs = Path(out_dir) if out_dir else Path("research/output/figs")
+    figs.mkdir(parents=True, exist_ok=True)
+    suf = f"_{tag}" if tag else ""
+    out = figs / f"rolling_ic_{title_src}_h{period}{suf}.png"
+    fig.savefig(out, dpi=140, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+    print(f"  [plot-rolling-ic] 已保存 {out}（{len(pick)} 因子）")
+    return out
+
+
+def plot_rolling_ic(all_ic: dict, period: int, window: int = 12):
+    """Legacy interactive plot (``--plot``); prefer ``plot_rolling_ic_lines``."""
+    valid = [k for k, v in all_ic.items() if v.dropna().abs().mean() >= 0.03]
+    if not valid:
+        print("无IC>0.03的因子，跳过图表")
+        return
+    plot_rolling_ic_lines(
+        all_ic,
+        period,
+        names=valid[: min(40, len(valid))],
+        window=window,
+        source_label="raw",
+        show=True,
+    )
 
 
 def plot_corr_matrix(corr: pd.DataFrame):
-    import matplotlib.pyplot as plt
-    import matplotlib
-    matplotlib.rcParams["font.family"] = "SimHei"
-    matplotlib.rcParams["axes.unicode_minus"] = False
+    plt = _configure_matplotlib_cjk()
 
     fig, ax = plt.subplots(figsize=(max(8, len(corr) * 0.7), max(6, len(corr) * 0.6)))
     im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
@@ -258,3 +390,4 @@ def plot_corr_matrix(corr: pd.DataFrame):
     ax.set_title("因子截面相关矩阵")
     plt.tight_layout()
     plt.show()
+    plt.close(fig)

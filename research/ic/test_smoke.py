@@ -58,12 +58,28 @@ def test_ic_stats_keys():
         assert k in stats
 
 
+def test_resolve_rolling_ic_names_priority():
+    from research.ic.display import resolve_rolling_ic_names
+
+    idx = pd.date_range("2020-01-01", periods=8, freq="W-FRI")
+    all_ic = {
+        "A": pd.Series(np.linspace(0.01, 0.05, 8), index=idx),
+        "B": pd.Series(np.linspace(-0.02, 0.02, 8), index=idx),
+        "C": pd.Series(np.linspace(0.08, 0.10, 8), index=idx),
+    }
+    assert resolve_rolling_ic_names(all_ic, names=["B", "missing"]) == ["B"]
+    assert resolve_rolling_ic_names(all_ic, selected=["B", "A"], top_n=10) == ["B", "A"]
+    top = resolve_rolling_ic_names(all_ic, top_n=1)
+    assert top == ["C"]
+
+
 def run_all():
     test_icir_ddof0()
     test_win_rate_sign_aware()
     test_ic_clip()
     test_newey_west_t_finite()
     test_ic_stats_keys()
+    test_resolve_rolling_ic_names_priority()
     print("research.ic.test_smoke: all passed")
 
 

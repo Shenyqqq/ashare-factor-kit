@@ -91,6 +91,7 @@ from research.ic.decay_corr import factor_corr_matrix, ic_decay_table
 from research.ic.display import (
     plot_corr_matrix,
     plot_rolling_ic,
+    plot_rolling_ic_lines,
     print_barra_comparison,
     print_decay,
     print_quantile_ls,
@@ -442,10 +443,64 @@ class _LazyFactorRegistry:
 
 
 
+def _maybe_plot_rolling_ic(
+    *,
+    enabled: bool,
+    period: int,
+    all_ic: dict,
+    pure_ic_series: dict | None,
+    summary_df: pd.DataFrame,
+    kept: list | None,
+    sparse_kept: list | None,
+    top_n: int,
+    window: int | None,
+    names_csv: str | None,
+    source: str,
+    tag: str,
+) -> None:
+    """Optional rolling-IC line chart from already-computed series (resume-safe)."""
+    if not enabled:
+        return
+    name_list = None
+    if names_csv:
+        name_list = [n.strip() for n in str(names_csv).split(",") if n.strip()]
+    selected = None
+    if not name_list:
+        selected = list(kept or []) + [n for n in (sparse_kept or []) if n not in (kept or [])]
+        if not selected:
+            selected = None
+    src = (source or "auto").lower().strip()
+    series_map = all_ic
+    label = "raw"
+    if src == "pure" or (src == "auto" and pure_ic_series):
+        if pure_ic_series:
+            series_map = pure_ic_series
+            label = "pure"
+        elif src == "pure":
+            print("  [plot-rolling-ic] 无 pure IC 序列，回退 raw")
+    plot_rolling_ic_lines(
+        series_map,
+        period,
+        names=name_list,
+        selected=selected,
+        summary_df=summary_df,
+        top_n=top_n,
+        window=window,
+        source_label=label,
+        tag=tag,
+        show=False,
+    )
+
+
 def run(
     period: int = 20,
     top: int = 0,
     plot: bool = False,
+    plot_rolling_ic_flag: bool = False,
+    plot_rolling_ic_top_n: int = 30,
+    plot_rolling_ic_window: int | None = None,
+    plot_rolling_ic_names: str | None = None,
+    plot_rolling_ic_source: str = "auto",
     decay: bool = False,
     corr: bool = False,
     save: bool = False,
@@ -1170,6 +1225,20 @@ def run(
                 name_suffix=u_tag,
             )
             print(f"\n结果已保存至 {json_path.parent}  ({json_path.name})")
+        _maybe_plot_rolling_ic(
+            enabled=plot_rolling_ic_flag,
+            period=period,
+            all_ic=all_ic,
+            pure_ic_series=None,
+            summary_df=summary_df,
+            kept=kept,
+            sparse_kept=sparse_kept,
+            top_n=plot_rolling_ic_top_n,
+            window=plot_rolling_ic_window,
+            names_csv=plot_rolling_ic_names,
+            source=plot_rolling_ic_source,
+            tag=u_tag,
+        )
         _log_phase("总耗时", t_run)
         gc.collect()
         return summary_df, yearly_df, all_ic, pd.DataFrame()
@@ -1715,6 +1784,21 @@ def run(
         )
         print(f"\n结果已保存至 {json_path.parent}  ({json_path.name})")
 
+    _maybe_plot_rolling_ic(
+        enabled=plot_rolling_ic_flag,
+        period=period,
+        all_ic=all_ic,
+        pure_ic_series=pure_ic_series or None,
+        summary_df=summary_df,
+        kept=kept,
+        sparse_kept=sparse_kept,
+        top_n=plot_rolling_ic_top_n,
+        window=plot_rolling_ic_window,
+        names_csv=plot_rolling_ic_names,
+        source=plot_rolling_ic_source,
+        tag=u_tag,
+    )
+
     _log_phase("总耗时", t_run)
     gc.collect()
     return summary_df, yearly_df, all_ic, ind_ic_df
@@ -1779,7 +1863,44 @@ def main():
 
     # ── 高级 ──────────────────────────────────────────────────────────────
     parser.add_argument("--top", type=int, default=0, help=_h("仅打印 Top-N", advanced=True))
-    parser.add_argument("--plot", action="store_true", help=_h("画图", advanced=True))
+    parser.add_argument("--plot", action="store_true", help=_h("交互式画图（旧）", advanced=True))
+    parser.add_argument(
+        "--plot-rolling-ic",
+        action="store_true",
+        dest="plot_rolling_ic",
+        help=_h(
+            "保存滚动 IC 折线图到 research/output/figs/（复用已算 IC 序列；默认入选/|IC| Top-N）",
+            advanced=True,
+        ),
+    )
+    parser.add_argument(
+        "--plot-rolling-ic-top-n",
+        type=int,
+        default=30,
+        dest="plot_rolling_ic_top_n",
+        help=_h("折线图最多因子数（默认 30；有入选名单时先入选再截断）", advanced=True),
+    )
+    parser.add_argument(
+        "--plot-rolling-ic-window",
+        type=int,
+        default=None,
+        dest="plot_rolling_ic_window",
+        help=_h("滚动窗期数（默认约半年：h5=26 / h20=6）", advanced=True),
+    )
+    parser.add_argument(
+        "--plot-rolling-ic-names",
+        type=str,
+        default=None,
+        dest="plot_rolling_ic_names",
+        help=_h("逗号分隔因子名（优先于入选/Top-N）", advanced=True),
+    )
+    parser.add_argument(
+        "--plot-rolling-ic-source",
+        choices=["auto", "raw", "pure"],
+        default="auto",
+        dest="plot_rolling_ic_source",
+        help=_h("折线序列口径 auto|raw|pure（默认 auto：有 barra pure 用 pure）", advanced=True),
+    )
     parser.add_argument("--decay", action="store_true", help=_h("打印衰减表", advanced=True))
     parser.add_argument(
         "--corr",
@@ -2200,6 +2321,11 @@ def main():
         period=args.period,
         top=args.top,
         plot=args.plot,
+        plot_rolling_ic_flag=args.plot_rolling_ic,
+        plot_rolling_ic_top_n=args.plot_rolling_ic_top_n,
+        plot_rolling_ic_window=args.plot_rolling_ic_window,
+        plot_rolling_ic_names=args.plot_rolling_ic_names,
+        plot_rolling_ic_source=args.plot_rolling_ic_source,
         decay=args.decay,
         corr=args.corr,
         save=args.save,

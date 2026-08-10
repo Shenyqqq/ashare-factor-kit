@@ -54,7 +54,7 @@ python -m data.download_delisted
 
 `run.py`：`--label-mode` / `--objective` / `--train-windows` / `--val-window`（默认 6 月共用近期 val；`0`=无独立 val，多窗须 `--wf-selection average`）/ `--cap-band`（`all` / `micro_30` / `micro_small_100` 等）/ `--sparse-from-ic` / `--rolling-pool-*` / `--position-regime` / `--portfolio-opt` / `--two-stage` / `--special-factors` / `--tradable-strict` / `--shap*` / `--tune` / `--multi-horizon` 等 → `--help-advanced`。
 
-`ic_analysis_v2`：阈值门、`--universe` / `--cap-band`、decay/emerging/sparse 旋钮、`--resume`/`--fresh`、增量补录 `--only-new`/`--factors`（merge `ic_series`；`barra_pure` 指纹匹配时只补新区并 merge，仍重跑 selection）、workers → `--help-advanced`（详例见 `docs/操作手册.md`）。
+`ic_analysis_v2`：阈值门、`--universe` / `--cap-band`、decay/emerging/sparse 旋钮、`--resume`/`--fresh`、增量补录 `--only-new`/`--factors`（merge `ic_series`；`barra_pure` 指纹匹配时只补新区并 merge，仍重跑 selection）、`--plot-rolling-ic`（滚动 IC 折线 → `research/output/figs/`，复用已算序列）、workers → `--help-advanced`（详例见 `docs/操作手册.md`）。
 
 ## 变更说明（CLI 精简）
 
