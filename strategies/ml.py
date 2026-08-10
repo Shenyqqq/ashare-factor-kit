@@ -1011,6 +1011,7 @@ def run(
     long_weight_ratio: float = 0.25,
     long_weight_curve: str = "smooth",
     softlong_floor_slope: float = 0.25,
+    retrain_every: int = 1,
 ) -> tuple[pd.DataFrame, object]:
     """
     训练 ML 策略并返回样本外预测得分。
@@ -1095,6 +1096,7 @@ def run(
         trainer_kwargs["val_window"] = val_window
     if artifact_dir is not None:
         trainer_kwargs["artifact_dir"] = artifact_dir
+    trainer_kwargs["retrain_every"] = int(retrain_every)
 
     # Regime-conditional：regime_states 提供时切换到 RegimeConditionalTrainer
     # （子类，与 WalkForwardTrainer 输出格式完全一致；regime_states=None 退化为父类）

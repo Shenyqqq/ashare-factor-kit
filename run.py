@@ -347,6 +347,7 @@ def main(mode="linear", skip_download=False, sample=0,
       long_weight_ratio: float = 0.25,
       long_weight_curve: str = "smooth",
       softlong_floor_slope: float = 0.25,
+      retrain_every: int = 1,
       tradable_limit_mode: str | None = None,
       exclude_limit_on_signal: bool | None = None,
       apply_exec_mask: bool | None = None,
@@ -418,11 +419,12 @@ def main(mode="linear", skip_download=False, sample=0,
         f"_sl{int(round(float(softlong_floor_slope) * 100))}"
         if label_mode == "cs_rank_softlong" else ""
     )
+    rt_tag = f"_rt{int(retrain_every)}" if int(retrain_every) > 1 else ""
     tag = (
         f"{mode}_h{horizon}{win_tag}{units_tag}{bt_tag}{mdl_tag}{dyn_tag}{dyn_lb_tag}"
         f"{mh_tag}{mh_w_tag}{reg_tag}{to_tag}{cap_tag}{barra_feat_tag}"
         f"{special_tag}{posreg_tag}{opt_tag}{twostage_tag}{rp_tag}"
-        f"{lw_tag}{softlong_tag}"
+        f"{lw_tag}{softlong_tag}{rt_tag}"
     )
     out_dir = _resolve_output_dir(output_dir, tag)
     add_utf8_file_sink(out_dir / "run.log")
@@ -882,6 +884,7 @@ def main(mode="linear", skip_download=False, sample=0,
             long_weight_ratio=long_weight_ratio,
             long_weight_curve=long_weight_curve,
             softlong_floor_slope=softlong_floor_slope,
+            retrain_every=retrain_every,
             **tradable_kwargs, **ml_extra_kwargs, **cache_kwargs,
         )
         if hasattr(trainer, "save_metrics"):
@@ -1354,6 +1357,14 @@ if __name__ == "__main__":
         help=_h("训练窗口单位：months（默认）| periods", advanced=True),
     )
     parser.add_argument(
+        "--retrain-every", type=int, default=1,
+        help=_h(
+            "每 N 个调仓期重训一次（默认 1=每期重训；周频约一季用 13）；"
+            "中间预测日复用最近重训日模型",
+            advanced=True,
+        ),
+    )
+    parser.add_argument(
         "--backtest-freq", default=None,
         help=_h("回测调仓频率覆盖（如 ME）；用于复现训练/回测频率错位", advanced=True),
     )
@@ -1691,6 +1702,7 @@ if __name__ == "__main__":
         long_weight_ratio=args.long_weight_ratio,
         long_weight_curve=args.long_weight_curve,
         softlong_floor_slope=args.softlong_floor_slope,
+        retrain_every=args.retrain_every,
         ensemble_method=args.ensemble_method,
         save_models=args.save_models,
         objective=args.objective,

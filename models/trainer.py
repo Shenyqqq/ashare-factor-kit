@@ -344,6 +344,26 @@ class FoldResult:
     importance: dict | None = None
 
 
+def is_retrain_step(
+    pred_offset: int,
+    retrain_every: int,
+    *,
+    has_cached_models: bool,
+) -> bool:
+    """是否在本预测步拟合新模型。
+
+    ``retrain_every<=1`` → 每期重训（旧行为）。
+    否则仅在 ``pred_offset % retrain_every == 0``（相对首个预测步）重训；
+    尚无缓存模型时强制拟合，避免 skip 空窗。
+    """
+    every = int(retrain_every)
+    if every <= 1:
+        return True
+    if not has_cached_models:
+        return True
+    return int(pred_offset) % every == 0
+
+
 def _run_fold_job(job):
     """模块级单折训练函数（可被 joblib 多进程 pickle）。
 
@@ -464,6 +484,7 @@ class WalkForwardTrainer:
         long_weight_ratio: float = 0.25,
         long_weight_curve: str = "smooth",
         softlong_floor_slope: float = 0.25,
+        retrain_every: int = 1,
     ):
         # 默认 train_windows/val_window 为日历月；units=periods 时直接当调仓期数
         self.train_windows, self.val_window = resolve_train_windows(
@@ -471,6 +492,9 @@ class WalkForwardTrainer:
         )
         if self.val_window < 0:
             raise ValueError(f"val_window 不能为负: {self.val_window}")
+        self.retrain_every = int(retrain_every)
+        if self.retrain_every < 1:
+            raise ValueError(f"retrain_every 须 >= 1，收到 {retrain_every}")
         # 多窗无 val：ic_weighted / best_* 依赖 val IC，禁止静默用 NaN 加权
         if (
             self.val_window == 0
@@ -562,13 +586,18 @@ class WalkForwardTrainer:
             f"(units={train_window_units}, freq={rebalance_freq}); "
             f"wf_selection={wf_selection}, label_mode={self.label_mode}, "
             f"ensemble={ensemble_method}, purge={purge_train}, embargo={embargo}, "
-            f"objective={self.objective}"
+            f"objective={self.objective}, retrain_every={self.retrain_every}"
             + (
                 f", shap=on(top={self.shap_top}, max_samples={self.shap_max_samples}, "
                 f"max_dates={self.shap_max_dates})"
                 if self.enable_shap else ", shap=off"
             )
         )
+        if self.retrain_every > 1:
+            logger.info(
+                f"retrain_every={self.retrain_every}: 预测日复用最近重训日拟合的模型；"
+                f"重训日 train 窗相对该日 purge/embargo，中间期只 predict"
+            )
         _modes = (
             set(self.label_mode.values()) if isinstance(self.label_mode, dict)
             else {self.label_mode}
@@ -855,7 +884,8 @@ class WalkForwardTrainer:
 
         logger.info(
             f"Walk-Forward lazy: 预测{max(0, n_dates - predict_start)}个调仓日, "
-            f"模型={self.model_types}, 并行={n_workers}任务×{cores_per_job}核/任务"
+            f"模型={self.model_types}, 并行={n_workers}任务×{cores_per_job}核/任务, "
+            f"retrain_every={self.retrain_every}"
         )
 
         all_scores = {}
@@ -865,6 +895,11 @@ class WalkForwardTrainer:
         peak_rss = log_rss("wf_lazy_loop_enter")
         peak_pool_cols = 0
         last_pool_cols: list[str] = []
+        cached_folds: dict[tuple[int, str], FoldResult] = {}
+        cached_feature_names: list[str] | None = None
+        last_retrain_date = None
+        n_fit_steps = 0
+        n_reuse_steps = 0
 
         for idx in range(predict_start, n_dates):
             pred_date = dates[idx]
@@ -879,87 +914,152 @@ class WalkForwardTrainer:
             if store is not None:
                 store.ensure(cols)
 
+            pred_offset = idx - predict_start
+            cols_match = (
+                cached_feature_names is not None
+                and list(cols) == list(cached_feature_names)
+            )
+            need_retrain = is_retrain_step(
+                pred_offset, self.retrain_every, has_cached_models=bool(cached_folds),
+            )
+            # rolling-pool 列集变化时不可复用旧模型（特征维不一致）
+            if not cols_match:
+                need_retrain = True
+
+            X_pred_df, y_true_s = dataset.get_cross_section(
+                pred_date, feature_names=cols,
+            )
+            if X_pred_df is None or len(X_pred_df) < MIN_STOCKS_PER_DATE:
+                continue
+            X_pred_np = X_pred_df.to_numpy(dtype=np.float32, copy=False)
+            y_true_np = y_true_s.to_numpy(dtype=np.float32, copy=False)
+            pred_index = X_pred_df.index
+
+            results: list[FoldResult] = []
             jobs = []
-            fold_metas = []  # parallel to jobs: feature_names for this fold
+            fold_metas = []
 
-            for window in self.train_windows:
-                ts, te, vs, ve = get_window_splits(
-                    idx, window, self.val_window, n_dates,
-                    min_train_window=self.min_train_window,
-                    window_specific_val=self.window_specific_val,
-                )
-                train_dates = dates[ts:te]
-                val_dates = dates[vs:ve]
-
-                if self.embargo and te > 0:
-                    eff_te = embargo_train_end(te, embargo_periods)
-                    train_dates = dates[ts:eff_te]
-
-                if self.purge_train:
-                    train_dates = purge_train_indices(
-                        train_dates, val_dates, pred_date, dates, self.hold_period,
-                        date_pos_map=date_to_pos,
-                    )
-
-                min_train_dates = max(8, window // 3) - (
-                    embargo_periods if self.embargo else 0
-                )
-                no_val = self.val_window == 0
-                if len(train_dates) < min_train_dates:
-                    continue
-                if not no_val and len(val_dates) < 2:
-                    continue
-
-                for model_type in self.model_types:
-                    lm = self._resolve_label_mode(model_type)
-                    stacked_tr = _stack_dates(train_dates, cols, lm)
-                    if stacked_tr[0] is None:
+            if not need_retrain:
+                for (window, model_type), cached in cached_folds.items():
+                    if cached.model is None:
                         continue
-                    if no_val:
-                        X_va = y_va = y_va_raw = group_va = None
-                    else:
-                        stacked_va = _stack_dates(val_dates, cols, lm)
-                        if stacked_va[0] is None:
-                            continue
-                        X_va, y_va, _, y_va_raw, group_va = stacked_va
-                    X_pred_df, y_true_s = dataset.get_cross_section(
-                        pred_date, feature_names=cols,
-                    )
-                    if X_pred_df is None or len(X_pred_df) < MIN_STOCKS_PER_DATE:
+                    try:
+                        pred = predict_model(cached.model, X_pred_np, model_type)
+                    except Exception as e:
+                        logger.warning(
+                            f"lazy 复用预测失败({model_type}, w={window}, "
+                            f"{pred_date.date()}): {e}"
+                        )
                         continue
-                    X_tr, y_tr, w_tr, y_tr_raw, group_tr = stacked_tr
-                    X_pred_np = X_pred_df.to_numpy(dtype=np.float32, copy=False)
-                    y_true_np = y_true_s.to_numpy(dtype=np.float32, copy=False)
-                    jobs.append((
-                        window, model_type, X_tr, y_tr, w_tr, y_tr_raw,
-                        X_va, y_va, y_va_raw, X_pred_np, y_true_np, cores_per_job,
-                        self.objective, cols, pred_date, self.device,
-                        group_tr, group_va,
-                        self.ridge_drop_regime,
+                    results.append(FoldResult(
+                        window, model_type, pred,
+                        cached.val_ic, cached.train_ic,
+                        cached.model, cached.importance,
                     ))
                     fold_metas.append({
                         "feature_names": cols,
-                        "pred_index": X_pred_df.index,
+                        "pred_index": pred_index,
                         "y_true_np": y_true_np,
                     })
+                if results:
+                    n_reuse_steps += 1
+                    if n_reuse_steps <= 3 or n_reuse_steps % self.retrain_every == 0:
+                        logger.info(
+                            f"retrain_every={self.retrain_every}: lazy skip fit @ "
+                            f"{pred_date.date()}, 复用模型自 {last_retrain_date.date()}"
+                        )
+                else:
+                    need_retrain = True
 
-            if not jobs:
-                continue
+            if need_retrain:
+                jobs = []
+                fold_metas = []
 
-            results = []
-            result_metas = []
-            for j, meta in zip(jobs, fold_metas):
-                r = _run_fold_job(j)
-                if r is not None:
-                    results.append(r)
-                    result_metas.append(meta)
+                for window in self.train_windows:
+                    ts, te, vs, ve = get_window_splits(
+                        idx, window, self.val_window, n_dates,
+                        min_train_window=self.min_train_window,
+                        window_specific_val=self.window_specific_val,
+                    )
+                    train_dates = dates[ts:te]
+                    val_dates = dates[vs:ve]
+
+                    if self.embargo and te > 0:
+                        eff_te = embargo_train_end(te, embargo_periods)
+                        train_dates = dates[ts:eff_te]
+
+                    if self.purge_train:
+                        train_dates = purge_train_indices(
+                            train_dates, val_dates, pred_date, dates, self.hold_period,
+                            date_pos_map=date_to_pos,
+                        )
+
+                    min_train_dates = max(8, window // 3) - (
+                        embargo_periods if self.embargo else 0
+                    )
+                    no_val = self.val_window == 0
+                    if len(train_dates) < min_train_dates:
+                        continue
+                    if not no_val and len(val_dates) < 2:
+                        continue
+
+                    for model_type in self.model_types:
+                        lm = self._resolve_label_mode(model_type)
+                        stacked_tr = _stack_dates(train_dates, cols, lm)
+                        if stacked_tr[0] is None:
+                            continue
+                        if no_val:
+                            X_va = y_va = y_va_raw = group_va = None
+                        else:
+                            stacked_va = _stack_dates(val_dates, cols, lm)
+                            if stacked_va[0] is None:
+                                continue
+                            X_va, y_va, _, y_va_raw, group_va = stacked_va
+                        X_tr, y_tr, w_tr, y_tr_raw, group_tr = stacked_tr
+                        jobs.append((
+                            window, model_type, X_tr, y_tr, w_tr, y_tr_raw,
+                            X_va, y_va, y_va_raw, X_pred_np, y_true_np, cores_per_job,
+                            self.objective, cols, pred_date, self.device,
+                            group_tr, group_va,
+                            self.ridge_drop_regime,
+                        ))
+                        fold_metas.append({
+                            "feature_names": cols,
+                            "pred_index": pred_index,
+                            "y_true_np": y_true_np,
+                        })
+
+                if not jobs:
+                    continue
+
+                results = []
+                result_metas = []
+                for j, meta in zip(jobs, fold_metas):
+                    r = _run_fold_job(j)
+                    if r is not None:
+                        results.append(r)
+                        result_metas.append(meta)
+
+                if not results:
+                    continue
+
+                fold_metas = result_metas
+                cached_folds = {(f.window, f.model_type): f for f in results}
+                cached_feature_names = list(cols)
+                last_retrain_date = pred_date
+                n_fit_steps += 1
+                if self.retrain_every > 1:
+                    logger.info(
+                        f"retrain_every={self.retrain_every}: lazy fit @ "
+                        f"{pred_date.date()} (step {n_fit_steps}, offset={pred_offset})"
+                    )
 
             if not results:
                 continue
 
             # 同 pred_date：各 window 共用 pool_t 列集；取第一折 pred_index 对齐股票
-            pred_index = result_metas[0]["pred_index"]
-            y_true_np = result_metas[0]["y_true_np"]
+            pred_index = fold_metas[0]["pred_index"] if fold_metas else pred_index
+            y_true_np = fold_metas[0]["y_true_np"] if fold_metas else y_true_np
 
             model_final_scores = {}
             # n_pool_features：当期真实特征列数（lazy 下不是固定 |U|）
@@ -967,6 +1067,8 @@ class WalkForwardTrainer:
                 "date": pred_date,
                 "pred_ic": np.nan,
                 "n_pool_features": len(cols),
+                "reused_model": int(not need_retrain),
+                "fit_date": last_retrain_date if last_retrain_date is not None else pred_date,
             }
             dyn_w = dynamic_model_weights(self._rolling_val_ic, self.model_types)
 
@@ -1006,14 +1108,16 @@ class WalkForwardTrainer:
                 model_final_scores[model_type] = combined
 
                 done_preview = idx - predict_start + 1
-                do_shap = self._should_compute_shap(done_preview, n_predict)
+                do_shap = need_retrain and self._should_compute_shap(
+                    done_preview, n_predict,
+                )
 
                 for i, f in enumerate(folds):
                     diag_row[f"train_ic_{model_type}_w{f.window}"] = train_ics[i]
                     diag_row[f"val_ic_{model_type}_w{f.window}"] = val_ics[i]
                     with models_lock:
                         self.models[(f.window, model_type)] = f.model
-                    if self.save_models and self.artifact_dir is not None:
+                    if need_retrain and self.save_models and self.artifact_dir is not None:
                         p = save_fold_model(
                             f.model, model_type, f.window, pred_date,
                             self.artifact_dir / "models",
@@ -1022,27 +1126,28 @@ class WalkForwardTrainer:
                             "path": str(p), "model": model_type,
                             "window": f.window, "date": str(pred_date),
                         })
-                    imp = f.importance if f.importance is not None else {}
-                    append_feature_importance_rows(
-                        self._feature_importance_rows,
-                        model_type, f.window, pred_date, imp,
-                    )
+                    if need_retrain:
+                        imp = f.importance if f.importance is not None else {}
+                        append_feature_importance_rows(
+                            self._feature_importance_rows,
+                            model_type, f.window, pred_date, imp,
+                        )
                     if do_shap and f.model is not None:
                         ww = float(w[i]) if i < len(w) else 0.0
                         # 找该 fold 对应的 X_pred / feature_names
-                        feat_names = None
-                        X_for_shap = None
-                        for j, meta in zip(jobs, fold_metas):
-                            if j[0] == f.window and j[1] == model_type:
-                                feat_names = meta["feature_names"]
-                                X_for_shap = j[9]
-                                break
-                        if feat_names is not None and X_for_shap is not None:
-                            self._record_fold_shap(
-                                f, X_for_shap, pred_date,
-                                window_weight=ww,
-                                feature_names=feat_names,
-                            )
+                        feat_names = cols
+                        X_for_shap = X_pred_np
+                        if jobs:
+                            for j, meta in zip(jobs, fold_metas):
+                                if j[0] == f.window and j[1] == model_type:
+                                    feat_names = meta["feature_names"]
+                                    X_for_shap = j[9]
+                                    break
+                        self._record_fold_shap(
+                            f, X_for_shap, pred_date,
+                            window_weight=ww,
+                            feature_names=feat_names,
+                        )
 
                 self._rolling_val_ic[model_type].append(float(np.nanmean(val_ics)))
 
@@ -1132,7 +1237,9 @@ class WalkForwardTrainer:
         icir = ic_mean / std if std > 0 else np.nan
         logger.info(
             f"完成: IC均值={ic_mean:.4f}, ICIR={icir:.4f}, "
-            f"胜率={(self.ic_series > 0).mean():.1%}"
+            f"胜率={(self.ic_series > 0).mean():.1%}, "
+            f"fit={n_fit_steps}, reuse={n_reuse_steps} "
+            f"(retrain_every={self.retrain_every})"
         )
 
         out = self.artifact_dir or PROCESSED_DIR
@@ -1165,6 +1272,7 @@ class WalkForwardTrainer:
                 "hold_period": self.hold_period,
                 "label_mode": self.label_mode,
                 "device": self.device,
+                "retrain_every": self.retrain_every,
                 "params": {
                     "ridge": RIDGE_PARAMS,
                     "ridge_cv_alphas": RIDGE_CV_ALPHAS,
@@ -1331,99 +1439,153 @@ class WalkForwardTrainer:
             f"Walk-Forward: 预测{max(0, n_dates - predict_start)}个调仓日, "
             f"模型={self.model_types}, "
             f"并行={n_workers}任务×{cores_per_job}核/任务 "
-            f"(TRAIN_MAX_WORKERS={TRAIN_MAX_WORKERS})"
+            f"(TRAIN_MAX_WORKERS={TRAIN_MAX_WORKERS}, retrain_every={self.retrain_every})"
         )
 
         all_scores = {}
         models_lock = threading.Lock()
         n_predict = max(0, n_dates - predict_start)
         saved_model_entries = []
+        # retrain_every>1：缓存最近一次重训折结果，中间预测日只 predict
+        cached_folds: dict[tuple[int, str], FoldResult] = {}
+        last_retrain_date = None
+        n_fit_steps = 0
+        n_reuse_steps = 0
 
         for idx in range(predict_start, n_dates):
             pred_date = dates[idx]
             if pred_date not in section_cache:
                 continue
             X_pred_np, y_true_np, pred_index = section_cache[pred_date]
+            pred_offset = idx - predict_start
+            need_retrain = is_retrain_step(
+                pred_offset, self.retrain_every, has_cached_models=bool(cached_folds),
+            )
 
-            jobs = []
-
-            for window in self.train_windows:
-                ts, te, vs, ve = get_window_splits(
-                    idx, window, self.val_window, n_dates,
-                    min_train_window=self.min_train_window,
-                    window_specific_val=self.window_specific_val,
-                )
-                train_dates = dates[ts:te]
-                val_dates = dates[vs:ve]
-
-                if self.embargo and te > 0:
-                    eff_te = embargo_train_end(te, embargo_periods)
-                    train_dates = dates[ts:eff_te]
-
-                if self.purge_train:
-                    train_dates = purge_train_indices(
-                        train_dates, val_dates, pred_date, dates, self.hold_period,
-                        date_pos_map=date_to_pos,
-                    )
-
-                # P1-3: 长窗口 floor 用 max(8, window // 3) - embargo，
-                # 避免周频长窗口（如 52 期）下小样本污染集成。
-                min_train_dates = max(8, window // 3) - (embargo_periods if self.embargo else 0)
-                no_val = self.val_window == 0
-                if len(train_dates) < min_train_dates:
-                    continue
-                if not no_val and len(val_dates) < 2:
-                    continue
-
-                for model_type in self.model_types:
-                    lm = self._resolve_label_mode(model_type)
-                    stacked_tr = _stack_cached(train_dates, lm)
-                    if stacked_tr[0] is None:
+            results: list[FoldResult] = []
+            if not need_retrain:
+                # 复用最近重训日模型：train 窗/purge/embargo 已相对重训日完成，无泄漏
+                for (window, model_type), cached in cached_folds.items():
+                    if cached.model is None:
                         continue
-                    if no_val:
-                        X_va = y_va = y_va_raw = group_va = None
-                    else:
-                        stacked_va = _stack_cached(val_dates, lm)
-                        if stacked_va[0] is None:
-                            continue
-                        X_va, y_va, _, y_va_raw, group_va = stacked_va
-                    X_tr, y_tr, w_tr, y_tr_raw, group_tr = stacked_tr
-                    jobs.append((
-                        window, model_type, X_tr, y_tr, w_tr, y_tr_raw,
-                        X_va, y_va, y_va_raw, X_pred_np, y_true_np, cores_per_job,
-                        # 多进程 pickle 所需的额外上下文（_run_fold_job 为模块级函数）
-                        self.objective, dataset.feature_names, pred_date, self.device,
-                        # rank objective 所需的逐期 group 大小（非 rank 模式被忽略）
-                        group_tr, group_va,
-                        # ridge ablation：剔除 regime 列（仅 ridge 生效）
-                        self.ridge_drop_regime,
+                    try:
+                        pred = predict_model(cached.model, X_pred_np, model_type)
+                    except Exception as e:
+                        logger.warning(
+                            f"复用预测失败({model_type}, w={window}, "
+                            f"{pred_date.date()}): {e}"
+                        )
+                        continue
+                    results.append(FoldResult(
+                        window, model_type, pred,
+                        cached.val_ic, cached.train_ic,
+                        cached.model, cached.importance,
                     ))
+                if results:
+                    n_reuse_steps += 1
+                    if n_reuse_steps <= 3 or n_reuse_steps % self.retrain_every == 0:
+                        logger.info(
+                            f"retrain_every={self.retrain_every}: skip fit @ "
+                            f"{pred_date.date()}, 复用模型自 {last_retrain_date.date()}"
+                        )
+                else:
+                    # 缓存失效 → 回退本折重训
+                    need_retrain = True
 
-            if not jobs:
-                continue
+            if need_retrain:
+                jobs = []
 
-            # n_workers<=1：串行执行（保留 lgbm/xgb 单模型多线程 cores_per_job 语义，
-            #   避免进程 fork 与 pickle 开销，模型对象也无需跨进程序列化）
-            # n_workers>1：joblib 多进程（绕过 GIL，纯 Python 训练循环 2-4× 加速）
-            #   _run_fold_job 为模块级函数，所有依赖通过 job tuple 显式传入以兼容 pickle
-            results = []
-            if n_workers <= 1:
-                for j in jobs:
-                    r = _run_fold_job(j)
-                    if r is not None:
-                        results.append(r)
-            else:
-                # prefer="processes" 强制进程池；timeout 防止单个 job 卡死整个流水线
-                raw = Parallel(
-                    n_jobs=n_workers,
-                    prefer="processes",
-                    timeout=3600,
-                )(
-                    delayed(_run_fold_job)(j) for j in jobs
-                )
-                for r in raw:
-                    if r is not None:
-                        results.append(r)
+                for window in self.train_windows:
+                    ts, te, vs, ve = get_window_splits(
+                        idx, window, self.val_window, n_dates,
+                        min_train_window=self.min_train_window,
+                        window_specific_val=self.window_specific_val,
+                    )
+                    train_dates = dates[ts:te]
+                    val_dates = dates[vs:ve]
+
+                    if self.embargo and te > 0:
+                        eff_te = embargo_train_end(te, embargo_periods)
+                        train_dates = dates[ts:eff_te]
+
+                    if self.purge_train:
+                        train_dates = purge_train_indices(
+                            train_dates, val_dates, pred_date, dates, self.hold_period,
+                            date_pos_map=date_to_pos,
+                        )
+
+                    # P1-3: 长窗口 floor 用 max(8, window // 3) - embargo，
+                    # 避免周频长窗口（如 52 期）下小样本污染集成。
+                    min_train_dates = max(8, window // 3) - (embargo_periods if self.embargo else 0)
+                    no_val = self.val_window == 0
+                    if len(train_dates) < min_train_dates:
+                        continue
+                    if not no_val and len(val_dates) < 2:
+                        continue
+
+                    for model_type in self.model_types:
+                        lm = self._resolve_label_mode(model_type)
+                        stacked_tr = _stack_cached(train_dates, lm)
+                        if stacked_tr[0] is None:
+                            continue
+                        if no_val:
+                            X_va = y_va = y_va_raw = group_va = None
+                        else:
+                            stacked_va = _stack_cached(val_dates, lm)
+                            if stacked_va[0] is None:
+                                continue
+                            X_va, y_va, _, y_va_raw, group_va = stacked_va
+                        X_tr, y_tr, w_tr, y_tr_raw, group_tr = stacked_tr
+                        jobs.append((
+                            window, model_type, X_tr, y_tr, w_tr, y_tr_raw,
+                            X_va, y_va, y_va_raw, X_pred_np, y_true_np, cores_per_job,
+                            # 多进程 pickle 所需的额外上下文（_run_fold_job 为模块级函数）
+                            self.objective, dataset.feature_names, pred_date, self.device,
+                            # rank objective 所需的逐期 group 大小（非 rank 模式被忽略）
+                            group_tr, group_va,
+                            # ridge ablation：剔除 regime 列（仅 ridge 生效）
+                            self.ridge_drop_regime,
+                        ))
+
+                if not jobs:
+                    continue
+
+                # n_workers<=1：串行执行（保留 lgbm/xgb 单模型多线程 cores_per_job 语义，
+                #   避免进程 fork 与 pickle 开销，模型对象也无需跨进程序列化）
+                # n_workers>1：joblib 多进程（绕过 GIL，纯 Python 训练循环 2-4× 加速）
+                #   _run_fold_job 为模块级函数，所有依赖通过 job tuple 显式传入以兼容 pickle
+                results = []
+                if n_workers <= 1:
+                    for j in jobs:
+                        r = _run_fold_job(j)
+                        if r is not None:
+                            results.append(r)
+                else:
+                    # prefer="processes" 强制进程池；timeout 防止单个 job 卡死整个流水线
+                    raw = Parallel(
+                        n_jobs=n_workers,
+                        prefer="processes",
+                        timeout=3600,
+                    )(
+                        delayed(_run_fold_job)(j) for j in jobs
+                    )
+                    for r in raw:
+                        if r is not None:
+                            results.append(r)
+
+                if not results:
+                    continue
+
+                cached_folds = {
+                    (f.window, f.model_type): f for f in results
+                }
+                last_retrain_date = pred_date
+                n_fit_steps += 1
+                if self.retrain_every > 1:
+                    logger.info(
+                        f"retrain_every={self.retrain_every}: fit @ {pred_date.date()} "
+                        f"(step {n_fit_steps}, offset={pred_offset})"
+                    )
 
             if not results:
                 continue
@@ -1433,6 +1595,8 @@ class WalkForwardTrainer:
             diag_row = {
                 "date": pred_date,
                 "pred_ic": np.nan,
+                "reused_model": int(not need_retrain),
+                "fit_date": last_retrain_date if last_retrain_date is not None else pred_date,
             }
 
             dyn_w = dynamic_model_weights(self._rolling_val_ic, self.model_types)
@@ -1459,14 +1623,16 @@ class WalkForwardTrainer:
                 model_final_scores[model_type] = combined
 
                 done_preview = idx - predict_start + 1
-                do_shap = self._should_compute_shap(done_preview, n_predict)
+                do_shap = need_retrain and self._should_compute_shap(
+                    done_preview, n_predict,
+                )
 
                 for i, f in enumerate(folds):
                     diag_row[f"train_ic_{model_type}_w{f.window}"] = train_ics[i]
                     diag_row[f"val_ic_{model_type}_w{f.window}"] = val_ics[i]
                     with models_lock:
                         self.models[(f.window, model_type)] = f.model
-                    if self.save_models and self.artifact_dir is not None:
+                    if need_retrain and self.save_models and self.artifact_dir is not None:
                         p = save_fold_model(
                             f.model, model_type, f.window, pred_date,
                             self.artifact_dir / "models",
@@ -1475,11 +1641,12 @@ class WalkForwardTrainer:
                             "path": str(p), "model": model_type,
                             "window": f.window, "date": str(pred_date),
                         })
-                    imp = f.importance if f.importance is not None else {}
-                    append_feature_importance_rows(
-                        self._feature_importance_rows,
-                        model_type, f.window, pred_date, imp,
-                    )
+                    if need_retrain:
+                        imp = f.importance if f.importance is not None else {}
+                        append_feature_importance_rows(
+                            self._feature_importance_rows,
+                            model_type, f.window, pred_date, imp,
+                        )
                     if do_shap and f.model is not None:
                         # 折内只记窗口 IC 权重；模型间权重在 _finalize_shap_export 施加
                         ww = float(w[i]) if i < len(w) else 0.0
@@ -1560,7 +1727,9 @@ class WalkForwardTrainer:
         icir = ic_mean / std if std > 0 else np.nan
         logger.info(
             f"完成: IC均值={ic_mean:.4f}, ICIR={icir:.4f}, "
-            f"胜率={(self.ic_series > 0).mean():.1%}"
+            f"胜率={(self.ic_series > 0).mean():.1%}, "
+            f"fit={n_fit_steps}, reuse={n_reuse_steps} "
+            f"(retrain_every={self.retrain_every})"
         )
 
         out = self.artifact_dir or PROCESSED_DIR
@@ -1584,6 +1753,7 @@ class WalkForwardTrainer:
                 "hold_period": self.hold_period,
                 "label_mode": self.label_mode,
                 "device": self.device,
+                "retrain_every": self.retrain_every,
                 "params": {
                     "ridge": RIDGE_PARAMS,
                     "ridge_cv_alphas": RIDGE_CV_ALPHAS,
@@ -1627,6 +1797,7 @@ class WalkForwardTrainer:
             "wf_selection": self.wf_selection,
             "ensemble_method": self.ensemble_method,
             "label_mode": self.label_mode,
+            "retrain_every": self.retrain_every,
             "long_weight_top": self.long_weight_top,
             "long_weight_ratio": self.long_weight_ratio,
             "long_weight_curve": self.long_weight_curve,
@@ -1755,6 +1926,12 @@ class RegimeConditionalTrainer(WalkForwardTrainer):
                 "退化为 WalkForwardTrainer._fit_predict_lazy（不按 regime 筛训练日）"
             )
             return self._fit_predict_lazy(dataset)
+
+        if self.retrain_every > 1:
+            logger.warning(
+                f"RegimeConditionalTrainer 暂不支持 retrain_every={self.retrain_every}，"
+                "按每期重训执行"
+            )
 
         self._dataset = dataset
         dates = dataset.rebalance_dates

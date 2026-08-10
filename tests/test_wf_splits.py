@@ -136,6 +136,45 @@ def test_hold_period_to_embargo_periods():
     assert hold_period_to_embargo_periods(5, dates) >= 1
 
 
+def test_is_retrain_step_default_every_period():
+    from models.trainer import is_retrain_step
+    for off in range(20):
+        assert is_retrain_step(off, 1, has_cached_models=True) is True
+        assert is_retrain_step(off, 1, has_cached_models=False) is True
+
+
+def test_is_retrain_step_quarterly():
+    from models.trainer import is_retrain_step
+    every = 13
+    # no cache → always fit
+    assert is_retrain_step(1, every, has_cached_models=False) is True
+    # with cache: only offsets 0, 13, 26, ...
+    assert is_retrain_step(0, every, has_cached_models=True) is True
+    assert is_retrain_step(1, every, has_cached_models=True) is False
+    assert is_retrain_step(12, every, has_cached_models=True) is False
+    assert is_retrain_step(13, every, has_cached_models=True) is True
+    assert is_retrain_step(26, every, has_cached_models=True) is True
+
+
+def test_retrain_every_init_and_reject_zero():
+    t = WalkForwardTrainer(
+        train_windows=[13],
+        val_window=0,
+        train_window_units="periods",
+        model_types=["ridge"],
+        retrain_every=13,
+    )
+    assert t.retrain_every == 13
+    with pytest.raises(ValueError, match="retrain_every"):
+        WalkForwardTrainer(
+            train_windows=[13],
+            val_window=0,
+            train_window_units="periods",
+            model_types=["ridge"],
+            retrain_every=0,
+        )
+
+
 if __name__ == "__main__":
     test_shared_recent_val_same_for_both_windows()
     test_val_window_zero_train_abuts_pred()
