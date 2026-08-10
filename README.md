@@ -44,6 +44,7 @@ quant_trading/
 ├── backtest/              # 分组回测引擎与成本
 ├── research/              # IC v2、rolling_pool、pbo
 ├── utils/                 # rebalance / PIT / WLS / universe(cap-band)
+├── live/                  # 实盘日更增量链路（daily_update）
 ├── tests/
 ├── docs/                  # 命令与流水线文档
 ├── logs/driver.py         # IC → YAML → 批量实验编排
@@ -72,6 +73,7 @@ python run.py --sample 100
 - **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** — 从数据到回测的推荐流程
 - **[docs/CLI_QUICKSTART.md](docs/CLI_QUICKSTART.md)** — 最短命令与默认开关
 - **[docs/PIPELINE.md](docs/PIPELINE.md)** — 端到端流水线与陷阱
+- **[docs/LIVE_DAILY.md](docs/LIVE_DAILY.md)** — 实盘日更增量链路（行情/因子 append → 当日中性化 → 模型出 Top-N）
 - `python run.py --help` / `--help-advanced`
 
 ### 图形界面（可选）
