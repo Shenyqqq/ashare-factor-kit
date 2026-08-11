@@ -64,6 +64,18 @@ def _cache_paths(name: str) -> tuple[Path, Path]:
 # 输入数据指纹
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _index_ends(obj: pd.Index | pd.Series | pd.DataFrame) -> tuple[str | None, str | None]:
+    """取 index 首尾的稳定字符串表示。"""
+    try:
+        idx = obj.index if not isinstance(obj, pd.Index) else obj
+        first, last = idx[0], idx[-1]
+        first_s = first.isoformat() if hasattr(first, "isoformat") else str(first)
+        last_s = last.isoformat() if hasattr(last, "isoformat") else str(last)
+        return first_s, last_s
+    except Exception:
+        return None, None
+
+
 def _df_signature(df: pd.DataFrame | None) -> dict | None:
     """DataFrame 的轻量指纹：shape + index 首尾 + 列数。
 
@@ -71,17 +83,44 @@ def _df_signature(df: pd.DataFrame | None) -> dict | None:
     """
     if df is None:
         return None
-    try:
-        idx = df.index
-        first = idx[0]
-        last = idx[-1]
-        # DatetimeIndex / 数值索引统一转 str
-        first_s = first.isoformat() if hasattr(first, "isoformat") else str(first)
-        last_s = last.isoformat() if hasattr(last, "isoformat") else str(last)
-    except Exception:
-        first_s, last_s = None, None
+    first_s, last_s = _index_ends(df)
     return {
         "shape": list(df.shape),
+        "index_first": first_s,
+        "index_last": last_s,
+    }
+
+
+def _normalize_industry_id(industry_map: Any) -> pd.Series | None:
+    """把 IC 的 DataFrame / ML 的 Series 统一成一维行业标识（优先 sw_l2）。"""
+    if industry_map is None:
+        return None
+    if isinstance(industry_map, pd.Series):
+        return industry_map
+    if isinstance(industry_map, pd.DataFrame):
+        if industry_map.empty:
+            return pd.Series(dtype=object)
+        if "sw_l2" in industry_map.columns:
+            return industry_map["sw_l2"]
+        return industry_map.iloc[:, 0]
+    return None
+
+
+def _industry_map_signature(industry_map: Any) -> dict | None:
+    """industry_map 指纹：只看稳定的一维标识，避免 IC/ML 形态分叉。
+
+    IC 路径常传 ``industry_map.parquet`` 整表 DataFrame（shape ``[N, 3]``），
+    ML / ``run.py`` 常先取 ``sw_l2`` Series（shape ``[N]``）。二者语义相同，
+    若用 ``_df_signature`` 直接签会因 shape 维数不同导致面板缓存假 MISS。
+    """
+    if industry_map is None:
+        return None
+    s = _normalize_industry_id(industry_map)
+    if s is None:
+        return {"type": type(industry_map).__name__}
+    first_s, last_s = _index_ends(s)
+    return {
+        "shape": [int(len(s))],
         "index_first": first_s,
         "index_last": last_s,
     }
@@ -122,11 +161,13 @@ def _masks_signature(masks: dict | None) -> dict | None:
 
 
 # 缓存指纹需采集的输入字段（与 compute_single_factor / iter_factor_registry 形参对齐）
+# industry_map 单独走 _industry_map_signature（见下），不在此列表。
 _SIG_DF_FIELDS = (
     "prices", "prices_raw", "volume", "amount", "open_", "high", "low",
-    "clean_ret", "market_prices", "industry_map", "margin", "moneyflow",
+    "clean_ret", "market_prices", "margin", "moneyflow",
     "northbound", "institution", "circ_mv", "total_mv",
 )
+_SIG_ALL_INPUT_FIELDS = _SIG_DF_FIELDS + ("industry_map",)
 
 
 def build_input_signature(kwargs: dict) -> dict:
@@ -134,6 +175,7 @@ def build_input_signature(kwargs: dict) -> dict:
     sig: dict[str, Any] = {}
     for f in _SIG_DF_FIELDS:
         sig[f] = _df_signature(kwargs.get(f))
+    sig["industry_map"] = _industry_map_signature(kwargs.get("industry_map"))
     sig["financial"] = _financial_signature(kwargs.get("financial"))
     sig["masks"] = _masks_signature(kwargs.get("masks"))
     sig["walk_forward_hmm"] = bool(kwargs.get("walk_forward_hmm", False))
@@ -152,7 +194,7 @@ def _signature_matches(meta: dict, current_sig: dict) -> bool:
         return False
     if meta.get("include_regime") != current_sig["include_regime"]:
         return False
-    for f in _SIG_DF_FIELDS:
+    for f in _SIG_ALL_INPUT_FIELDS:
         if meta.get(f) != current_sig[f]:
             return False
     if meta.get("financial") != current_sig["financial"]:
@@ -197,7 +239,7 @@ def _save_panel(name: str, panel: pd.DataFrame, signature: dict) -> None:
             "panel_shape": list(panel.shape),
         }
         # 把各字段指纹也平铺进 meta，便于 _signature_matches 直接读
-        for f in _SIG_DF_FIELDS:
+        for f in _SIG_ALL_INPUT_FIELDS:
             meta[f] = signature[f]
         meta["financial"] = signature["financial"]
         meta["masks"] = signature["masks"]
