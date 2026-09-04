@@ -1,0 +1,45 @@
+# h5 mcap30 (micro_30) 20260804: dense=26 sparse=9
+# source: research/output/selected_factors_h5_cap_micro_30.json
+# gates: IC∧ICIR∧t/FDR∧corr_dedup; min_long_share=0; research tradable; barra; GS off
+# universe: --cap-band micro_30 (circ_mv≤30亿, no floor, 20d amount≥2000万)
+# sparse inject: --special-factors sparse --sparse-from-ic research/output/selected_factors_h5_cap_micro_30.json
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - WQ_016
+  - GTJA_140
+  - GTJA_042
+  - WQ_050
+  - A158_VSUMP20
+  - A158_KLEN
+  - GTJA_064
+  - A158_CORR5
+  - WQ_055
+  - GTJA_179
+  - A158_CORR20
+  - GTJA_074
+  - A158_CORD20
+  - GTJA_118
+  - GTJA_145
+  - A158_VSUMP10
+  - GTJA_105
+  - GTJA_061
+  - A158_VSTD60
+  - WQ_045
+  - WQ_018
+  - A158_QTLD5
+  - GTJA_001
+  - A158_VSUMN5
+  - GTJA_092
+  - GTJA_171
+  factors_sparse:
+  - 龙虎榜连续上榜
+  - 连板数
+  - 涨跌停净强度_20d
+  - 龙虎榜换手上榜_20d
+  - 龙虎榜涨幅上榜_20d
+  - 未来30日解禁次数
+  - 龙虎榜跌幅上榜规避_20d
+  - 龙虎榜机构净买入_20d
+  - 龙虎榜净买占比_20d

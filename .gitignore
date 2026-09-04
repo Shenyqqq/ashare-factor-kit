@@ -1,0 +1,76 @@
+# 数据文件不进 git（太大）
+data/raw/
+data/processed/
+data/universe/
+*.parquet
+*.csv
+*.h5
+
+# 密钥绝对不进 git
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# 临时 / agent 抓取 / 本地草稿
+.tmp/
+_sweep_*.py
+*.bak
+*.bak_*
+
+# 日志目录：仅保留编排脚本，忽略运行日志与一次性脚本
+logs/*
+!logs/driver.py
+!logs/analyze_results.py
+
+# 实验产物：仅保留说明，忽略大体量结果
+results/*
+!results/README.md
+
+# IC / 研究输出：保留筛选短名单，忽略 checkpoint / 日志 / 临时脚本
+research/output/_checkpoints/
+research/output/_logs/
+research/output/_archive/
+research/output/_*/
+research/output/_*.py
+research/output/_*.txt
+research/output/*.log
+research/output/*.err
+research/output/*.exit
+research/output/*.bat
+research/output/factor_depth_*/
+research/output/shortlist_*/
+research/output/rolling_pool_schedule_*
+research/output/ic_*.log
+research/output/ic_*.err
+research/output/osap_*.txt
+research/output/factor_configs_*.yaml
+
+# 配置备份 / 一次性调参快照（主文件 tuned_params.json 仍可跟踪）
+config/*.bak*
+config/*_backup.json
+config/*backup*.json
+config/tuned_params_*_*.json
+
+# 本地数据质量快照（脚本 quality_report.py 已入库）
+data/quality_report_*.md
+
+# 其它输出
+*.png
+*.pdf
+backtest_result*
+tmp_cols.txt
+catboost_info/

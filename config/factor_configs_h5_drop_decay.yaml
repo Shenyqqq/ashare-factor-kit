@@ -1,0 +1,15 @@
+# Drop-decay ablation: dense top24 minus pool decay labels (16)
+# Remaining dense = 8; sparse still via --sparse-from-ic
+# Source: research/output/selected_factors_h5.json (2026-07-26)
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - WQ_050
+  - WQ_015
+  - WQ_026
+  - 换手率行业中性_20d
+  - 融资余额变化_20d
+  - WQ_018
+  - WQ_068
+  - 行业相对强度_20d

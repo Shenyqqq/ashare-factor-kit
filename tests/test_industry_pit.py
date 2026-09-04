@@ -1,0 +1,167 @@
+"""PIT industry panel smoke test (synthetic, no network)."""
+import pandas as pd
+import numpy as np
+
+from research.ic.barra import (
+    _industry_dummies,
+    precompute_ctrl_matrices,
+    unpack_date_ctrl,
+)
+from data.industry.download_industry import (
+    build_industry_panel,
+    load_industry_as_of,
+    _snapshot_from_panel,
+)
+
+
+def test_as_of():
+    raw = pd.DataFrame([
+        {"symbol": "A", "start_date": "2015-01-01", "industry_code": "440101"},
+        {"symbol": "A", "start_date": "2020-01-01", "industry_code": "440201"},
+        {"symbol": "B", "start_date": "2015-01-01", "industry_code": "640101"},
+    ])
+    panel = build_industry_panel(raw)
+    assert panel.loc[panel["code"] == "A", "end_date"].iloc[0] == pd.Timestamp("2019-12-31")
+    assert pd.isna(panel.loc[panel["code"] == "A", "end_date"].iloc[1])
+    asof_2019 = load_industry_as_of(panel, "2019-06-01").to_dict()
+    asof_2021 = load_industry_as_of(panel, "2021-06-01").to_dict()
+    assert asof_2019 == {"A": "4401", "B": "6401"}, asof_2019
+    assert asof_2021 == {"A": "4402", "B": "6401"}, asof_2021
+    snap = _snapshot_from_panel(panel)
+    assert snap.loc["A", "sw_l2"] == "4402"
+    assert snap.loc["B", "sw_l2"] == "6401"
+    print("[OK] load_industry_as_of / build_industry_panel / snapshot")
+
+
+def test_dummies_pit_vs_static():
+    panel = pd.DataFrame([
+        {"code": "A", "effective_date": "2015-01-01", "sw_l1": "44", "sw_l2": "4401", "end_date": "2019-12-31"},
+        {"code": "A", "effective_date": "2020-01-01", "sw_l1": "44", "sw_l2": "4402", "end_date": pd.NaT},
+        {"code": "B", "effective_date": "2015-01-01", "sw_l1": "64", "sw_l2": "6401", "end_date": pd.NaT},
+        {"code": "C", "effective_date": "2015-01-01", "sw_l1": "44", "sw_l2": "4401", "end_date": pd.NaT},
+    ])
+    idx = pd.Index(["A", "B", "C"])
+    d_2019 = _industry_dummies(None, idx, industry_panel=panel, date=pd.Timestamp("2019-06-01"))
+    d_2021 = _industry_dummies(None, idx, industry_panel=panel, date=pd.Timestamp("2021-06-01"))
+    # 2019: A,C=4401 (ref), B=6401 -> only _ind_6401 dummy
+    assert set(d_2019.keys()) == {"_ind_6401"}, d_2019.keys()
+    # 2021: A=4402, C=4401 (ref), B=6401 -> _ind_4402 and _ind_6401
+    assert set(d_2021.keys()) == {"_ind_4402", "_ind_6401"}, d_2021.keys()
+    assert d_2021["_ind_4402"]["A"] == 1.0
+    assert d_2021["_ind_4402"]["C"] == 0.0
+    # static fallback
+    static = pd.Series({"A": "4402", "B": "6401", "C": "4401"})
+    d_static = _industry_dummies(static, idx)
+    assert set(d_static.keys()) == {"_ind_4402", "_ind_6401"}, d_static.keys()
+    print("[OK] _industry_dummies PIT + static fallback")
+
+
+def test_precompute_pit_and_static():
+    panel = pd.DataFrame([
+        {"code": "A", "effective_date": "2015-01-01", "sw_l1": "44", "sw_l2": "4401", "end_date": "2019-12-31"},
+        {"code": "A", "effective_date": "2020-01-01", "sw_l1": "44", "sw_l2": "4402", "end_date": pd.NaT},
+        {"code": "B", "effective_date": "2015-01-01", "sw_l1": "64", "sw_l2": "6401", "end_date": pd.NaT},
+        {"code": "C", "effective_date": "2015-01-01", "sw_l1": "44", "sw_l2": "4401", "end_date": pd.NaT},
+    ])
+    dates = pd.DatetimeIndex(["2019-06-03", "2021-06-03"])
+    fwd = pd.DataFrame(
+        {"A": [0.01, 0.02], "B": [0.0, 0.03], "C": [0.05, 0.04]},
+        index=dates,
+    )
+    barra = {"size": pd.DataFrame(
+        {"A": [1.0, 2.0], "B": [3.0, 4.0], "C": [5.0, 6.0]},
+        index=dates,
+    )}
+
+    # PIT path
+    dc = precompute_ctrl_matrices(
+        barra, fwd, industry_map=None, dates=dates, industry_panel=panel,
+    )
+    assert len(dc) == 2
+    arr_2019, idx_2019, _, _ = unpack_date_ctrl(dc[pd.Timestamp("2019-06-03")])
+    arr_2021, idx_2021, _, _ = unpack_date_ctrl(dc[pd.Timestamp("2021-06-03")])
+    # 2019: 1 barra col + 1 ind dummy (_ind_6401) = 2 cols
+    assert arr_2019.shape == (3, 2), arr_2019.shape
+    # 2021: 1 barra col + 2 ind dummies (_ind_4402, _ind_6401) = 3 cols
+    assert arr_2021.shape == (3, 3), arr_2021.shape
+    print(f"[OK] precompute PIT: 2019 shape={arr_2019.shape}, 2021 shape={arr_2021.shape}")
+
+    # Static path
+    static = pd.Series({"A": "4402", "B": "6401", "C": "4401"})
+    dc2 = precompute_ctrl_matrices(
+        barra, fwd, industry_map=static, dates=dates,
+    )
+    arr_s, _, _, _ = unpack_date_ctrl(dc2[pd.Timestamp("2019-06-03")])
+    # Static: 1 barra col + 2 ind dummies (4401 ref dropped, 4402 & 6401 present) = 3 cols
+    assert arr_s.shape == (3, 3), arr_s.shape
+    print(f"[OK] precompute static: shape={arr_s.shape}")
+
+
+def test_no_industry():
+    """No industry_map and no panel -> ctrl_arr = barra only."""
+    dates = pd.DatetimeIndex(["2021-06-03"])
+    fwd = pd.DataFrame({"A": [0.01], "B": [0.0]}, index=dates)
+    barra = {"size": pd.DataFrame({"A": [1.0], "B": [3.0]}, index=dates)}
+    dc = precompute_ctrl_matrices(barra, fwd, industry_map=None, dates=dates)
+    arr, _, _, w = unpack_date_ctrl(dc[pd.Timestamp("2021-06-03")])
+    assert arr.shape == (2, 1), arr.shape
+    assert w is None, "未传 weight_panel 时应为 None（等权 OLS）"
+    print(f"[OK] precompute no-industry: shape={arr.shape}")
+
+
+def test_residualize_panel_pit_as_of():
+    """PIT as-of 行业与静态回填产生不同残差（足够截面、非插值）。"""
+    from models.wf.labels import residualize_panel
+
+    rng = np.random.default_rng(1)
+    n = 40
+    cols = [f"{i:06d}" for i in range(n)]
+    dates = pd.DatetimeIndex(["2019-06-03", "2021-06-03"])
+    # 一半 4401、一半 6401；前 10 只 2020 年起改 4402（静态已是 4402）
+    rows = []
+    static = {}
+    for i, c in enumerate(cols):
+        if i < 10:
+            rows.append({"code": c, "effective_date": "2015-01-01",
+                         "sw_l1": "44", "sw_l2": "4401", "end_date": "2019-12-31"})
+            rows.append({"code": c, "effective_date": "2020-01-01",
+                         "sw_l1": "44", "sw_l2": "4402", "end_date": pd.NaT})
+            static[c] = "4402"
+        elif i < 20:
+            rows.append({"code": c, "effective_date": "2015-01-01",
+                         "sw_l1": "44", "sw_l2": "4401", "end_date": pd.NaT})
+            static[c] = "4401"
+        else:
+            rows.append({"code": c, "effective_date": "2015-01-01",
+                         "sw_l1": "64", "sw_l2": "6401", "end_date": pd.NaT})
+            static[c] = "6401"
+    panel = pd.DataFrame(rows)
+    size = pd.DataFrame(rng.normal(size=(2, n)), index=dates, columns=cols)
+    # 因子含行业均值：2019 的 4401 组应与静态 4402 回填不同
+    ind2019 = np.array([0.0 if i < 20 else 1.0 for i in range(n)])
+    fac = pd.DataFrame(
+        size.to_numpy() + np.vstack([ind2019, ind2019]) * 2.0
+        + rng.normal(scale=0.1, size=(2, n)),
+        index=dates, columns=cols,
+    )
+    pit = residualize_panel(
+        fac, {"Barra_Size": size}, pd.Series(static), dates,
+        min_stocks=10, industry_panel=panel,
+    )
+    st = residualize_panel(
+        fac, {"Barra_Size": size}, pd.Series(static), dates, min_stocks=10,
+    )
+    assert pit.notna().sum().sum() > 10
+    a_pit, a_st = pit.loc[dates[0]], st.loc[dates[0]]
+    corr = float(a_pit.corr(a_st))
+    assert corr < 0.999, f"2019 PIT vs 静态残差几乎相同 corr={corr:.6f}"
+    print("[OK] residualize_panel PIT as-of differs from static backfill")
+
+
+if __name__ == "__main__":
+    test_as_of()
+    test_dummies_pit_vs_static()
+    test_precompute_pit_and_static()
+    test_no_industry()
+    test_residualize_panel_pit_as_of()
+    print("\nALL PIT SMOKE TESTS PASSED")

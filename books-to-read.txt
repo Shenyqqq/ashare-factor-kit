@@ -1,0 +1,4 @@
+Advances in Financial Machine Learning
+Active Portfolio Management
+Machine Learning for Asset Manager
+Analysis of Financial Time Series

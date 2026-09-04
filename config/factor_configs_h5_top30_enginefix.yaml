@@ -1,0 +1,41 @@
+# Top-30 pure alpha factors for h5, selected by ICIR descending from
+# research/output/selected_factors_h5.json (factors pool, barra_factors_used=[]).
+# Generated for engine-fix verification run on 2026-07-06.
+# No 市场*/HMM_* regime factors, no Barra_* factors in this whitelist.
+# Note: strategies/ml.py auto-injects 市场*/HMM_* regime features when a
+# whitelist is supplied (engine behavior, unchanged). This matches the
+# prior ridge_h5 baseline, so comparison is apples-to-apples.
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - WQ_013
+  - WQ_016
+  - WQ_044
+  - WQ_055
+  - WQ_050
+  - WQ_015
+  - WQ_040
+  - WQ_027
+  - WQ_088
+  - WQ_003
+  - WQ_026
+  - WQ_012
+  - 未来30日解禁次数
+  - WQ_045
+  - WQ_006
+  - 振幅_20d
+  - 波动率_20d
+  - WQ_002
+  - WQ_075
+  - 未来60日解禁市值占比
+  - WQ_018
+  - WQ_094
+  - WQ_004
+  - 波动率_60d
+  - 价值_PB
+  - WQ_037
+  - 特质波动率_60d
+  - 跌停弱势_20d
+  - WQ_019
+  - WQ_073

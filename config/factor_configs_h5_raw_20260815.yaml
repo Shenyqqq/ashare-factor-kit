@@ -1,0 +1,47 @@
+# h5 raw 20260815: dense=28 sparse=11
+# gates: IC AND ICIR AND t/FDR AND corr_dedup; min_long_share=0; research tradable; neut=raw; GS off; sparse-track on
+# sparse inject: --special-factors sparse --sparse-from-ic research/output/selected_factors_h5_raw_20260815.json
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - GTJA_099
+  - GTJA_176
+  - GTJA_042
+  - GTJA_016
+  - GTJA_064
+  - GTJA_070
+  - WQ_015
+  - WQ_027
+  - GTJA_140
+  - A158_CORD20
+  - GTJA_105
+  - A158_CORR20
+  - WQ_012
+  - GTJA_005
+  - GTJA_179
+  - A158_VSUMN60
+  - GTJA_074
+  - A158_QTLD60
+  - A158_VMA60
+  - 融资余额变化_20d
+  - GTJA_001
+  - GTJA_156
+  - A158_LOW0
+  - GTJA_141
+  - GTJA_094
+  - A158_IMAX30
+  - WQ_002
+  - GTJA_004
+  factors_sparse:
+  - 龙虎榜连续上榜
+  - 连板数
+  - 涨跌停净强度_20d
+  - 龙虎榜换手上榜_20d
+  - 龙虎榜涨幅上榜_20d
+  - 龙虎榜跌幅上榜规避_20d
+  - 解禁定增压力_60d
+  - 龙虎榜净买占比_20d
+  - 未来30日解禁次数
+  - 龙虎榜机构净买入_20d
+  - 大宗机构接盘_20d

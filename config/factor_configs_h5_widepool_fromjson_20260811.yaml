@@ -1,0 +1,61 @@
+# h5 widepool from JSON 20260811: dense=47 sparse=16
+# dense = 原 45 (nolongshare 20260804) + 2 个 dense corr-dedup(0.7) 因子: WQ_041, WQ_085
+# sparse = 16 = 原 11 + 5 个 sparse corr-dedup(0.7) 因子（经 sparse 注入轨，避免 dense batch 崩溃）
+#   sparse corr-dedup 加回: 龙虎榜上榜次数_20d / 涨跌停状态 / 涨停强度_20d / 未来60日解禁市值占比 / 解禁流动性压力_60d
+# 注: 用户原话 "sparse 仍只白名单 11"，但 5 个 sparse corr-dedup 走 dense 注册表 batch 路径会静默崩溃
+#     (get_smallcap_factors/get_limit_factors batch)，故改走 sparse 注入轨 (compute_sparse_factors，
+#     逐因子 try/except + 全数据)，sparse 11→16。如需严格 11，则这 5 个无法加回。
+# sparse inject: --special-factors sparse --sparse-from-ic F:/PythonProject/quant_trading/research/output/selected_factors_h5_widepool_20260811.json
+# gates: IC∧ICIR∧t/FDR∧corr_dedup; min_long_share=0; research tradable; barra; GS off
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - GTJA_099
+  - WQ_055
+  - GTJA_042
+  - GTJA_016
+  - GTJA_064
+  - GTJA_032
+  - GTJA_140
+  - A158_CORD20
+  - GTJA_105
+  - GTJA_179
+  - WQ_012
+  - WQ_026
+  - A158_CORR20
+  - GTJA_074
+  - A158_VSUMN60
+  - A158_QTLD60
+  - GTJA_156
+  - A158_VMA60
+  - GTJA_001
+  - A158_LOW0
+  - A158_IMAX30
+  - WQ_071
+  - GTJA_145
+  - GTJA_121
+  - A158_VSUMN10
+  - GTJA_092
+  - A158_VSUMP5
+  - WQ_037
+  - GTJA_029
+  - GTJA_086
+  - GTJA_048
+  - A158_IMIN20
+  - WQ_066
+  - GTJA_058
+  - GTJA_045
+  - GTJA_044
+  - A158_VMA5
+  - GTJA_131
+  - GTJA_006
+  - A158_RESI10
+  - GTJA_039
+  - 动量_120d
+  - GTJA_125
+  - GTJA_142
+  - GTJA_091
+  # ── 以下 2 个为 dense corr-dedup(0.7) 加回 ──
+  - WQ_041
+  - WQ_085

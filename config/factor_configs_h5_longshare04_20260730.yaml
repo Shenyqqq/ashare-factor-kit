@@ -1,0 +1,43 @@
+# h5 long_share>0.4 合取白名单（IC∧ICIR∧t/FDR∧long_share>0.4；corr_dedup OFF）
+# 来源: .tmp/long_share_gate_offline_h5.md（过线 37）；无 sparse 注入（run 时勿传 --special-factors/--sparse-from-ic）
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - A158_CORD20
+  - A158_CORD30
+  - A158_CORD5
+  - A158_CORD60
+  - A158_CORR10
+  - A158_CORR20
+  - A158_CORR30
+  - A158_CORR5
+  - A158_MA60
+  - A158_QTLD20
+  - A158_ROC30
+  - A158_VSUMD60
+  - A158_VSUMN60
+  - A158_VSUMP60
+  - GTJA_001
+  - GTJA_005
+  - GTJA_016
+  - GTJA_032
+  - GTJA_036
+  - GTJA_041
+  - GTJA_042
+  - GTJA_061
+  - GTJA_062
+  - GTJA_064
+  - GTJA_074
+  - GTJA_090
+  - GTJA_105
+  - GTJA_176
+  - WQ_003
+  - WQ_015
+  - WQ_026
+  - WQ_040
+  - WQ_044
+  - WQ_050
+  - WQ_055
+  - 月最大收益
+  - 波动率_20d

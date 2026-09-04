@@ -1,0 +1,51 @@
+# Auto-generated from research/output/selected_factors_h5.json (2026-07-28)
+# dense factors=44; sparse injected via --sparse-from-ic (4)
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - WQ_013
+  - WQ_055
+  - GTJA_064
+  - GTJA_016
+  - GTJA_042
+  - GTJA_032
+  - GTJA_140
+  - GTJA_070
+  - A158_CORD20
+  - WQ_026
+  - GTJA_074
+  - GTJA_179
+  - A158_CORR20
+  - WQ_012
+  - A158_VSUMP60
+  - AR_26d
+  - GTJA_001
+  - 月最大收益
+  - GTJA_156
+  - A158_KLEN
+  - A158_VMA60
+  - A158_KLOW
+  - GTJA_061
+  - A158_IMAX30
+  - A158_KUP
+  - GTJA_121
+  - A158_ROC60
+  - GTJA_145
+  - WQ_018
+  - A158_VSUMN10
+  - GTJA_092
+  - 综合股权融资
+  - A158_VSUMD5
+  - GTJA_043
+  - 行业相对强度_20d
+  - A158_BETA5
+  - GTJA_086
+  - WQ_019
+  - WQ_066
+  - A158_IMXD10
+  - GTJA_045
+  - GTJA_053
+  - GTJA_044
+  - GTJA_131
+  ic_start_date: all
