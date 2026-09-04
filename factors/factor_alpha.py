@@ -342,7 +342,12 @@ def factor_margin_change(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 东财大单净流入
+# 东财大单净流入 — 【已弃用 / DEPRECATED】
+# ══════════════════════════════════════════════════════════════════════════════
+# 弃用原因：akshare 东财大单/超大单全市场拉不稳（push2his 限流重、单票历史常仅近数月），
+#   raw 文件 moneyflow_large 长期缺失或过短，因子不可用。勿再进入 IC / 生产 YAML。
+#   实现保留供未来接 Tushare DC 长历史后复活；当前 registry 已通过 moneyflow=None 跳过。
+#   详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
 # ══════════════════════════════════════════════════════════════════════════════
 
 def factor_moneyflow_large(
@@ -351,7 +356,10 @@ def factor_moneyflow_large(
     amount: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    大单净流入因子：过去N日大单净流入额均值（超大单+大单）。
+    [DEPRECATED] 大单净流入因子：过去N日大单净流入额均值（超大单+大单）。
+
+    弃用：akshare 资金流数据不足（全市场限流、单票历史短），因子不可用。
+    勿再进入 IC / 生产池。保留实现供 Tushare DC 接入后复活。
 
     moneyflow: DataFrame(index=日期, columns=股票), 值=大单净流入额（元）
     amount:    DataFrame(index=日期, columns=股票), 值=成交额（元），可选；
@@ -480,11 +488,19 @@ def load_margin() -> pd.DataFrame | None:
 
 
 def load_moneyflow() -> pd.DataFrame | None:
-    p = RAW_DIR / "moneyflow_large.parquet"
-    if not p.exists():
-        logger.warning(f"大单净流入文件不存在: {p}，请先运行 data/download_moneyflow.py")
-        return None
-    return pd.read_parquet(p)
+    """[DEPRECATED] 加载东财大单净流入宽表。
+
+    弃用：akshare 资金流数据不足（全市场限流、单票历史短），因子不可用。
+    始终返回 None；勿再进入 IC / 生产池。详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
+    """
+    import warnings
+    warnings.warn(
+        "load_moneyflow 已弃用：akshare 东财大单资金流数据不足，因子不可用。",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    logger.warning("load_moneyflow 已弃用（akshare 资金流数据不足），返回 None")
+    return None
 
 
 def load_northbound() -> pd.DataFrame | None:

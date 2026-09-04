@@ -99,6 +99,13 @@ def test_schedule_pool_ignores_same_day_ic():
     assert pool_a, "冒烟：该期池不应为空"
 
 
+def test_parse_lookback_2y_is_104():
+    from research.rolling_pool.cli import _parse_lookback
+
+    assert _parse_lookback("2y") == 104
+    assert _parse_lookback("1y") == 52
+
+
 def test_schedule_meta_flags_causality():
     ic = _synthetic_ic(30)
     params = PoolParams(

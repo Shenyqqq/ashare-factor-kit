@@ -25,6 +25,7 @@ data/download.py  —  下载历史数据，存为 parquet
     # 注意：没有 --update 开关；日常直接跑本模块即增量。详见 data/DATA_UPDATE.md
 """
 import argparse
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +33,7 @@ from pathlib import Path
 
 import akshare as ak
 import pandas as pd
+import requests
 from loguru import logger
 
 import sys
@@ -39,9 +41,67 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import RAW_DIR, UNIVERSE_DIR
 
 # 并发线程数：I/O密集型，线程数 > CPU核数也有效
-# 太高会被东财限流（429），8-12 是经验值
-OHLCV_WORKERS = 8
+# 太高会被东财限流（429），8-12 是经验值；push2his 被掐时可 OHLCV_WORKERS=2
+OHLCV_WORKERS = int(os.environ.get("OHLCV_WORKERS", "8"))
 FIN_WORKERS   = 8
+
+_EM_KLINE_URLS = (
+    "https://push2delay.eastmoney.com/api/qt/stock/kline/get",
+    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+)
+_EM_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _fetch_em_kline(code: str, start_ymd: str, end_ymd: str, adjust: str) -> pd.DataFrame | None:
+    """东财日 K。push2his 常 RemoteDisconnected，回退 push2delay（同字段、同复权口径）。"""
+    market_code = 1 if str(code).startswith("6") else 0
+    fqt = {"qfq": "1", "hfq": "2", "": "0"}.get(adjust, "2")
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f116",
+        "ut": "7eea3edcaed734bea9cbfc24409ed989",
+        "klt": "101",
+        "fqt": fqt,
+        "secid": f"{market_code}.{str(code).zfill(6)}",
+        "beg": start_ymd.replace("-", ""),
+        "end": end_ymd.replace("-", ""),
+    }
+    headers = {
+        "User-Agent": _EM_UA,
+        "Referer": "https://quote.eastmoney.com/",
+        "Connection": "close",
+    }
+    last_err = None
+    for url in _EM_KLINE_URLS:
+        s = requests.Session()
+        s.trust_env = False
+        s.proxies = {"http": None, "https": None}
+        try:
+            r = s.get(url, params=params, timeout=8, headers=headers)
+            r.raise_for_status()
+            payload = r.json()
+            klines = (payload.get("data") or {}).get("klines") or []
+            if not klines:
+                continue
+            temp = pd.DataFrame([item.split(",") for item in klines])
+            cols = ["日期", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
+                    "振幅", "涨跌幅", "涨跌额", "换手率"]
+            temp = temp.iloc[:, :len(cols)]
+            temp.columns = cols[: temp.shape[1]]
+            temp["日期"] = pd.to_datetime(temp["日期"])
+            for c in ("开盘", "收盘", "最高", "最低", "成交量", "成交额"):
+                if c in temp.columns:
+                    temp[c] = pd.to_numeric(temp[c], errors="coerce")
+            return temp
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err is not None:
+        raise last_err
+    return None
 
 # OHLCV 字段映射：AKShare列名 → 文件名前缀
 OHLCV_FIELDS = {
@@ -224,21 +284,159 @@ _normalize_sh_table = _normalize_meta_table
 _normalize_sz_table = _normalize_meta_table
 
 
+def _fetch_bj_stock_list() -> pd.DataFrame:
+    """北交所在市名单（``ak.stock_info_bj_name_code``），统一为 STOCK_META_COLUMNS。
+
+    失败返回空表。仅保留 ``92xxxx``（与 ``filter_universe`` 一致；8 开头不收录）。
+    """
+    fn = getattr(ak, "stock_info_bj_name_code", None)
+    if fn is None:
+        logger.warning("akshare 无 stock_info_bj_name_code，跳过北交所名单")
+        return pd.DataFrame(columns=STOCK_META_COLUMNS)
+    try:
+        raw = fn()
+    except Exception as e:
+        logger.warning(f"BJ 接口 stock_info_bj_name_code 失败: {e}")
+        return pd.DataFrame(columns=STOCK_META_COLUMNS)
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=STOCK_META_COLUMNS)
+    df = _normalize_meta_table(raw)
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    df = df[df["code"].str.startswith("92")].copy()
+    df = df.drop_duplicates(subset="code", keep="last")
+    df["is_st_current"] = df["name"].astype(str).str.contains("ST", case=False, na=False)
+    keep = [c for c in STOCK_META_COLUMNS if c in df.columns]
+    out = df[keep].copy()
+    for col in STOCK_META_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NaT if col.endswith("date") else (False if col == "is_st_current" else "")
+    logger.info(f"BJ 接口取股票列表: {len(out)} 只 92xxxx")
+    return out[STOCK_META_COLUMNS]
+
+
+def _bj_codes_from_price_panels() -> list[str]:
+    """从 ``prices_hfq`` / ``close_hfq`` 列名取 92xxxx（只读 schema，不加载整表）。"""
+    codes: set[str] = set()
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        pq = None  # type: ignore[assignment]
+    for fname in ("prices_hfq.parquet", "close_hfq.parquet"):
+        p = RAW_DIR / fname
+        if not p.exists():
+            continue
+        try:
+            if pq is not None:
+                names = pq.read_schema(p).names
+                cols = [c for c in names if c not in ("date", "__index_level_0__")]
+            else:
+                cols = pd.read_parquet(p).columns.tolist()
+            codes.update(
+                c.zfill(6) for c in map(str, cols) if str(c).zfill(6).startswith("92")
+            )
+        except Exception as e:
+            logger.warning(f"从 {fname} 读北交所列失败: {e}")
+    return sorted(codes)
+
+
+def collect_bj_stock_codes(*, use_api: bool = True) -> list[str]:
+    """北交所 ``92xxxx`` 代码：``prices_hfq`` 列 ∪ 可选 ``stock_info_bj_name_code``。
+
+    与 ``filter_universe`` 同口径：保留 92，剔除 200/900/8。
+    """
+    codes: set[str] = set(_bj_codes_from_price_panels())
+    if use_api:
+        bj = _fetch_bj_stock_list()
+        if not bj.empty:
+            codes.update(bj["code"].astype(str).str.zfill(6).tolist())
+    out = sorted(c for c in codes if c.startswith("92") and not is_excluded_universe_code(c))
+    logger.info(
+        f"北交所 92xxxx 代码 {len(out)} 只"
+        f"（prices_hfq{' ∪ BJ 接口' if use_api else ''}）"
+    )
+    return out
+
+
+def append_bj_codes_to_stock_list(codes: list[str] | None = None) -> int:
+    """只追加缺失的 92xxxx 到 ``stock_list.parquet``，不删历史 B 股/退市行。
+
+    Returns
+    -------
+    int
+        新追加只数。
+    """
+    p = UNIVERSE_DIR / "stock_list.parquet"
+    if not p.exists():
+        logger.warning(f"找不到 {p}，跳过追加北交所")
+        return 0
+    sl = pd.read_parquet(p)
+    sl["code"] = sl["code"].astype(str).str.zfill(6)
+    have = set(sl["code"])
+    n_b_before = int(sl["code"].map(is_b_share_code).sum())
+    want = codes if codes is not None else collect_bj_stock_codes()
+    want = [
+        c.zfill(6) for c in want
+        if str(c).zfill(6).startswith("92") and not is_excluded_universe_code(c)
+    ]
+    new_codes = [c for c in want if c not in have]
+    if not new_codes:
+        logger.info("stock_list 已含全部待追加 92xxxx，不改写")
+        return 0
+
+    meta = _fetch_bj_stock_list()
+    meta_map: dict[str, dict] = {}
+    if not meta.empty:
+        for _, row in meta.iterrows():
+            meta_map[str(row["code"]).zfill(6)] = row.to_dict()
+
+    rows = []
+    for c in new_codes:
+        m = meta_map.get(c, {})
+        name = str(m.get("name", "") or "")
+        rows.append({
+            "code": c,
+            "name": name,
+            "list_date": m.get("list_date", pd.NaT),
+            "delist_date": m.get("delist_date", pd.NaT),
+            "is_st_current": bool(m.get("is_st_current", False))
+            or ("ST" in name.upper()),
+        })
+    extra = pd.DataFrame(rows)
+    for col in sl.columns:
+        if col not in extra.columns:
+            extra[col] = pd.NA
+    extra = extra[list(sl.columns)]
+    out = pd.concat([sl, extra], ignore_index=True)
+    n_b_after = int(out["code"].astype(str).str.zfill(6).map(is_b_share_code).sum())
+    if n_b_after != n_b_before:
+        raise RuntimeError(
+            f"追加 92 后 B 股行数变化 {n_b_before} → {n_b_after}，拒绝写盘"
+        )
+    UNIVERSE_DIR.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(p)
+    logger.info(
+        f"stock_list 追加北交所 {len(new_codes)} 只（未删历史 B/退市行），"
+        f"现 {len(out)} 只；B 股仍 {n_b_after} 行"
+    )
+    return len(new_codes)
+
+
 def _fetch_stock_list_with_metadata() -> pd.DataFrame:
     """优先用上交所/深交所官方接口（含上市日期），失败回退到 stock_info_a_code_name。
 
     返回列：code, name, list_date, delist_date, is_st_current
 
     注：akshare 1.18.x 起 ``stock_info_sz_name_code`` 的合法 ``symbol`` 仅剩
-    ``'A股列表'`` / ``'B股列表'``（中小板 2021 年并入主板，创业板由 A股列表
-    里的『板块』列区分）；``stock_info_sh_name_code`` 仍接受 主板A股/主板B股/
-    科创板。各源表先经 ``_normalize_meta_table`` 去重列再 concat，避免
-    InvalidIndexError。
+    ``'A股列表'`` / ``'B股列表'``；``stock_info_sh_name_code`` 仍接受
+    主板A股/主板B股/科创板。本函数**不再拉取 B 股列表**；``filter_universe``
+    再兜底去掉 ``200xxxx`` / ``900xxxx`` 与北交所 ``8xxxxx``。
+    北交所 ``92xxxx`` 经 ``stock_info_bj_name_code`` 并入（与 filter_universe 一致：保留 92）。
+    各源表先经 ``_normalize_meta_table`` 去重列再 concat，避免 InvalidIndexError。
     """
     frames: list[pd.DataFrame] = []
 
-    # ── 上交所：主板A / 主板B / 科创板 ──
-    for sym in ("主板A股", "主板B股", "科创板"):
+    # ── 上交所：主板A / 科创板（B 股不拉，filter_universe 再兜底）──
+    for sym in ("主板A股", "科创板"):
         try:
             sh = ak.stock_info_sh_name_code(symbol=sym)
             if sh is not None and not sh.empty:
@@ -246,14 +444,19 @@ def _fetch_stock_list_with_metadata() -> pd.DataFrame:
         except Exception as e:
             logger.warning(f"SH 接口({sym}) 失败: {e}")
 
-    # ── 深交所：A股列表（含主板+创业板，按『板块』列区分）/ B股列表 ──
-    for sym in ("A股列表", "B股列表"):
+    # ── 深交所：A股列表（含主板+创业板，按『板块』列区分）──
+    for sym in ("A股列表",):
         try:
             sz = ak.stock_info_sz_name_code(symbol=sym)
             if sz is not None and not sz.empty:
                 frames.append(_normalize_meta_table(sz))
         except Exception as e:
             logger.warning(f"SZ 接口({sym}) 失败: {e}")
+
+    # ── 北交所：92xxxx（保留；8 开头由 filter_universe / is_excluded 剔除）──
+    bj = _fetch_bj_stock_list()
+    if bj is not None and not bj.empty:
+        frames.append(bj)
 
     if frames:
         # 二次兜底：每个 frame 强制列名唯一，避免任意源引入重复列导致 concat 失败
@@ -264,9 +467,10 @@ def _fetch_stock_list_with_metadata() -> pd.DataFrame:
         df["is_st_current"] = df["name"].astype(str).str.contains(
             "ST", case=False, na=False
         )
+        n_bj = int(df["code"].astype(str).str.zfill(6).str.startswith("92").sum())
         logger.info(
-            f"SH/SZ 接口取股票列表: {len(df)} 只 "
-            f"(含退市 {df['delist_date'].notna().sum()} 只)"
+            f"SH/SZ/BJ 接口取股票列表: {len(df)} 只 "
+            f"(含退市 {df['delist_date'].notna().sum()} 只，北交所92 {n_bj} 只)"
         )
         return df
 
@@ -417,18 +621,69 @@ def get_stock_list(include_delisted: bool = True) -> pd.DataFrame:
     return df
 
 
+# 深市 B 股 200xxxx / 沪市 B 股 900xxxx。92/43 不是 B，startswith("8") 也不会误伤它们。
+B_SHARE_PREFIXES = ("200", "900")
+
+
+def normalize_stock_code(code: object) -> str:
+    """6 位数字代码；去掉 ``.SZ`` / ``.SH`` / ``.BJ`` 后缀。非股票列名原样返回。"""
+    s = str(code).strip()
+    if not s or s.lower() in {"nan", "none"}:
+        return ""
+    if "." in s:
+        s = s.split(".", 1)[0]
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) < 5:
+        return s
+    return digits.zfill(6)
+
+
+def is_b_share_code(code: object) -> bool:
+    """深市 B 股 ``200xxxx``、沪市 B 股 ``900xxxx``（可带交易所后缀）。"""
+    return normalize_stock_code(code).startswith(B_SHARE_PREFIXES)
+
+
+def is_excluded_universe_code(code: object) -> bool:
+    """默认股票池剔除：北交所 ``8xxxxx`` + 沪深 B 股。
+
+    不含北交所 ``92xxxx``、新三板 ``43xxxx``。
+    """
+    c = normalize_stock_code(code)
+    return c.startswith("8") or c.startswith(B_SHARE_PREFIXES)
+
+
+def drop_excluded_universe_columns(
+    df: pd.DataFrame | None,
+    *,
+    name: str | None = None,
+) -> pd.DataFrame | None:
+    """从宽表（columns=code）去掉北交所 8 开头与 B 股，供 IC / run.py / live 加载口共用。"""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    keep = [c for c in df.columns if not is_excluded_universe_code(c)]
+    n_drop = len(df.columns) - len(keep)
+    if n_drop <= 0:
+        return df
+    if name:
+        logger.info(f"{name}: 剔除北交所8开头/B股 {n_drop} 列，余 {len(keep)}")
+    return df.loc[:, keep]
+
+
 def filter_universe(stock_list: pd.DataFrame) -> pd.DataFrame:
-    """构建回测股票池：保留所有曾上市股票（含已退市、当前 ST），仅剔除北交所。
+    """构建回测股票池：保留曾上市 A 股（含已退市、当前 ST），剔除北交所 8 开头与沪深 B 股。
 
     M4 修复：不再按当前名字剔除 ST/退市。
       - ST 状态由回测时按日期查询 st_schedule 决定（见 backtest.execution.build_st_schedule）
       - 退市股由回测时按 delist_date > date 判断仍在市（见 TradeRules.is_delisted）
     历史回测需要这些股票在退市前的价格数据，否则会引入幸存者偏差。
+
+    B 股（深 200xxxx / 沪 900xxxx）以美元或港元计价，与 A 股截面不可比；默认剔除。
+    北交所 ``92xxxx`` / 新三板 ``43xxxx`` 不在此列（``startswith('8')`` 不会误伤）。
     """
     filtered = stock_list.copy()
-    # 仅剔除北交所（8 开头代码）；保留 6/0/3 开头主板/创业板/科创板
+    # 剔除北交所 8 开头 + B 股；保留 000/002/300/301/600/601/603/605/688 与 92
     if "code" in filtered.columns:
-        mask = ~filtered["code"].astype(str).str.startswith("8")
+        mask = ~filtered["code"].map(is_excluded_universe_code)
         filtered = filtered[mask].copy()
     # 确保元数据列存在（接口失败时补 NaT / False）
     for col in ("list_date", "delist_date"):
@@ -530,11 +785,16 @@ def download_ohlcv(
     lock = threading.Lock()
     failed = []
     done_count = 0
+    em_fail_streak = 0
+    em_skip = False
+    EM_SKIP_AFTER = 6
 
     def _code_to_sina_symbol(code: str) -> str:
         c = str(code).zfill(6)
         if c.startswith(("6", "9")):
             return f"sh{c}"
+        if c.startswith(("4", "8")):
+            return f"bj{c}"
         return f"sz{c}"
 
     def _fetch_raw_via_sina(code: str, code_start: str, code_end: str) -> pd.DataFrame | None:
@@ -554,37 +814,98 @@ def download_ohlcv(
         })
         return out.dropna(subset=["日期"])
 
+    def _fetch_hfq_via_sina_splice(
+        code: str, em_last_close: float, em_last_date, end_ymd: str,
+    ) -> pd.DataFrame | None:
+        """用新浪 hfq 日收益接到东财复权价上，避免混用两套复权基数。
+
+        新浪 volume 为股，东财 volume.parquet 为手，这里 /100。
+        """
+        if em_last_close is None or not pd.notna(em_last_close) or float(em_last_close) <= 0:
+            return None
+        sina_start = pd.Timestamp(em_last_date).strftime("%Y%m%d")
+        sdf = ak.stock_zh_a_daily(
+            symbol=_code_to_sina_symbol(code),
+            start_date=sina_start,
+            end_date=end_ymd.replace("-", ""),
+            adjust="hfq",
+        )
+        if sdf is None or sdf.empty:
+            return None
+        sdf = sdf.copy()
+        sdf["date"] = pd.to_datetime(sdf["date"])
+        sdf = sdf.set_index("date").sort_index()
+        overlap = sdf.index[sdf.index <= pd.Timestamp(em_last_date)]
+        if len(overlap) == 0:
+            return None
+        base = sdf.loc[overlap[-1]]
+        base_c = float(base["close"])
+        if not pd.notna(base_c) or base_c <= 0:
+            return None
+        scale = float(em_last_close) / base_c
+        new = sdf.loc[sdf.index > pd.Timestamp(em_last_date)]
+        if new.empty:
+            return None
+        out = pd.DataFrame({
+            "日期": new.index,
+            "开盘": pd.to_numeric(new["open"], errors="coerce") * scale,
+            "收盘": pd.to_numeric(new["close"], errors="coerce") * scale,
+            "最高": pd.to_numeric(new["high"], errors="coerce") * scale,
+            "最低": pd.to_numeric(new["low"], errors="coerce") * scale,
+            "成交量": pd.to_numeric(new["volume"], errors="coerce") / 100.0,
+            "成交额": pd.to_numeric(new["amount"], errors="coerce"),
+        })
+        return out.dropna(subset=["日期", "收盘"])
+
     def _fetch_ohlcv(code: str):
+        nonlocal em_fail_streak, em_skip
         series = data[close_col].get(code)
-        code_start = (
-            (series.index[-1] + pd.Timedelta(days=1)).strftime("%Y%m%d")
+        last_dt = (
+            series.index[-1]
             if series is not None and len(series) > 0
+            else None
+        )
+        code_start = (
+            (last_dt + pd.Timedelta(days=1)).strftime("%Y%m%d")
+            if last_dt is not None
             else start.replace("-", "")
         )
         code_end = end.replace("-", "")
-        try:
-            df = ak.stock_zh_a_hist(
-                symbol=code, period="daily",
-                start_date=code_start,
-                end_date=code_end,
-                adjust=adjust,
-            )
-            time.sleep(0.05)
-            if (df is None or df.empty) and adjust == "":
-                df = _fetch_raw_via_sina(code, code_start, code_end)
-                time.sleep(0.05)
-            return code, df, None
-        except Exception as e:
-            # 不复权：东财失败时回退新浪（hfq 仍只走东财，避免复权口径混用）
-            if adjust == "":
+        df = None
+        err = None
+        if not em_skip:
+            try:
+                df = _fetch_em_kline(code, code_start, code_end, adjust)
+            except Exception as e:
+                err = e
+                df = None
+                with lock:
+                    em_fail_streak += 1
+                    if em_fail_streak >= EM_SKIP_AFTER and not em_skip:
+                        em_skip = True
+                        logger.warning(
+                            f"东财 K 线连续失败 {em_fail_streak} 次，"
+                            f"本批改走新浪拼接/不复权回退"
+                        )
+        if df is None or df.empty:
+            if adjust == "" :
                 try:
                     df = _fetch_raw_via_sina(code, code_start, code_end)
-                    time.sleep(0.05)
-                    if df is not None and not df.empty:
-                        return code, df, None
+                    err = None if df is not None and not df.empty else err
                 except Exception as e2:
                     return code, None, e2
-            return code, None, e
+            elif adjust == "hfq" and series is not None and len(series) > 0:
+                try:
+                    df = _fetch_hfq_via_sina_splice(
+                        code, float(series.iloc[-1]), last_dt, code_end,
+                    )
+                    err = None if df is not None and not df.empty else err
+                except Exception as e3:
+                    return code, None, e3
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return code, None, err or RuntimeError("empty OHLCV")
+        time.sleep(0.05)
+        return code, df, None
 
     with ThreadPoolExecutor(max_workers=OHLCV_WORKERS) as executor:
         futures = {executor.submit(_fetch_ohlcv, code): code for code in need}

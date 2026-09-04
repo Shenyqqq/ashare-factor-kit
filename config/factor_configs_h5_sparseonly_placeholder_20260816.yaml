@@ -1,0 +1,8 @@
+# sparse-only 诊断：稠密白名单必须非空。
+# run.py 把 factors: [] / 缺省当成「不过滤 = 全量稠密」，不能用空列表。
+# 占位名不在 registry，过滤后 0 个稠密；真正特征靠 --special-factors sparse 全量注入。
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+    - __sparse_only_no_dense__

@@ -86,8 +86,8 @@ def _load_stock_codes(sample: int = 0, codes_csv: str | None = None) -> list[str
         raise FileNotFoundError(f"找不到 {p}，请先运行 `python -m data.download` 生成股票列表")
     df = pd.read_parquet(p)
     codes = df["code"].astype(str).str.zfill(6).tolist()
-    # 剔除北交所（8 开头）
-    codes = [c for c in codes if not c.startswith("8")]
+    from data.download import is_excluded_universe_code
+    codes = [c for c in codes if not is_excluded_universe_code(c)]
     if sample:
         codes = codes[:sample]
         logger.info(f"调试模式：仅取前 {sample} 只 → {codes}")

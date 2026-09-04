@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -46,6 +47,62 @@ DEFAULT_WARMUP_DAYS = 450
 DEFAULT_LOOKBACK_DAYS = 7
 
 
+# 申万 2021 二级：panel 存 6 位行业码的前 4 位。候选清单给人看时映射成名称。
+_SW_L2_NAMES = {
+    "1101": "种植业", "1102": "渔业", "1103": "林业Ⅱ", "1104": "饲料",
+    "1105": "农产品加工", "1107": "养殖业", "1108": "动物保健Ⅱ", "1109": "农业综合Ⅱ",
+    "2202": "化学原料", "2203": "化学制品", "2204": "化学纤维", "2205": "塑料",
+    "2206": "橡胶", "2208": "农化制品", "2209": "非金属材料Ⅱ",
+    "2303": "冶钢原料", "2304": "普钢", "2305": "特钢Ⅱ",
+    "2402": "金属新材料", "2403": "工业金属", "2404": "贵金属", "2405": "小金属",
+    "2406": "能源金属",
+    "2701": "半导体", "2702": "元件", "2703": "光学光电子", "2704": "其他电子Ⅱ",
+    "2705": "消费电子", "2706": "电子化学品Ⅱ",
+    "2802": "汽车零部件", "2803": "汽车服务", "2804": "摩托车及其他",
+    "2805": "乘用车", "2806": "商用车",
+    "3301": "白色家电", "3302": "黑色家电", "3303": "小家电", "3304": "厨卫电器",
+    "3305": "照明设备Ⅱ", "3306": "家电零部件Ⅱ", "3307": "其他家电Ⅱ",
+    "3404": "食品加工", "3405": "白酒Ⅱ", "3406": "非白酒", "3407": "饮料乳品",
+    "3408": "休闲食品", "3409": "调味发酵品Ⅱ",
+    "3501": "纺织制造", "3502": "服装家纺", "3503": "饰品",
+    "3601": "造纸", "3602": "包装印刷", "3603": "家居用品", "3605": "文娱用品",
+    "3701": "化学制药", "3702": "中药Ⅱ", "3703": "生物制品", "3704": "医药商业",
+    "3705": "医疗器械", "3706": "医疗服务",
+    "4101": "电力", "4103": "燃气Ⅱ",
+    "4208": "物流", "4209": "铁路公路", "4210": "航空机场", "4211": "航运港口",
+    "4301": "房地产开发", "4303": "房地产服务",
+    "4502": "贸易Ⅱ", "4503": "一般零售", "4504": "专业连锁Ⅱ",
+    "4506": "互联网电商", "4507": "旅游零售Ⅱ",
+    "4606": "体育Ⅱ", "4607": "本地生活服务Ⅱ", "4608": "专业服务",
+    "4609": "酒店餐饮", "4610": "旅游及景区", "4611": "教育",
+    "4802": "国有大型银行Ⅱ", "4803": "股份制银行Ⅱ", "4804": "城商行Ⅱ",
+    "4805": "农商行Ⅱ", "4806": "其他银行Ⅱ",
+    "4901": "证券Ⅱ", "4902": "保险Ⅱ", "4903": "多元金融",
+    "5101": "综合Ⅱ",
+    "6101": "水泥", "6102": "玻璃玻纤", "6103": "装修建材",
+    "6201": "房屋建设Ⅱ", "6202": "装修装饰Ⅱ", "6203": "基础建设",
+    "6204": "专业工程", "6206": "工程咨询服务Ⅱ",
+    "6301": "电机Ⅱ", "6303": "其他电源设备Ⅱ", "6305": "光伏设备",
+    "6306": "风电设备", "6307": "电池", "6308": "电网设备",
+    "6401": "通用设备", "6402": "专用设备", "6405": "轨交设备Ⅱ",
+    "6406": "工程机械", "6407": "自动化设备",
+    "6501": "航天装备Ⅱ", "6502": "航空装备Ⅱ", "6503": "地面兵装Ⅱ",
+    "6504": "航海装备Ⅱ", "6505": "军工电子Ⅱ",
+    "7101": "计算机设备", "7103": "IT服务Ⅱ", "7104": "软件开发",
+    "7204": "游戏Ⅱ", "7205": "广告营销", "7206": "影视院线", "7207": "数字媒体",
+    "7208": "社交Ⅱ", "7209": "出版", "7210": "电视广播Ⅱ",
+    "7301": "通信服务", "7302": "通信设备",
+    "7401": "煤炭开采", "7402": "焦炭Ⅱ",
+    "7501": "油气开采Ⅱ", "7502": "油服工程", "7503": "炼化及贸易",
+    "7601": "环境治理", "7602": "环保设备Ⅱ",
+    "7701": "个护用品", "7702": "化妆品", "7703": "医疗美容",
+}
+
+CANDIDATE_COLS = [
+    "as_of_date", "rank", "code", "name", "sw_l2", "circ_mv", "circ_mv_yi", "score",
+]
+
+
 def _backup_parquet(path: Path) -> None:
     """写前 .bak 备份（与 download_shares 习惯一致）。"""
     if not path.exists():
@@ -57,6 +114,21 @@ def _backup_parquet(path: Path) -> None:
         logger.warning(f".bak 备份失败（继续）: {path.name} -> {e}")
 
 
+def _log_circ_mv_shape(tag: str) -> tuple[int, pd.Timestamp | None, pd.Timestamp | None]:
+    """记录 circ_mv 行数/首末日，防止 lookback 切片覆盖全历史。"""
+    path = RAW_DIR / "circ_mv.parquet"
+    if not path.exists():
+        logger.warning(f"circ_mv [{tag}]: 文件不存在")
+        return 0, None, None
+    df = pd.read_parquet(path)
+    idx = pd.DatetimeIndex(pd.to_datetime(df.index))
+    n0, n1 = idx.min(), idx.max()
+    logger.info(
+        f"circ_mv [{tag}]: shape={df.shape}  {n0.date()} → {n1.date()}"
+    )
+    return int(df.shape[0]), n0, n1
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 1: 行情增量下载
 # ══════════════════════════════════════════════════════════════════════════════
@@ -66,14 +138,14 @@ def incremental_download(as_of, lookback_days, sample=0):
 
     复用现有下载函数（本身已是 per-stock date-append 增量）。
     """
-    from data.download import download_ohlcv, get_stock_list
+    from data.download import download_ohlcv, filter_universe, get_stock_list
 
     as_of = pd.Timestamp(as_of)
     start = (as_of - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     end = as_of.strftime("%Y-%m-%d")
     logger.info(f"[Step 1] 行情增量下载 {start} ~ {end}")
 
-    stock_list = get_stock_list(include_delisted=True)
+    stock_list = filter_universe(get_stock_list(include_delisted=True))
     codes = list(stock_list["code"].astype(str).str.zfill(6))
     if sample and sample > 0:
         codes = codes[:sample]
@@ -89,30 +161,246 @@ def incremental_download(as_of, lookback_days, sample=0):
         logger.error(f"OHLCV 增量下载失败: {e}")
         raise
 
+    # 日更原先只拉 hfq，prices_raw 会停在旧末日（2026-07 曾因此停更到 7/29）。
+    try:
+        from data.download import _last_valid_by_code
+
+        peer_last = _last_valid_by_code(RAW_DIR / "close_hfq.parquet")
+        download_ohlcv(
+            codes, start=start, end=end, adjust="", peer_last=peer_last,
+        )
+    except Exception as e:
+        logger.warning(f"prices_raw 增量下载失败（自算市值/换手将塌缩）: {e}")
+
+    # 与主下载流程（data.download:807-808）一致：close_hfq → prices_hfq 向后兼容。
+    # load_clean_panels 读 prices_hfq.parquet；不补这一步则 hfq 增量不生效。
+    try:
+        close_hfq_path = RAW_DIR / "close_hfq.parquet"
+        prices_hfq_path = RAW_DIR / "prices_hfq.parquet"
+        if close_hfq_path.exists():
+            _backup_parquet(prices_hfq_path)
+            import pandas as _pd
+            ch = _pd.read_parquet(close_hfq_path)
+            ch.sort_index().to_parquet(prices_hfq_path)
+            logger.info(f"[Step 1] close_hfq → prices_hfq 同步: {ch.shape}")
+    except Exception as e:
+        logger.warning(f"close_hfq → prices_hfq 同步失败: {e}")
+
     try:
         from data.download_stock_value_em import download_stock_value_em
-        download_stock_value_em(codes, start=start, refresh_stale_days=5)
+        # start 是 wide 面板日期下界（默认 2018-01-01），不是 lookback 窗口。
+        # 把 as_of-lookback 传进去会在 assemble 时切片后整表覆盖，砍掉历史市值。
+        n_before, _, _ = _log_circ_mv_shape("download 前")
+        download_stock_value_em(codes, refresh_stale_days=5)
+        n_after, _, _ = _log_circ_mv_shape("download 后")
+        if n_before > 0 and n_after < n_before:
+            logger.error(
+                f"circ_mv 行数从 {n_before} 砍到 {n_after}，历史被截断！"
+                "assemble 必须 outer merge，禁止用 lookback 当 start 覆盖全表"
+            )
     except Exception as e:
         logger.warning(f"stock_value_em 增量下载失败（市值因子将退化）: {e}")
 
     try:
         from data.download_shares import download_shares
-        download_shares(codes, start=start, refresh_stale_days=30)
+        # start 是股本长表历史下界（默认 2015），不是 lookback。
+        # 传入 as_of-lookback 会 _apply_start_filter 砍掉历史变动记录。
+        download_shares(codes, start="2015-01-01", refresh_stale_days=30)
     except Exception as e:
         logger.warning(f"download_shares 增量下载失败（换手率将退化）: {e}")
+
+    # ST 时间序列：incremental 原先不刷新，沪市新 ST（如 600530）会漏出 live 宇宙。
+    try:
+        from data.download_st_history import main as download_st_history
+        logger.info("[Step 1] 刷新 ST 历史 st_history.parquet")
+        download_st_history()
+    except Exception as e:
+        logger.warning(f"download_st_history 失败（ST mask 将用旧表）: {e}")
 
     try:
         from data.compute_market_cap import compute_market_cap
         _backup_parquet(RAW_DIR / "turnover_rate.parquet")
+        # 禁止把 lookback 当 start：会把 turnover_rate 整表覆盖成最近 N 日（曾砍成 23 行）。
         compute_market_cap(
             shares_path=RAW_DIR / "share_change.parquet",
             prices_path=RAW_DIR / "prices_raw.parquet",
             volume_path=RAW_DIR / "volume.parquet",
-            start=start, end=end,
+            start="2018-01-01",
+            end=None,
             sample_codes=codes if sample else None,
         )
     except Exception as e:
         logger.warning(f"compute_market_cap（turnover_rate）失败: {e}")
+
+    # ── 财务季报（季频；resume by code，已 4 月内新鲜的跳过）──
+    try:
+        from data.download import download_financial_indicators
+        _fin_path = RAW_DIR / "financial_indicators.parquet"
+        _backup_parquet(_fin_path)
+        download_financial_indicators(codes, start_year=start[:4], out_path=_fin_path)
+    except Exception as e:
+        logger.warning(f"financial_indicators 增量下载失败: {e}")
+
+    # ── 两融（日频；margin_detail 长表 + margin_balance 宽表，按交易日 resume）──
+    try:
+        from data.download_margin import main as _margin_main
+        for _fn in ("margin_balance.parquet", "margin_detail.parquet"):
+            _backup_parquet(RAW_DIR / _fn)
+        _margin_main(start, end, sample=0)
+    except Exception as e:
+        logger.warning(f"margin 增量下载失败（融资因子将退化）: {e}")
+
+    # ── 大单/超大单净流入：已弃用（akshare 资金流数据不足，因子不可用）──
+    # 不再增量下载 moneyflow_large/superlarge；因子侧已标记弃用，勿进入 IC/生产池。
+    # 详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1 / factors/factor_alpha.py::load_moneyflow。
+
+    # ── 机构持仓（季频；resume by 季报期）──
+    try:
+        from data.download_institution import download_institution
+        _backup_parquet(RAW_DIR / "institution_holding.parquet")
+        download_institution(start_year=int(start[:4]))
+    except Exception as e:
+        logger.warning(f"institution 增量下载失败: {e}")
+
+    # ── 龙虎榜（日频；month-chunks resume）──
+    try:
+        from data.download_lhb import main as _lhb_main
+        _backup_parquet(RAW_DIR / "lhb_detail.parquet")
+        _lhb_main(start, end, sample=0)
+    except Exception as e:
+        logger.warning(f"lhb 增量下载失败: {e}")
+
+    # ── 大宗交易 + 高管增减持（日频；month-chunks / 全量合并）──
+    try:
+        from data.download_holder_trade import download_block_trade, download_holder_trade
+        for _fn in ("block_trade.parquet", "holder_trade.parquet"):
+            _backup_parquet(RAW_DIR / _fn)
+        download_block_trade(start, end, sample=0)
+        download_holder_trade(start, end)
+    except Exception as e:
+        logger.warning(f"block_trade/holder_trade 增量下载失败: {e}")
+
+    # ── 解禁（日频；month-chunks resume）──
+    try:
+        from data.download_lockup import main as _lockup_main
+        _backup_parquet(RAW_DIR / "lockup_release.parquet")
+        _lockup_main(start, end, sample=0)
+    except Exception as e:
+        logger.warning(f"lockup 增量下载失败: {e}")
+
+    # ── 回购（事件；全量快照合并去重）──
+    try:
+        from data.download_repurchase import download_repurchase
+        _backup_parquet(RAW_DIR / "repurchase.parquet")
+        download_repurchase()
+    except Exception as e:
+        logger.warning(f"repurchase 增量下载失败: {e}")
+
+    # ── 评级变动（日频；by announce_date resume）──
+    try:
+        from data.download_rank_forecast import download_rank_forecast
+        _backup_parquet(RAW_DIR / "rank_forecast.parquet")
+        download_rank_forecast(start=start, end=end)
+    except Exception as e:
+        logger.warning(f"rank_forecast 增量下载失败: {e}")
+
+    # ── 研报列表（per-stock resume；逐股慢，仅拉未覆盖股，不重刷已有股）──
+    try:
+        from data.download_research_report import download_research_report
+        _backup_parquet(RAW_DIR / "research_report.parquet")
+        download_research_report(codes=codes, force=False)
+    except Exception as e:
+        logger.warning(f"research_report 增量下载失败: {e}")
+
+    # ── 行业资金流（per-sector resume）──
+    try:
+        from data.download_sector_fund_flow import download_sector_fund_flow
+        _backup_parquet(RAW_DIR / "sector_fund_flow.parquet")
+        download_sector_fund_flow(use_hist=True)
+    except Exception as e:
+        logger.warning(f"sector_fund_flow 增量下载失败: {e}")
+
+    # ── 业绩快报/正式稿（季频；resume by report_date）──
+    try:
+        from data.events.download_yjbb import download_yjbb
+        _backup_parquet(RAW_DIR / "yjbb.parquet")
+        download_yjbb(start_year=int(start[:4]))
+    except Exception as e:
+        logger.warning(f"yjbb 增量下载失败: {e}")
+
+    # ── 业绩预告（季频；resume by report_date）──
+    try:
+        from data.events.download_yjyg import download as _download_yjyg
+        _backup_parquet(RAW_DIR / "yjyg.parquet")
+        _download_yjyg()
+    except Exception as e:
+        logger.warning(f"yjyg 增量下载失败: {e}")
+
+    # ── 大宗营业部排行（快照；大宗折价席位质量因子依赖）──
+    try:
+        from data.download_dzjy_yybph import download_dzjy_yybph
+        _backup_parquet(RAW_DIR / "dzjy_yybph.parquet")
+        download_dzjy_yybph()
+    except Exception as e:
+        logger.warning(f"dzjy_yybph 增量下载失败: {e}")
+
+    # ── 股东户数（季频；per-stock resume）──
+    try:
+        from data.download_shareholder import main as _shareholder_main
+        _backup_parquet(RAW_DIR / "shareholder_count.parquet")
+        _shareholder_main(start=start, sample=0)
+    except Exception as e:
+        logger.warning(f"shareholder 增量下载失败: {e}")
+
+    # ── 指数增量更新（沪深300 / 创业板指；缓存末日 < end 则从 last+1 拉到 end）──
+    try:
+        import akshare as _ak
+        _INDEX_MAP = {"沪深300": "000300", "创业板指": "399006"}
+        for _nm, _code in _INDEX_MAP.items():
+            _cache = RAW_DIR / f"index_{_code}.parquet"
+            try:
+                if _cache.exists():
+                    _s = pd.read_parquet(_cache).squeeze()
+                    if isinstance(_s, pd.DataFrame):
+                        _s = _s.iloc[:, 0]
+                    _last = pd.Timestamp(_s.index.max())
+                    if _last >= pd.Timestamp(end):
+                        continue
+                    _inc_start = (_last + pd.Timedelta(days=1)).strftime("%Y%m%d")
+                    _inc_end = pd.Timestamp(end).strftime("%Y%m%d")
+                    _df = _ak.index_zh_a_hist(
+                        symbol=_code, period="daily",
+                        start_date=_inc_start, end_date=_inc_end,
+                    )
+                    _df["日期"] = pd.to_datetime(_df["日期"])
+                    _inc = _df.set_index("日期")["收盘"].rename(_nm)
+                    _merged = pd.concat([_s, _inc])
+                    _merged = _merged[~_merged.index.duplicated(keep="last")].sort_index()
+                    _merged.name = _nm
+                    _backup_parquet(_cache)
+                    _merged.to_frame().to_parquet(_cache)
+                    logger.info(f"指数 {_nm}({_code}) 增量 +{len(_inc)} 行 → 末日 {_merged.index.max().date()}")
+                else:
+                    _df = _ak.index_zh_a_hist(
+                        symbol=_code, period="daily",
+                        start_date=start.replace("-", ""), end_date=end.replace("-", ""),
+                    )
+                    _df["日期"] = pd.to_datetime(_df["日期"])
+                    _s = _df.set_index("日期")["收盘"].rename(_nm)
+                    _s.to_frame().to_parquet(_cache)
+                    logger.info(f"指数 {_nm}({_code}) 首次下载 shape={_s.shape}")
+            except Exception as e:
+                logger.warning(f"指数 {_nm}({_code}) 增量更新失败: {e}，沿用旧缓存")
+    except Exception as e:
+        logger.warning(f"指数增量更新整体失败: {e}")
+
+    # ── 中证全指（csi_all；复用 strategies.market_state.download_csi_all，force 全量快照）──
+    try:
+        from strategies.market_state import download_csi_all
+        _backup_parquet(RAW_DIR / "csi_all.parquet")
+        download_csi_all(force=True)
+    except Exception as e:
+        logger.warning(f"csi_all 增量更新失败: {e}，沿用旧缓存")
 
     logger.info("[Step 1] 行情增量下载完成")
 
@@ -120,6 +408,39 @@ def incremental_download(as_of, lookback_days, sample=0):
 # ══════════════════════════════════════════════════════════════════════════════
 # Step 2: 加载 + 清洗 raw 面板（与 run.py._load_data 同口径，简化版）
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _truncate_sparse_prices_raw(prices_raw, min_frac: float = 0.80):
+    """截掉新浪补数中的稀疏尾（索引已到末日、但只有先补到的代码段有值）。
+
+    取最后一个覆盖率 >= min_frac 的交易日；Size 仍走完整 circ_mv，hfq 不截。
+    """
+    if prices_raw is None or not isinstance(prices_raw, pd.DataFrame) or prices_raw.empty:
+        return prices_raw
+    cov = prices_raw.notna().sum(axis=1)
+    n_col = max(int(prices_raw.shape[1]), 1)
+    ok = cov[cov >= min_frac * n_col]
+    if ok.empty:
+        cut = cov.idxmax()
+        logger.warning(
+            f"prices_raw 无 >= {min_frac:.0%} 覆盖日，退到最大覆盖 "
+            f"{pd.Timestamp(cut).date()} n={int(cov.loc[cut])}/{n_col}"
+        )
+    else:
+        cut = ok.index.max()
+    cut = pd.Timestamp(cut)
+    tail = pd.Timestamp(prices_raw.index.max())
+    if tail > cut:
+        logger.warning(
+            f"prices_raw 截到最后高覆盖日 {cut.date()} "
+            f"n={int(cov.loc[cut])}/{n_col}；丢弃稀疏尾 {tail.date()} "
+            f"n={int(cov.loc[tail])}/{n_col}（避免 600xxx 先补、其余 NaN 的截面偏）"
+        )
+        return prices_raw.loc[prices_raw.index <= cut]
+    logger.info(
+        f"prices_raw 末日 {tail.date()} 覆盖 {int(cov.loc[tail])}/{n_col}，无需截尾"
+    )
+    return prices_raw
+
 
 def _load_opt(fname):
     p = RAW_DIR / fname
@@ -149,10 +470,17 @@ def load_clean_panels(sample=0):
     prices, open_, high, low = clean_ohlc_aligned(_close_raw, _open_raw, _high_raw, _low_raw)
 
     prices_raw_path = RAW_DIR / "prices_raw.parquet"
+    snap = os.environ.get("LIVE_PRICES_RAW_PATH")
+    if snap:
+        snap_p = Path(snap)
+        if snap_p.exists():
+            prices_raw_path = snap_p
+            logger.info(f"prices_raw 改读快照 {prices_raw_path}")
     prices_raw = (
         clean_prices(pd.read_parquet(prices_raw_path), label="prices_raw")
         if prices_raw_path.exists() else None
     )
+    prices_raw = _truncate_sparse_prices_raw(prices_raw)
     fin_path = RAW_DIR / "financial_indicators.parquet"
     financial = clean_financial(pd.read_parquet(fin_path)) if fin_path.exists() else None
 
@@ -185,8 +513,11 @@ def load_clean_panels(sample=0):
 
     _margin_raw = _load_opt("margin_balance.parquet")
     margin = clean_aux_panel(_margin_raw, name="margin") if _margin_raw is not None else None
-    _moneyflow_raw = _load_opt("moneyflow_large.parquet")
-    moneyflow = clean_aux_panel(_moneyflow_raw, name="moneyflow") if _moneyflow_raw is not None else None
+    # moneyflow 已弃用：akshare 东财大单全市场拉不稳、单票历史常仅近数月，
+    # 因子不可用。不再加载 moneyflow_large，强制 None 以跳过相关因子计算。
+    if (_load_opt("moneyflow_large.parquet") is not None):
+        logger.warning("moneyflow_large 已弃用（akshare 资金流数据不足），跳过加载；大单净流入/残差因子不计算。")
+    moneyflow = None
     institution = _load_opt("institution_holding.parquet")
 
     from data.mv_panels import load_mv_raw
@@ -204,6 +535,27 @@ def load_clean_panels(sample=0):
 
     logger.info("[Step 2b] 涨跌停清洗（生成 clean_ret）")
     clean_ret, masks = clean_ohlcv(prices, open_, high, low)
+
+    from data.download import drop_excluded_universe_columns
+
+    prices = drop_excluded_universe_columns(prices, name="prices")
+    prices_raw = drop_excluded_universe_columns(prices_raw)
+    open_ = drop_excluded_universe_columns(open_)
+    high = drop_excluded_universe_columns(high)
+    low = drop_excluded_universe_columns(low)
+    volume = drop_excluded_universe_columns(volume)
+    amount = drop_excluded_universe_columns(amount)
+    clean_ret = drop_excluded_universe_columns(clean_ret)
+    margin = drop_excluded_universe_columns(margin)
+    institution = drop_excluded_universe_columns(institution)
+    total_mv = drop_excluded_universe_columns(total_mv)
+    circ_mv = drop_excluded_universe_columns(circ_mv)
+    turnover_rate = drop_excluded_universe_columns(turnover_rate)
+    if masks:
+        masks = {
+            k: (drop_excluded_universe_columns(v) if isinstance(v, pd.DataFrame) else v)
+            for k, v in masks.items()
+        }
 
     panels = dict(
         prices=prices, financial=financial, prices_raw=prices_raw,
@@ -345,7 +697,23 @@ def append_factor_panels(names, warmup_panels, as_of):
                 last_existing = existing.index[-1]
                 new_rows = fresh_panel.loc[fresh_panel.index > last_existing]
                 if new_rows.empty:
-                    logger.info(f"[append] {name}: 无新行（已有至 {last_existing.date()}）")
+                    # 已有面板含 as_of（上一份坏 Size / 稀疏 raw 可能写过）→ 用热身窗覆盖当日
+                    if as_of in existing.index and as_of in fresh_panel.index:
+                        existing = existing.copy()
+                        common = existing.columns.intersection(fresh_panel.columns)
+                        existing.loc[as_of, common] = fresh_panel.loc[as_of, common]
+                        extra = fresh_panel.columns.difference(existing.columns)
+                        if len(extra):
+                            existing = existing.reindex(
+                                columns=existing.columns.union(extra)
+                            )
+                            existing.loc[as_of, extra] = fresh_panel.loc[as_of, extra]
+                        logger.info(
+                            f"[append] {name}: 已有至 {last_existing.date()}，"
+                            f"热身窗覆盖 {as_of.date()}（内存，不重写磁盘）"
+                        )
+                    else:
+                        logger.info(f"[append] {name}: 无新行（已有至 {last_existing.date()}）")
                     result[name] = existing
                     continue
                 # 列对齐：union(existing, new)，缺失填 NaN
@@ -435,11 +803,31 @@ def compute_barra_warmup(warmup_panels):
         prices, circ_mv=warmup_panels["circ_mv"], total_mv=warmup_panels["total_mv"],
     )
     logger.info(f"[Step 4] Barra 因子就绪: {len(barra)} 个；WLS 权重={'有' if weights is not None else '无(等权OLS)'}")
+    size = barra.get("Barra_Size")
+    asof = warmup_panels.get("_as_of")
+    if size is not None and asof is not None:
+        asof = pd.Timestamp(asof)
+        if asof in size.index:
+            n_sz = int(pd.to_numeric(size.loc[asof], errors="coerce").notna().sum())
+            n_fill0 = int((pd.to_numeric(size.loc[asof], errors="coerce").fillna(0) == 0).sum())
+            logger.info(
+                f"Barra_Size 当日 {asof.date()} 非空={n_sz}/{size.shape[1]} "
+                f"（零值/fillna候选={n_fill0}；大量 0 说明 Size 塌缩）"
+            )
+            if n_sz < 1000:
+                logger.error(
+                    f"Barra_Size 当日覆盖过低 {n_sz}，中性化会 fillna(0) 退化"
+                )
+        else:
+            logger.error(f"Barra_Size 无当日 {asof.date()}，中性化会 fillna(0)")
+    elif size is None:
+        logger.error("Barra_Size 未算出，size_industry 中性化会失败/fillna(0)")
     return barra, weights
 
 
-def neutralize_as_of(factor_panels, barra, weights, industry_map, as_of, universe=None):
-    """对 as_of 截面做 WLS Barra+行业残差，返回 {name: neut_row_series}。
+def neutralize_as_of(factor_panels, barra, weights, industry_map, as_of, universe=None,
+                     prices=None, neut_controls="barra"):
+    """对 as_of 截面做 WLS 残差，返回 {name: neut_row_series}。
 
     - 复用 models.wf.labels.residualize_panel（与训练同口径）
     - rebalance_dates=[as_of]：只算当日一行
@@ -447,11 +835,36 @@ def neutralize_as_of(factor_panels, barra, weights, industry_map, as_of, univers
     - 输出每项是 pd.Series(index=universe)（当日截面残差 + re-zscore）
     - universe: 统一股票宇宙（prices.columns）；各因子面板列集可能不同
       （如融资因子仅覆盖两融标的），统一 reindex 到 universe 避免空 DataFrame。
+    - prices: 用于 live neut 缓存宇宙指纹；None 时退化为 universe 构造指纹
+      （缓存命中率可能略降，但不影响正确性）。
+    - neut_controls: ``barra``（9 风格+行业）或 ``size_industry``（Size+行业）。
+      须与训练 manifest 一致；写入 live_neut 缓存键。
+    - live neut 缓存：键 = name + live_neut_v1 + as_of + 宇宙指纹 + ctrl_sig；
+      默认 barra 不加 nc:（与旧 live 文件兼容），size_industry 才加 ``|nc:size_industry``。
+      命中直接用，未命中算并落盘（data/processed/factor_panels/live_neut_<hash>.parquet）。
     """
-    from models.wf.labels import residualize_panel
+    from models.wf.labels import (
+        NEUT_CONTROLS_SIZE,
+        NEUT_CONTROLS_SIZE_INDUSTRY,
+        residualize_panel,
+        select_neut_control_factors,
+        normalize_neut_controls,
+    )
     from factors.special_factors import should_skip_neutralize
+    from research.rolling_pool.neut_cache import (
+        barra_bundle_sig, live_neut_cache_path,
+        try_load_live_neut, save_live_neut,
+    )
 
     as_of = pd.Timestamp(as_of)
+    neut_mode = normalize_neut_controls(neut_controls)
+    barra = select_neut_control_factors(barra, neut_mode)
+    if neut_mode == NEUT_CONTROLS_SIZE_INDUSTRY:
+        logger.info(
+            "feature_neutralize size_industry: Size+PIT行业 WLS，未用 9 风格"
+        )
+    elif neut_mode == NEUT_CONTROLS_SIZE:
+        logger.info("feature_neutralize size: 仅 Size WLS，无行业")
     if universe is None:
         # 取所有面板列的并集
         cols = []
@@ -461,12 +874,26 @@ def neutralize_as_of(factor_panels, barra, weights, industry_map, as_of, univers
         universe = pd.Index(sorted(set(cols)))
     universe = universe.astype(str).str.zfill(6)
 
+    # live neut 缓存控制变量指纹（Barra + 行业 + WLS 权重）
     ind_series = None
     if industry_map is not None:
         if isinstance(industry_map, pd.DataFrame) and "sw_l2" in industry_map.columns:
             ind_series = industry_map["sw_l2"]
         else:
             ind_series = industry_map
+    industry_panel = None
+    if neut_mode != NEUT_CONTROLS_SIZE:
+        try:
+            from research.ic.load_data import load_industry_panel
+            industry_panel = load_industry_panel(required=False)
+        except Exception as e:
+            logger.warning(f"live neutralize: 加载 industry_map_panel 失败: {e}")
+    ctrl_sig = barra_bundle_sig(
+        barra, industry_map=ind_series, weight_panel=weights,
+        industry_panel=industry_panel,
+    )
+    # 宇宙指纹用 prices（若提供）以与训练 neut 缓存口径一致
+    prices_for_sig = prices if prices is not None else _universe_to_prices_sig(universe)
 
     def _zscore_keep_nan(series):
         """截面 zscore 但保留 NaN（不 dropna），与 cross_sectional_zscore 在
@@ -487,6 +914,7 @@ def neutralize_as_of(factor_panels, barra, weights, industry_map, as_of, univers
     n_skip = 0
     n_neut = 0
     n_allnan = 0
+    n_cache_hit = 0
     for name, panel in factor_panels.items():
         if should_skip_neutralize(name):
             if as_of in panel.index:
@@ -495,9 +923,23 @@ def neutralize_as_of(factor_panels, barra, weights, industry_map, as_of, univers
                 out[name] = pd.Series(np.nan, index=universe, dtype=np.float32)
             n_skip += 1
             continue
+        # 先查 live neut 缓存
+        cache_path = live_neut_cache_path(
+            name, as_of, prices_for_sig, ctrl_sig=ctrl_sig,
+            neut_controls=neut_mode,
+        )
+        cached = try_load_live_neut(
+            cache_path, as_of=as_of, universe=universe, name=name,
+        )
+        if cached is not None:
+            out[name] = cached
+            n_cache_hit += 1
+            n_neut += 1
+            continue
         resid = residualize_panel(
             panel, barra, ind_series, pd.DatetimeIndex([as_of]),
             weight_panel=weights,
+            industry_panel=industry_panel,
         )
         if as_of in resid.index:
             row = resid.loc[as_of]
@@ -509,13 +951,32 @@ def neutralize_as_of(factor_panels, barra, weights, industry_map, as_of, univers
             if as_of in panel.index:
                 row = panel.loc[as_of].reindex(universe)
             n_allnan += 1
-        out[name] = _zscore_keep_nan(row)
+        zrow = _zscore_keep_nan(row)
+        out[name] = zrow
+        # 落盘 live neut 缓存（单日行）
+        save_live_neut(cache_path, zrow, as_of=as_of, name=name)
         n_neut += 1
     logger.info(
         f"[Step 4] 当日中性化: {n_neut} 残差 + {n_skip} 豁免"
         + (f"（{n_allnan} 个残差全 NaN 退化为 raw）" if n_allnan else "")
+        + (f"（{n_cache_hit} 个 live neut 缓存命中）" if n_cache_hit else "")
     )
     return out
+
+
+def _universe_to_prices_sig(universe: pd.Index) -> pd.DataFrame:
+    """用 universe 构造一个最小 prices DataFrame 供 universe_sig 取指纹。
+
+    live neut 缓存键需要 universe_sig(prices)；当调用方未传 prices 时用此兜底，
+    生成一个 1×N 的 DataFrame（首尾列名与 universe 一致即可稳定指纹）。
+    """
+    cols = universe.astype(str).str.zfill(6)
+    if len(cols) == 0:
+        return pd.DataFrame()
+    return pd.DataFrame(
+        {c: [0.0] for c in cols},
+        index=pd.DatetimeIndex([pd.Timestamp("2000-01-01")]),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -527,7 +988,11 @@ def load_latest_models(model_dir, prefer_model=None, prefer_window=None):
 
     - 按 date 降序取最近重训日（同一日可能有多个 window×model）
     - prefer_model/prefer_window: 优先选指定模型/窗口（None=全部）
-    - 返回 list[dict]（每条含 path/model/window/date/feature_names/...）
+    - 返回 (list[dict], manifest_feature_neutralize, manifest_neut_controls)
+      - manifest_feature_neutralize: manifest 中记录的训练 feature_neutralize；
+        缺失键时返回 None（调用方按 False 默认 + warning 处理）
+      - manifest_neut_controls: ``barra`` | ``size_industry``；缺失键时默认
+        ``barra`` 并 warning
     - 需要 --save-models 产物；无 manifest 报错并提示
     """
     model_dir = Path(model_dir)
@@ -540,6 +1005,17 @@ def load_latest_models(model_dir, prefer_model=None, prefer_window=None):
     entries = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not entries:
         raise ValueError(f"manifest 为空: {manifest_path}")
+    # 提取训练时记录的 feature_neutralize（每条 entry 都应含；取首条即可）
+    manifest_fn = entries[0].get("feature_neutralize")
+    if manifest_fn is None:
+        logger.warning(
+            "manifest 无 feature_neutralize 字段（旧训练产物），按 False 默认处理；"
+            "建议用更新后的 trainer 重训以写入该字段"
+        )
+    from models.wf.labels import normalize_neut_controls
+    manifest_nc = normalize_neut_controls(
+        entries[0].get("neut_controls"), missing_warn=True,
+    )
     # 过滤
     cand = entries
     if prefer_model:
@@ -556,9 +1032,10 @@ def load_latest_models(model_dir, prefer_model=None, prefer_window=None):
     batch = [e for e in cand if e["date"] == latest_date]
     logger.info(
         f"[Step 5] 加载模型: {len(batch)} 个 fold（重训日 {latest_date}，"
-        f"models={[e['model'] + '_w' + str(e['window']) for e in batch]}）"
+        f"models={[e['model'] + '_w' + str(e['window']) for e in batch]}，"
+        f"feature_neutralize={manifest_fn}, neut_controls={manifest_nc})"
     )
-    return batch
+    return batch, manifest_fn, manifest_nc
 
 
 def build_feature_matrix(feature_names, neut_rows, raw_panels, as_of, universe=None):
@@ -696,13 +1173,109 @@ def strict_universe_mask(prices, volume, masks, as_of):
     return row.reindex(prices.columns).fillna(False)
 
 
-def output_topn(scores, mask, top_n, cap_band, as_of, output_path, stock_names=None):
+def _pretty_sw_l2(val):
+    """4 位申万二级代码 → 中文名；未知则保留原值。"""
+    if val is None:
+        return val
+    try:
+        if pd.isna(val):
+            return val
+    except (TypeError, ValueError):
+        pass
+    s = str(val).strip()
+    if not s or s.lower() == "nan":
+        return np.nan
+    return _SW_L2_NAMES.get(s[:4], s)
+
+
+def _sw_l2_as_of(codes, as_of, sw_l2=None):
+    """PIT 申万二级（as_of 当日或 asof≤）。无 panel 时退化静态 map 并 warning。"""
+    codes = pd.Index(codes).astype(str).str.zfill(6)
+    if sw_l2 is not None:
+        s = sw_l2.copy()
+        s.index = s.index.astype(str).str.zfill(6)
+        return s.reindex(codes)
+
+    from data.industry.download_industry import (
+        PANEL_PATH, OUT_PATH, load_industry_panel, load_industry_as_of,
+        load_industry_map,
+    )
+    if PANEL_PATH.exists():
+        panel = load_industry_panel()
+        if panel is not None and not panel.empty:
+            s = load_industry_as_of(panel, as_of, level="sw_l2")
+            s.index = s.index.astype(str).str.zfill(6)
+            return s.reindex(codes)
+        logger.warning("industry_map_panel.parquet 为空，退化静态 industry_map.parquet")
+    else:
+        logger.warning(
+            "industry_map_panel.parquet 缺失，退化静态 industry_map.parquet（无 PIT）"
+        )
+    if OUT_PATH.exists():
+        imap = load_industry_map()
+        imap.index = imap.index.astype(str).str.zfill(6)
+        col = "sw_l2" if "sw_l2" in imap.columns else imap.columns[0]
+        return imap[col].reindex(codes)
+    return pd.Series(index=codes, dtype=object)
+
+
+def _circ_mv_as_of(codes, as_of, circ_mv=None):
+    """东财流通市值（元）：≤as_of 最后有效值（按股票 ffill）。
+
+    增量日若只拼出稀疏新行（多数 NaN），取末日行会整列空；
+    须沿时间前向填充后再取 asof。
+    """
+    codes = pd.Index(codes).astype(str).str.zfill(6)
+    if circ_mv is None:
+        path = RAW_DIR / "circ_mv.parquet"
+        if not path.exists():
+            logger.warning("circ_mv.parquet 缺失，市值列为空")
+            return pd.Series(index=codes, dtype=float)
+        circ_mv = pd.read_parquet(path)
+    if circ_mv is None or circ_mv.empty:
+        return pd.Series(index=codes, dtype=float)
+    df = circ_mv.copy()
+    df.index = pd.DatetimeIndex(pd.to_datetime(df.index))
+    df.columns = df.columns.astype(str).str.zfill(6)
+    le = df.index[df.index <= pd.Timestamp(as_of)]
+    if len(le) == 0:
+        logger.warning(f"circ_mv 无 <= {pd.Timestamp(as_of).date()} 的日期")
+        return pd.Series(index=codes, dtype=float)
+    sub = df.loc[le].sort_index()
+    row = sub.ffill().iloc[-1]
+    d = sub.index[-1]
+    n_ok = int(pd.to_numeric(row.reindex(codes), errors="coerce").notna().sum())
+    logger.info(
+        f"circ_mv asof {d.date()}（请求 {pd.Timestamp(as_of).date()}）"
+        f" 候选命中 {n_ok}/{len(codes)}"
+    )
+    return row.reindex(codes)
+
+
+def _enrich_candidate_cols(top, as_of, circ_mv=None, sw_l2=None):
+    """给候选表加 sw_l2 / circ_mv（元）/ circ_mv_yi（亿元）。"""
+    top = top.copy()
+    top["code"] = top["code"].astype(str).str.zfill(6)
+    sw = _sw_l2_as_of(top["code"], as_of, sw_l2=sw_l2)
+    top["sw_l2"] = [ _pretty_sw_l2(sw.get(c)) for c in top["code"] ]
+    mv = _circ_mv_as_of(top["code"], as_of, circ_mv=circ_mv)
+    top["circ_mv"] = [mv.get(c) for c in top["code"]]
+    top["circ_mv_yi"] = pd.to_numeric(top["circ_mv"], errors="coerce") / 1e8
+    ordered = [c for c in CANDIDATE_COLS if c in top.columns]
+    extra = [c for c in top.columns if c not in ordered]
+    return top[ordered + extra]
+
+
+def output_topn(scores, mask, top_n, cap_band, as_of, output_path, stock_names=None,
+                circ_mv=None, sw_l2=None):
     """输出 Top-N 候选清单（strict 宇宙内按得分降序）。
 
     - scores: pd.Series(stock -> score)
     - mask: bool Series(stock -> 可买)
     - cap_band: 可选市值带过滤（'all' 关闭）；当前仅 'all'，其它值 warning
-    - output_path: .csv 或 .md（按扩展名决定格式）
+    - output_path: .csv 或 .md（同时写两种格式）
+    - circ_mv: 东财流通市值宽表（元）；None 则读 data/raw/circ_mv.parquet
+    - sw_l2: 可选 code→申万二级 Series（测试注入）；None 则 PIT panel asof
     返回 Top-N DataFrame。
     """
     as_of = pd.Timestamp(as_of)
@@ -711,10 +1284,12 @@ def output_topn(scores, mask, top_n, cap_band, as_of, output_path, stock_names=N
     s = s.sort_values(ascending=False)
     top = s.head(top_n).reset_index()
     top.columns = ["code", "score"]
+    top["code"] = top["code"].astype(str).str.zfill(6)
     if stock_names is not None:
-        top = top.merge(
-            stock_names.rename("name").reset_index(), on="code", how="left",
-        )
+        names = stock_names.rename("name")
+        names.index = names.index.astype(str).str.zfill(6)
+        names.index.name = "code"
+        top = top.merge(names.reset_index(), on="code", how="left")
     top.insert(0, "as_of_date", as_of.strftime("%Y-%m-%d"))
     top.insert(len(top.columns), "rank", range(1, len(top) + 1))
     if cap_band and cap_band != "all":
@@ -722,31 +1297,66 @@ def output_topn(scores, mask, top_n, cap_band, as_of, output_path, stock_names=N
             f"cap_band={cap_band} 在 live 暂未实现市值带过滤（用 'all'）；"
             f"可在训练时用 --cap-band 限定训练池以间接约束"
         )
+    top = _enrich_candidate_cols(top, as_of, circ_mv=circ_mv, sw_l2=sw_l2)
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if out.suffix.lower() == ".md":
-        _write_md(top, out, as_of)
+    suffix = out.suffix.lower()
+    if suffix == ".md":
+        csv_path = out.with_suffix(".csv")
+        md_path = out
     else:
-        top.to_csv(out, index=False, encoding="utf-8-sig")
-    logger.info(f"[Step 5] Top-{len(top)} 候选清单 -> {out}")
+        csv_path = out if suffix else out.with_suffix(".csv")
+        md_path = csv_path.with_suffix(".md")
+    top.to_csv(csv_path, index=False, encoding="utf-8-sig")
+    _write_md(top, md_path, as_of)
+    logger.info(f"[Step 5] Top-{len(top)} 候选清单 -> {csv_path} / {md_path}")
     return top
 
 
+def _fmt_md_cell(val, kind="str"):
+    if val is None:
+        return ""
+    try:
+        if pd.isna(val):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if kind == "score":
+        return f"{float(val):.4f}"
+    if kind == "yi":
+        return f"{float(val):.2f}"
+    if kind == "yuan":
+        return f"{float(val):.0f}"
+    return str(val)
+    return str(val)
+
+
 def _write_md(top, out, as_of):
-    """写 Markdown 候选清单。"""
+    """写 Markdown 候选清单（含申万二级 / 流通市值）。"""
     lines = [
         f"# 实盘候选清单 {as_of.strftime('%Y-%m-%d')}",
         "",
         f"共 {len(top)} 只（strict 可买宇宙，按模型得分降序）。",
         "",
-        "| rank | code | name | score |",
-        "|------|------|------|-------|",
+        "流通市值 `circ_mv` 单位：元（东财）；`circ_mv_yi` 单位：亿元（= circ_mv / 1e8）。",
+        "`sw_l2` 为申万 2021 二级行业（PIT as-of 当日，无 panel 则静态映射）。",
+        "",
+        "| rank | code | name | sw_l2 | circ_mv(元) | circ_mv_yi(亿元) | score |",
+        "|------|------|------|-------|-------------|------------------|-------|",
     ]
     for _, r in top.iterrows():
-        name = r.get("name", "")
-        name = "" if pd.isna(name) else name
-        lines.append(f"| {int(r['rank'])} | {r['code']} | {name} | {r['score']:.4f} |")
+        lines.append(
+            "| {rank} | {code} | {name} | {sw} | {mv} | {yi} | {score} |".format(
+                rank=int(r["rank"]),
+                code=r["code"],
+                name=_fmt_md_cell(r.get("name", "")),
+                sw=_fmt_md_cell(r.get("sw_l2", "")),
+                mv=_fmt_md_cell(r.get("circ_mv"), "yuan"),
+                yi=_fmt_md_cell(r.get("circ_mv_yi"), "yi"),
+                score=_fmt_md_cell(r.get("score"), "score"),
+            )
+        )
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -828,9 +1438,17 @@ def main(as_of=None, lookback_days=DEFAULT_LOOKBACK_DAYS,
     panels = load_clean_panels(sample=sample)
 
     # Step 5a: 加载模型 manifest（先于因子计算，以确定 feature_names）
-    model_entries = load_latest_models(
+    model_entries, manifest_fn, manifest_nc = load_latest_models(
         model_dir, prefer_model=prefer_model, prefer_window=prefer_window,
     )
+    # feature_neutralize 一致性校验：manifest 记录 vs CLI --no-feature-neutralize
+    # 推荐自动覆盖 + warning（避免误用 raw 因子给残差化训练的模型出分，反之亦然）
+    if manifest_fn is not None and bool(manifest_fn) != bool(feature_neutralize):
+        logger.warning(
+            f"feature_neutralize 不一致：manifest={manifest_fn} vs CLI={feature_neutralize}；"
+            f"自动覆盖为 manifest 值 ({manifest_fn}) 以匹配训练口径"
+        )
+        feature_neutralize = bool(manifest_fn)
     feature_names, fn_source = resolve_feature_names(model_entries, factor_config, horizon)
     if feature_names is None:
         # 全量：枚举所有可计算因子名
@@ -864,10 +1482,22 @@ def main(as_of=None, lookback_days=DEFAULT_LOOKBACK_DAYS,
         neut_rows = neutralize_as_of(
             factor_panels, barra, weights, panels["industry_map"], as_of,
             universe=universe,
+            prices=panels["prices"],
+            neut_controls=manifest_nc,
         )
 
     # Step 5b: 组装特征矩阵 + predict
     X = build_feature_matrix(feature_names, neut_rows or {}, factor_panels, as_of, universe=universe)
+    n_ok = X.notna().sum()
+    all_nan = [c for c in X.columns if int(n_ok.get(c, 0)) == 0]
+    low_cov = [
+        f"{c}:{int(n_ok[c])}"
+        for c in X.columns if 0 < int(n_ok.get(c, 0)) < 200
+    ]
+    logger.info(
+        f"特征覆盖 as_of={as_of.date()} 全NaN={all_nan or '无'} "
+        f"低覆盖(<200)={low_cov or '无'}"
+    )
     scores = predict_scores(model_entries, X)
 
     # Step 5c: strict 宇宙 + Top-N 输出
@@ -879,14 +1509,24 @@ def main(as_of=None, lookback_days=DEFAULT_LOOKBACK_DAYS,
         output = out_dir / f"candidates_{as_of.strftime('%Y%m%d')}.csv"
     from research.ic.universe import load_stock_names
     sn = load_stock_names()
-    top = output_topn(scores, mask, top_n, cap_band, as_of, output, stock_names=sn)
+    top = output_topn(
+        scores, mask, top_n, cap_band, as_of, output, stock_names=sn,
+        circ_mv=panels.get("circ_mv"),
+    )
 
     # 控制台打印 Top-N
     logger.info(f"--- Top-{len(top)} 候选（{as_of.date()}）---")
     for _, r in top.iterrows():
         name = r.get("name", "")
         name = "" if pd.isna(name) else name
-        logger.info(f"  {int(r['rank']):>3}. {r['code']} {name:<8} score={r['score']:.4f}")
+        sw = r.get("sw_l2", "")
+        sw = "" if pd.isna(sw) else sw
+        yi = r.get("circ_mv_yi", np.nan)
+        yi_s = f"{float(yi):.1f}亿" if pd.notna(yi) else "NA"
+        logger.info(
+            f"  {int(r['rank']):>3}. {r['code']} {name:<8} {sw:<10} "
+            f"{yi_s:<10} score={r['score']:.4f}"
+        )
     return top
 
 

@@ -61,6 +61,42 @@ def test_hold_dates_use_full_daily_calendar_not_scores():
     assert result.nav is not None and len(result.nav) >= 2
 
 
+def test_hold_period_3_exits_at_t_plus_3_not_next_friday():
+    """--hold-period 3: Mon open → Wed close，不拿到下周五。"""
+    daily = _daily_calendar()
+    fridays = daily[daily.weekday == 4]
+    sig, nxt = fridays[0], fridays[1]
+    exec_d = resolve_execution_date(sig, daily, use_open=True)
+    assert exec_d is not None
+
+    full = hold_dates_between(daily, exec_d, nxt)
+    assert full[-1] == nxt
+    assert len(full) >= 4
+
+    truncated = hold_dates_between(
+        daily, exec_d, nxt, signal_date=sig, hold_period=3,
+    )
+    sig_loc = daily.get_loc(sig)
+    assert truncated[-1] == daily[sig_loc + 3]
+    assert truncated[-1] < nxt
+    assert list(truncated) == list(daily[sig_loc + 1: sig_loc + 4])
+    assert len(truncated) == 3
+
+
+def test_hold_period_none_keeps_next_signal_exit():
+    """不传 hold_period 时仍持有到下一信号日（默认与历史实验一致）。"""
+    daily = _daily_calendar()
+    fridays = daily[daily.weekday == 4]
+    sig, nxt = fridays[0], fridays[1]
+    exec_d = resolve_execution_date(sig, daily, use_open=True)
+    a = hold_dates_between(daily, exec_d, nxt)
+    b = hold_dates_between(
+        daily, exec_d, nxt, signal_date=sig, hold_period=None,
+    )
+    assert list(a) == list(b)
+    assert a[-1] == nxt
+
+
 def test_index_period_return_near_buy_and_hold():
     """指数区间收益应接近同窗 buy&hold，而非接近 0。"""
     daily = _daily_calendar(periods=30)
@@ -112,6 +148,31 @@ def test_sparse_scores_index_cumret_not_collapsed():
     # 全样本约 +20%；若持有窗塌成 1 日/周，累计会远小于真实
     assert cum > 0.08, f"沪深300 cum={cum:.3%} too low (calendar bug?)"
     assert cum < 0.35, f"沪深300 cum={cum:.3%} unexpectedly high"
+
+
+def test_quantile_hold_period_3_skips_friday_drop():
+    """hold_period=3 在周三收盘离场，不吃周五大跌（默认会拿到下信号日）。"""
+    daily = pd.bdate_range("2023-01-02", periods=25)
+    n = 12
+    cols = [f"{i:06d}" for i in range(n)]
+    close = pd.DataFrame(100.0, index=daily, columns=cols)
+    close.loc[daily[daily.weekday == 4]] = 50.0
+    open_ = close.copy()
+    fridays = daily[daily.weekday == 4]
+    scores = pd.DataFrame(1.0, index=fridays, columns=cols)
+    scores.iloc[:, :6] = 2.0
+
+    r_full = run_quantile_backtest(
+        close, scores, n_quantiles=2, rebalance_freq="W-FRI",
+        open_prices=open_, cost_bps=0.0, min_stocks=3, top_n=6,
+    )
+    r_h3 = run_quantile_backtest(
+        close, scores, n_quantiles=2, rebalance_freq="W-FRI",
+        open_prices=open_, cost_bps=0.0, min_stocks=3, top_n=6,
+        hold_period=3,
+    )
+    assert float(r_full.nav["Top6"].iloc[-1]) < 0.5
+    assert float(r_h3.nav["Top6"].iloc[-1]) > 0.9
 
 
 if __name__ == "__main__":

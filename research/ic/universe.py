@@ -1,6 +1,7 @@
 """Tradable universe masks for IC cross-sections (quantile backtest philosophy)."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from backtest.execution import build_st_schedule, infer_st_codes
@@ -95,6 +96,7 @@ def build_ic_tradability_mask(
     bool DataFrame aligned to *prices*; True = stock tradable on signal date for IC.
 
     Filters (signal date):
+      - 北交所 ``8xxxxx`` + 沪深 B 股 ``200xxxx`` / ``900xxxx``（与 ``filter_universe`` 同口径）
       - ST：优先用真实 st_history 时间序列；否则 build_st_schedule 保守实现；
             再回退到 stock_names 含 ST 的静态集合。
       - limit up / limit down (any_limit) — **仅 strict 模式**；research 保留涨跌停
@@ -109,6 +111,14 @@ def build_ic_tradability_mask(
         exclude_limit_on_signal, tradable_limit_mode
     )
     tradable = pd.DataFrame(True, index=prices.index, columns=prices.columns)
+
+    # 与 filter_universe 同口径：北交所 8 开头 + 沪深 B 股（200/900）不可交易。
+    # 覆盖已落盘宽表里残留的 B 列；92/43 不在排除之列。
+    from data.download import is_excluded_universe_code
+
+    excl_cols = [c for c in tradable.columns if is_excluded_universe_code(c)]
+    if excl_cols:
+        tradable.loc[:, excl_cols] = False
 
     px = prices.reindex(columns=tradable.columns)
     tradable &= px.notna() & (px > 0)
@@ -237,6 +247,63 @@ def mask_scores_for_backtest(
         gate = gate & fwd.reindex(index=scores.index, columns=scores.columns).notna()
 
     return scores.where(gate)
+
+
+def restan_within_mask(
+    panel: pd.DataFrame,
+    mask: pd.DataFrame | None,
+    *,
+    winsor_pct: float = 0.01,
+    clip: float = 3.0,
+    min_stocks: int = 2,
+    dates: pd.DatetimeIndex | None = None,
+) -> pd.DataFrame:
+    """在 ``mask=True`` 的当日成员上重做截面 winsor + zscore。
+
+    磁盘因子面板是**全市场** ``winsor(1%)+cs_zscore(3σ)``。Spearman IC 虽对
+    单调变换不敏感，但全市场 winsor 会改池内相对次序；中性化更不能拿全市场
+    z 当被解释变量。本函数：量价时序已含在面板里，只重做截面步。
+
+    非成员 / 非 ``dates`` 行保持 NaN（不把池外值带进回归）。
+    ``mask is None`` 时原样返回（全市场行为不变）。
+    """
+    if panel is None or panel.empty or mask is None:
+        return panel
+    idx = panel.index.intersection(mask.index)
+    if dates is not None:
+        idx = idx.intersection(pd.DatetimeIndex(dates))
+    cols = panel.columns.intersection(mask.columns)
+    if len(idx) == 0 or len(cols) == 0:
+        out = pd.DataFrame(
+            np.nan, index=panel.index, columns=panel.columns, dtype=np.float32,
+        )
+        return out
+
+    arr = panel.reindex(index=idx, columns=cols).to_numpy(dtype=np.float64, copy=False)
+    m = mask.reindex(index=idx, columns=cols).fillna(False).to_numpy(dtype=bool)
+    buf = np.full(arr.shape, np.nan, dtype=np.float32)
+    lo_q = float(winsor_pct)
+    hi_q = 1.0 - float(winsor_pct)
+    for i in range(arr.shape[0]):
+        valid = m[i] & np.isfinite(arr[i])
+        n = int(valid.sum())
+        if n < min_stocks:
+            continue
+        v = arr[i, valid]
+        if lo_q > 0.0 and n >= 10:
+            lo, hi = np.quantile(v, [lo_q, hi_q])
+            v = np.clip(v, lo, hi)
+        std = float(v.std(ddof=0))
+        if std < 1e-12:
+            buf[i, valid] = 0.0
+            continue
+        z = (v - float(v.mean())) / std
+        buf[i, valid] = np.clip(z, -clip, clip).astype(np.float32)
+    out = pd.DataFrame(
+        np.nan, index=panel.index, columns=panel.columns, dtype=np.float32,
+    )
+    out.loc[idx, cols] = buf
+    return out
 
 
 def apply_tradable_mask(

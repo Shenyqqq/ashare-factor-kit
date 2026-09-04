@@ -117,8 +117,9 @@ def collect_delisted_codes(scan_raw: bool = False) -> list[str]:
     if cur:
         codes -= cur
 
-    # 剔除北交所 8 开头
-    codes = {c for c in codes if not c.startswith("8")}
+    # 剔除北交所 8 开头 + 沪深 B 股（与 filter_universe 同口径；不误伤 92/43）
+    from data.download import is_excluded_universe_code
+    codes = {c for c in codes if not is_excluded_universe_code(c)}
 
     codes_list = sorted(codes)
     logger.info(f"退市股候选: {len(codes_list)} 只")
@@ -335,6 +336,8 @@ def main(start: str, end: str, sample: int = 0, scan_raw: bool = False) -> None:
                 if not new.empty:
                     merged = pd.concat([sl, new], ignore_index=True, sort=False)
                     merged["code"] = merged["code"].astype(str).str.zfill(6)
+                    from data.download import filter_universe
+                    merged = filter_universe(merged)
                     merged.to_parquet(sl_path)
                     logger.info(f"stock_list.parquet 合并退市股: {len(merged)} 只")
     except Exception as e:

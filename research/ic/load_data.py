@@ -137,6 +137,29 @@ def load_ic_data() -> ICDataBundle:
     )
 
     clean_ret, masks = clean_ohlcv(prices, open_, high, low)
+
+    from data.download import drop_excluded_universe_columns
+
+    prices = drop_excluded_universe_columns(prices, name="prices")
+    prices_raw = drop_excluded_universe_columns(prices_raw)
+    open_ = drop_excluded_universe_columns(open_)
+    high = drop_excluded_universe_columns(high)
+    low = drop_excluded_universe_columns(low)
+    volume = drop_excluded_universe_columns(volume)
+    amount = drop_excluded_universe_columns(amount)
+    clean_ret = drop_excluded_universe_columns(clean_ret)
+    margin = drop_excluded_universe_columns(margin)
+    moneyflow = drop_excluded_universe_columns(moneyflow)
+    institution = drop_excluded_universe_columns(institution)
+    total_mv = drop_excluded_universe_columns(total_mv)
+    circ_mv = drop_excluded_universe_columns(circ_mv)
+    turnover_rate = drop_excluded_universe_columns(turnover_rate)
+    if masks:
+        masks = {
+            k: (drop_excluded_universe_columns(v) if isinstance(v, pd.DataFrame) else v)
+            for k, v in masks.items()
+        }
+
     stock_names = load_stock_names()
     is_st_current = load_is_st_current()
 

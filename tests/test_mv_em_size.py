@@ -93,6 +93,76 @@ def test_barra_size_reads_em_circ_mv():
     assert raw_log.loc[dates[-1], "600519"] > raw_log.loc[dates[-1], "600000"]
 
 
+def test_merge_wide_preserve_keeps_history_on_window_slice(tmp_path):
+    """列完全重叠时，lookback 窗口切片也不得覆盖窗口外历史日期。"""
+    from data.download_stock_value_em import _merge_wide_preserve
+
+    path = tmp_path / "circ_mv.parquet"
+    hist_idx = pd.date_range("2020-01-02", periods=5, freq="B")
+    old = pd.DataFrame(
+        {"600519": [1.0e12, 1.1e12, 1.2e12, 1.3e12, 1.4e12],
+         "000001": [2.0e11, 2.1e11, 2.2e11, 2.3e11, 2.4e11]},
+        index=hist_idx,
+    )
+    old.to_parquet(path)
+
+    window = pd.DataFrame(
+        {"600519": [1.41e12, 1.42e12], "000001": [2.41e11, 2.42e11]},
+        index=pd.DatetimeIndex(["2020-01-09", "2020-01-10"]),
+    )
+    merged = _merge_wide_preserve(path, window)
+    assert merged.index.min() == hist_idx.min()
+    assert merged.index.max() == pd.Timestamp("2020-01-10")
+    assert len(merged.index) == 7
+    assert float(merged.loc[hist_idx[0], "600519"]) == pytest.approx(1.0e12)
+    assert float(merged.loc[hist_idx[-1], "600519"]) == pytest.approx(1.4e12)
+    assert float(merged.loc[pd.Timestamp("2020-01-10"), "600519"]) == pytest.approx(1.42e12)
+
+
+def test_merge_wide_fill_missing_does_not_touch_existing(tmp_path):
+    """补 92 列时沪深已有列的行数/格点必须原样保留。"""
+    from data.download_stock_value_em import _merge_wide_preserve
+
+    path = tmp_path / "circ_mv.parquet"
+    hist_idx = pd.date_range("2020-01-02", periods=5, freq="B")
+    old = pd.DataFrame(
+        {"600519": [1.0e12, 1.1e12, 1.2e12, 1.3e12, 1.4e12],
+         "000001": [2.0e11, 2.1e11, 2.2e11, 2.3e11, 2.4e11]},
+        index=hist_idx,
+    )
+    old.to_parquet(path)
+
+    incoming = pd.DataFrame(
+        {
+            "600519": [9.9e12, 9.9e12],  # 即使带沪深列也必须被跳过
+            "920001": [1.1e9, 1.2e9],
+        },
+        index=pd.DatetimeIndex(["2020-01-03", "2020-01-06"]),
+    )
+    merged = _merge_wide_preserve(path, incoming, fill_missing_cols_only=True)
+    assert list(old["600519"]) == list(merged["600519"].loc[hist_idx])
+    assert list(old["000001"]) == list(merged["000001"].loc[hist_idx])
+    assert "920001" in merged.columns
+    assert float(merged.loc[pd.Timestamp("2020-01-06"), "920001"]) == pytest.approx(1.2e9)
+    assert pd.isna(merged.loc[hist_idx[0], "920001"])
+
+
+def test_drop_sparse_trailing_dates_keeps_body():
+    """未完成批次的稀疏末日必须丢掉，历史完整日保留。"""
+    from data.download_stock_value_em import _drop_sparse_trailing_dates
+
+    idx = pd.date_range("2026-07-01", periods=30, freq="B")
+    n = 100
+    data = np.ones((len(idx), n))
+    data[-3:, 10:] = np.nan  # 末日只剩 10 列
+    data[-5:-3, 40:] = np.nan  # 再前两日 40 列
+    wide = pd.DataFrame(data, index=idx, columns=[f"{i:06d}" for i in range(n)])
+    out = _drop_sparse_trailing_dates(wide, min_frac=0.5)
+    assert out.index.max() == idx[-6]
+    assert len(out) == len(idx) - 5
+    assert int(out.iloc[-1].notna().sum()) == n
+
+
 def test_map_em_columns_units(monkeypatch):
     from data.download_stock_value_em import _map_em_columns
 

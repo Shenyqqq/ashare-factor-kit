@@ -68,6 +68,7 @@ from models.wf.labels import (
     compute_return_overlap_weights,
     triple_barrier_label,
     long_bias_sample_weights,
+    rank_tail_sample_weights,
 )
 from models.wf.ensemble import (
     combine_model_scores,
@@ -136,7 +137,7 @@ def resolve_train_windows(
 
 
 WF_SELECTION_DEFAULT = "ic_weighted"
-LABEL_MODE_DEFAULT = "cs_zscore"
+LABEL_MODE_DEFAULT = "cs_rank"
 ENSEMBLE_METHOD_DEFAULT = "zscore"
 
 
@@ -483,8 +484,12 @@ class WalkForwardTrainer:
         long_weight_top: float | None = None,
         long_weight_ratio: float = 0.25,
         long_weight_curve: str = "smooth",
+        rank_weight_mid: float = 1.0,
         softlong_floor_slope: float = 0.25,
         retrain_every: int = RETRAIN_EVERY,
+        feature_neutralize: bool = False,
+        neut_controls: str = "barra",
+        time_decay: float = TIME_DECAY,
     ):
         # 默认 train_windows/val_window 为日历月；units=periods 时直接当调仓期数
         self.train_windows, self.val_window = resolve_train_windows(
@@ -526,6 +531,10 @@ class WalkForwardTrainer:
         )
         self.long_weight_ratio = float(long_weight_ratio)
         self.long_weight_curve = str(long_weight_curve)
+        # rank_weight_mid≥1 → 关闭 U 形两端加权；<1 则中间降权、两端满权。
+        self.rank_weight_mid = float(rank_weight_mid)
+        if not np.isfinite(self.rank_weight_mid) or self.rank_weight_mid <= 0:
+            raise ValueError(f"rank_weight_mid 须为正有限值: {rank_weight_mid}")
         self.softlong_floor_slope = float(softlong_floor_slope)
         # SHAP（默认关）：仅在最近 shap_max_dates 个预测日、每折最多
         # shap_max_samples 行上算 Tree/Linear SHAP，避免拖慢全量 WF。
@@ -533,18 +542,20 @@ class WalkForwardTrainer:
         self.shap_top = int(shap_top)
         self.shap_max_samples = int(shap_max_samples)
         self.shap_max_dates = int(shap_max_dates)
-        # rank objective 默认配合 cs_rank 百分位标签；fit 时经 prepare_rank_labels
+        # rank objective 配合 cs_rank 百分位标签；fit 时经 prepare_rank_labels
         # 转为截面细整数秩（0..n-1）供 LGBM/XGB/Cat Ranker 共用。仅在用户未显式
-        # 覆盖 label_mode（仍是默认 cs_zscore）时自动切换。
+        # 覆盖 label_mode（仍是默认 cs_rank）且默认值本身不是 cs_rank 时自动切换。
         if (
             objective == "rank"
             and isinstance(label_mode, str)
             and label_mode == LABEL_MODE_DEFAULT
+            and label_mode != "cs_rank"
         ):
             self.label_mode = "cs_rank"
             logger.info(
-                "rank objective 检测到默认 label_mode='cs_zscore'，自动切换为 'cs_rank' "
-                "（fit 时再转为细整数秩）；如需保留 cs_zscore 请显式传入 label_mode。"
+                f"rank objective 检测到默认 label_mode={LABEL_MODE_DEFAULT!r}，"
+                "自动切换为 'cs_rank'（fit 时再转为细整数秩）；"
+                "如需保留其它模式请显式传入 label_mode。"
             )
         self.output_rank = output_rank
         self.tag = tag
@@ -569,6 +580,16 @@ class WalkForwardTrainer:
                 "ridge_drop_regime=True：ridge 拟合时剔除 市场/HMM_ regime 列"
                 "（仅 ridge 模型生效；其它模型忽略）"
             )
+        # feature_neutralize：build_factor_dataset 出口是否做了残差化。
+        # 仅写入 manifest 供 live.daily_update 校验 CLI 一致性；不参与训练逻辑
+        # （实际残差化在 build_factor_dataset / rolling-pool lazy 路径完成）。
+        self.feature_neutralize = bool(feature_neutralize)
+        from models.wf.labels import normalize_neut_controls
+        self.neut_controls = normalize_neut_controls(neut_controls)
+        # time_decay=0 → exp(0*i)=1，窗内等权；universe 归一化与 overlap 权重仍生效。
+        self.time_decay = float(time_decay)
+        if self.time_decay < 0:
+            raise ValueError(f"time_decay 不能为负: {time_decay}")
 
         self.score_df: pd.DataFrame | None = None
         self.ic_series: pd.Series | None = None
@@ -586,13 +607,18 @@ class WalkForwardTrainer:
             f"(units={train_window_units}, freq={rebalance_freq}); "
             f"wf_selection={wf_selection}, label_mode={self.label_mode}, "
             f"ensemble={ensemble_method}, purge={purge_train}, embargo={embargo}, "
-            f"objective={self.objective}, retrain_every={self.retrain_every}"
+            f"objective={self.objective}, retrain_every={self.retrain_every}, "
+            f"time_decay={self.time_decay}"
             + (
                 f", shap=on(top={self.shap_top}, max_samples={self.shap_max_samples}, "
                 f"max_dates={self.shap_max_dates})"
                 if self.enable_shap else ", shap=off"
             )
         )
+        if self.time_decay == 0:
+            logger.info(
+                "time_decay=0: 窗内等权（仍保留 universe 归一化与 overlap 权重）"
+            )
         if self.retrain_every > 1:
             logger.info(
                 f"retrain_every={self.retrain_every}: 预测日复用最近重训日拟合的模型；"
@@ -622,9 +648,21 @@ class WalkForwardTrainer:
                 f"curve={self.long_weight_curve} "
                 "（标签本身不变；w 乘到既有 time-decay / universe / overlap 权重上）"
             )
+        if self.rank_weight_mid < 1.0 - 1e-12:
+            logger.info(
+                "rank-tail sample_weight: "
+                f"w = {self.rank_weight_mid:.3f} + {1.0 - self.rank_weight_mid:.3f}"
+                " * (2*|r-0.5|)**2 "
+                "（U 形；乘到既有 time-decay / long-bias / universe / overlap 上）"
+            )
 
-    def _section_base_weights(self, y_raw: np.ndarray, decay: float) -> np.ndarray:
-        """单截面基础样本权重 = time-decay × 可选 long-bias。"""
+    def _section_base_weights(
+        self,
+        y_raw: np.ndarray,
+        decay: float,
+        y_label: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """单截面基础样本权重 = time-decay × 可选 long-bias × 可选 rank-tail。"""
         w = np.full(len(y_raw), float(decay), dtype=np.float64)
         if self.long_weight_top is not None:
             w = w * long_bias_sample_weights(
@@ -632,6 +670,11 @@ class WalkForwardTrainer:
                 top_frac=self.long_weight_top,
                 bottom_weight=self.long_weight_ratio,
                 curve=self.long_weight_curve,
+            )
+        if self.rank_weight_mid < 1.0 - 1e-12:
+            src = y_label if y_label is not None else y_raw
+            w = w * rank_tail_sample_weights(
+                src, mid_weight=self.rank_weight_mid,
             )
         return w
 
@@ -845,11 +888,11 @@ class WalkForwardTrainer:
                 y_t = self._transform_y(
                     y_np, label_mode, barra_df=barra_df, ind_dummies=ind_dummies,
                 )
-                decay = np.exp(TIME_DECAY * i)
+                decay = np.exp(self.time_decay * i)
                 X_list.append(X_np)
                 y_list.append(y_t)
                 y_raw_list.append(y_np)
-                w_list.append(self._section_base_weights(y_np, decay))
+                w_list.append(self._section_base_weights(y_np, decay, y_t))
                 dates_used.append(d)
                 stocks_per_date.append(int(len(y_t)))
             if not X_list:
@@ -1273,6 +1316,7 @@ class WalkForwardTrainer:
                 "label_mode": self.label_mode,
                 "device": self.device,
                 "retrain_every": self.retrain_every,
+                "time_decay": self.time_decay,
                 "params": {
                     "ridge": RIDGE_PARAMS,
                     "ridge_cv_alphas": RIDGE_CV_ALPHAS,
@@ -1283,6 +1327,8 @@ class WalkForwardTrainer:
                     "mlp": MLP_PARAMS,
                 },
                 "lazy_rolling_pool": True,
+                "feature_neutralize": self.feature_neutralize,
+                "neut_controls": self.neut_controls,
             }
             save_models_manifest(
                 saved_model_entries, out / "models",
@@ -1393,11 +1439,11 @@ class WalkForwardTrainer:
                 y_t = self._transform_y(
                     y_np, label_mode, barra_df=barra_df, ind_dummies=ind_dummies,
                 )
-                decay = np.exp(TIME_DECAY * i)
+                decay = np.exp(self.time_decay * i)
                 X_list.append(X_np)
                 y_list.append(y_t)
                 y_raw_list.append(y_np)
-                w_list.append(self._section_base_weights(y_np, decay))
+                w_list.append(self._section_base_weights(y_np, decay, y_t))
                 dates_used.append(d)
                 stocks_per_date.append(int(len(y_t)))
             if not X_list:
@@ -1754,6 +1800,7 @@ class WalkForwardTrainer:
                 "label_mode": self.label_mode,
                 "device": self.device,
                 "retrain_every": self.retrain_every,
+                "time_decay": self.time_decay,
                 "params": {
                     "ridge": RIDGE_PARAMS,
                     "ridge_cv_alphas": RIDGE_CV_ALPHAS,
@@ -1763,6 +1810,8 @@ class WalkForwardTrainer:
                     "rf": RF_PARAMS,
                     "mlp": MLP_PARAMS,
                 },
+                "feature_neutralize": self.feature_neutralize,
+                "neut_controls": self.neut_controls,
             }
             save_models_manifest(
                 saved_model_entries, out / "models",
@@ -1801,6 +1850,7 @@ class WalkForwardTrainer:
             "long_weight_top": self.long_weight_top,
             "long_weight_ratio": self.long_weight_ratio,
             "long_weight_curve": self.long_weight_curve,
+            "rank_weight_mid": self.rank_weight_mid,
             "softlong_floor_slope": self.softlong_floor_slope,
         }
         with open(out / f"model_metrics_{tag}.json", "w", encoding="utf-8") as f:
@@ -1991,11 +2041,11 @@ class RegimeConditionalTrainer(WalkForwardTrainer):
                 y_t = self._transform_y(
                     y_np, label_mode, barra_df=barra_df, ind_dummies=ind_dummies,
                 )
-                decay = np.exp(TIME_DECAY * i)
+                decay = np.exp(self.time_decay * i)
                 X_list.append(X_np)
                 y_list.append(y_t)
                 y_raw_list.append(y_np)
-                w_list.append(self._section_base_weights(y_np, decay))
+                w_list.append(self._section_base_weights(y_np, decay, y_t))
                 dates_used.append(d)
                 stocks_per_date.append(int(len(y_t)))
             if not X_list:
@@ -2298,6 +2348,7 @@ class RegimeConditionalTrainer(WalkForwardTrainer):
                 "label_mode": self.label_mode,
                 "device": self.device,
                 "regime_conditional": True,
+                "time_decay": self.time_decay,
                 "params": {
                     "ridge": RIDGE_PARAMS,
                     "ridge_cv_alphas": RIDGE_CV_ALPHAS,
@@ -2307,6 +2358,8 @@ class RegimeConditionalTrainer(WalkForwardTrainer):
                     "rf": RF_PARAMS,
                     "mlp": MLP_PARAMS,
                 },
+                "feature_neutralize": self.feature_neutralize,
+                "neut_controls": self.neut_controls,
             }
             save_models_manifest(
                 saved_model_entries, out / "models",

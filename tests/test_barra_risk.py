@@ -17,9 +17,11 @@ import pytest
 from factors.barra_risk import (
     _halflife_weighted_mean,
     barra_growth,
+    barra_leverage,
     barra_liquidity,
     barra_regression_weights,
     barra_size,
+    barra_value,
     get_barra_factors,
     market_return,
     pick_market_cap,
@@ -176,6 +178,34 @@ def test_growth_blends_revenue_and_profit_yoy(synthetic):
     assert c_rev < 0.99 and c_pro < 0.99, "不应退化成单腿"
     # 等权：两腿贡献度接近
     assert abs(c_rev - c_pro) < 0.25
+
+
+def test_financial_barra_drops_b_share_absent_from_prices():
+    """财务长表含 200xxx 时，prices 无 B → normalize 后列不含 200。"""
+    dates = pd.bdate_range("2021-01-04", periods=8)
+    a_codes = ["000001", "600000", "300001"]
+    prices = pd.DataFrame(10.0, index=dates, columns=a_codes)
+    rows = []
+    for q in pd.date_range("2020-03-31", "2021-03-31", freq="QE"):
+        for i, c in enumerate(a_codes + ["200001"]):
+            rows.append({
+                "code": c,
+                "trade_date": q,
+                "debt_ratio": 99.0 if c.startswith("200") else 20.0 + 10.0 * i,
+                "revenue_growth": 50.0 if c.startswith("200") else 5.0 + 8.0 * i,
+                "net_profit_growth": 80.0 if c.startswith("200") else 4.0 + 6.0 * i,
+                "pb": 0.1 if c.startswith("200") else 1.5 + 0.5 * i,
+            })
+    fin = pd.DataFrame(rows)
+    for name, df in (
+        ("Leverage", barra_leverage(fin, prices)),
+        ("Growth", barra_growth(fin, prices)),
+        ("Value", barra_value(fin, prices)),
+    ):
+        assert df is not None, name
+        cols = [str(c) for c in df.columns]
+        assert "200001" not in cols, name
+        assert list(df.columns) == a_codes, name
 
 
 # ── 市场收益 / Beta ───────────────────────────────────────────────────────────

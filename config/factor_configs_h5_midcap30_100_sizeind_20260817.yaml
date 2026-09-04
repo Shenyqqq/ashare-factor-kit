@@ -1,0 +1,64 @@
+# h5 midcap size_industry selected_factors_h5_midcap30_100_sizeind_20260817_mcap30_100_8e9eee: dense=47 sparse=9
+# gates: IC AND ICIR AND t/FDR AND corr_dedup; min_long_share=0; research tradable; neut=size_industry (池内 log(circ_mv)+PIT sw_l2); GS off; sparse-track on (not residualized)
+# sparse inject: --special-factors sparse --sparse-from-ic F:/PythonProject/quant_trading/research/output/selected_factors_h5_midcap30_100_sizeind_20260817_mcap30_100_8e9eee.json
+h5:
+  horizon: 5
+  rebalance_freq: W-FRI
+  factors:
+  - GTJA_083
+  - GTJA_070
+  - WQ_050
+  - GTJA_042
+  - GTJA_176
+  - GTJA_064
+  - GTJA_140
+  - A158_VSUMD60
+  - WQ_027
+  - GTJA_005
+  - GTJA_179
+  - A158_CORD30
+  - A158_QTLD60
+  - WQ_003
+  - A158_LOW0
+  - A158_VMA60
+  - WQ_012
+  - GTJA_156
+  - GTJA_074
+  - A158_IMAX30
+  - 个股融资余额变化_20d
+  - 换手率行业中性_20d
+  - GTJA_001
+  - WQ_071
+  - GTJA_145
+  - 波动率_60d
+  - A158_VSTD5
+  - A158_KUP
+  - 价值_EP
+  - GTJA_056
+  - 价值_PB
+  - GTJA_092
+  - WQ_023
+  - GTJA_043
+  - GTJA_035
+  - A158_VSUMP5
+  - GTJA_023
+  - 营收市值比
+  - GTJA_184
+  - WQ_061
+  - A158_IMIN20
+  - WQ_001
+  - GTJA_086
+  - WQ_019
+  - GTJA_045
+  - GTJA_155
+  - WQ_038
+  factors_sparse:
+  - 龙虎榜连续上榜
+  - 连板数
+  - 涨跌停净强度_20d
+  - 龙虎榜上榜次数_20d
+  - 龙虎榜换手上榜_20d
+  - 龙虎榜净买占比_20d
+  - 解禁定增压力_60d
+  - 龙虎榜机构净买入_20d
+  - 未来30日解禁次数

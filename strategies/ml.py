@@ -30,9 +30,120 @@ from factors.special_factors import (
 )
 from models.trainer import (
     WalkForwardTrainer, RegimeConditionalTrainer,
-    build_ml_dataset, MODEL_TYPES, REBALANCE_FREQ,
+    LABEL_MODE_DEFAULT, build_ml_dataset, MODEL_TYPES, REBALANCE_FREQ,
 )
 from research.ic.forward_return import build_forward_return, winsorize_forward_return
+
+# rank 标签对 raw forward_return 做截面百分位；winsor 会把两端夹成并列、扭曲秩。
+_RANK_LABEL_MODES = frozenset({"cs_rank", "cs_rank_softlong"})
+
+
+def _load_industry_panel_optional() -> pd.DataFrame | None:
+    """训练残差化用 PIT 行业长表；缺失则 None（调用方回退静态 map）。"""
+    try:
+        from research.ic.load_data import load_industry_panel
+        return load_industry_panel(required=False)
+    except Exception as e:
+        logger.warning(f"加载 industry_map_panel 失败: {e}")
+        return None
+
+
+def _and_bool_masks(
+    a: pd.DataFrame | None,
+    b: pd.DataFrame | None,
+    *,
+    index,
+    columns,
+) -> pd.DataFrame | None:
+    """逐格 AND 两个 bool 面板；全 None 则返回 None（全市场）。"""
+    if a is None and b is None:
+        return None
+    if a is None:
+        return b.reindex(index=index, columns=columns).fillna(False).astype(bool)
+    if b is None:
+        return a.reindex(index=index, columns=columns).fillna(False).astype(bool)
+    aa = a.reindex(index=index, columns=columns).fillna(False)
+    bb = b.reindex(index=index, columns=columns).fillna(False)
+    return (aa & bb).astype(bool)
+
+
+def _build_tradable_mask(
+    prices: pd.DataFrame,
+    *,
+    volume,
+    masks,
+    stock_names,
+    is_st_current,
+    listing_dates,
+    delist_dates,
+    st_history,
+    exclude_limit_on_signal,
+    tradable_limit_mode,
+) -> pd.DataFrame:
+    from research.ic.universe import (
+        build_ic_tradability_mask,
+        load_stock_names,
+        load_is_st_current,
+        load_listing_dates,
+        load_delist_dates,
+        load_st_history,
+    )
+    sn = stock_names if stock_names is not None else load_stock_names()
+    ist = is_st_current if is_st_current is not None else load_is_st_current()
+    ld = listing_dates if listing_dates is not None else load_listing_dates()
+    dd = delist_dates if delist_dates is not None else load_delist_dates()
+    sth = st_history if st_history is not None else load_st_history()
+    return build_ic_tradability_mask(
+        prices,
+        volume=volume,
+        masks=masks,
+        stock_names=sn,
+        listing_dates=ld,
+        delist_dates=dd,
+        is_st_current=ist,
+        st_history=sth,
+        exclude_limit_on_signal=resolve_exclude_limit_on_signal(
+            exclude_limit_on_signal, tradable_limit_mode
+        ),
+    )
+
+
+def should_winsor_fwd_return(
+    label_mode: str,
+    fwd_return_winsor: bool = True,
+    cs_rank_winsor: bool = False,
+) -> bool:
+    """非 rank 模式才对 forward_return 截面截尾；cs_rank 默认吃 raw。
+
+    ``cs_rank_winsor=True`` 时 rank 模式也截尾（消融：winsor 后再 cs_rank）。
+    """
+    if str(label_mode) in _RANK_LABEL_MODES:
+        return bool(cs_rank_winsor) and bool(fwd_return_winsor)
+    return bool(fwd_return_winsor)
+
+
+def _maybe_winsor_forward_return(
+    forward_return: pd.DataFrame,
+    *,
+    fwd_return_winsor: bool,
+    label_mode: str,
+    cs_rank_winsor: bool = False,
+) -> pd.DataFrame:
+    """cs_zscore / raw 等截尾；cs_rank 默认对 raw fwd 做百分位。
+
+    ``cs_rank_winsor`` 打开时先截面 winsor 再 rank（8.10 标签口径消融）。
+    """
+    if not should_winsor_fwd_return(label_mode, fwd_return_winsor, cs_rank_winsor):
+        if str(label_mode) in _RANK_LABEL_MODES:
+            logger.info("cs_rank: skip fwd_return_winsor, rank on raw forward_return")
+        return forward_return
+    if FWD_RETURN_WINSOR is not None:
+        lo, hi = FWD_RETURN_WINSOR
+        forward_return = winsorize_forward_return(forward_return, lower=lo, upper=hi)
+        logger.info(f"fwd_return_winsor: 截面 [{lo:.0%}, {hi:.0%}] 截尾（与 IC 同函数）")
+        if str(label_mode) in _RANK_LABEL_MODES:
+            logger.info("cs_rank_winsor: rank on winsorized forward_return")
+    return forward_return
 
 
 def _registry_kwargs(
@@ -165,6 +276,7 @@ def _build_factor_dataset_lazy(
     sparse_from_ic: str | None,
     barra_factors,
     industry_map,
+    industry_panel,
     eligible_mask,
     stock_names,
     is_st_current,
@@ -173,6 +285,8 @@ def _build_factor_dataset_lazy(
     st_history,
     apply_tradable_filter: bool,
     fwd_return_winsor: bool,
+    cs_rank_winsor: bool = False,
+    label_mode: str,
     tradable_limit_mode: str | None,
     exclude_limit_on_signal: bool | None,
     apply_exec_mask: bool | None,
@@ -194,6 +308,10 @@ def _build_factor_dataset_lazy(
     moneyflow,
     northbound,
     institution,
+    neut_controls: str = "barra",
+    restan_in_universe: bool = False,
+    min_industry_n: int = 0,
+    universe_tag: str = "",
 ):
     """rolling-pool lazy：不拼并集 U 宽表；面板经 RollingPoolPanelStore 按需加载。"""
     from research.rolling_pool.lazy import (
@@ -302,13 +420,39 @@ def _build_factor_dataset_lazy(
                 always_on.append(name)
 
     # 中性化：pool_t 训练需历史调仓日真实残差 → 全 rebalance_dates OLS（非入选日稀疏）
-    ind_map_series = None
-    neut_weights = None
+    from models.wf.labels import (
+        NEUT_CONTROLS_SIZE,
+        NEUT_CONTROLS_SIZE_INDUSTRY,
+        normalize_neut_controls,
+        select_neut_control_factors,
+    )
+    neut_mode = normalize_neut_controls(neut_controls)
+    need_ind = neut_mode != NEUT_CONTROLS_SIZE
+    if industry_panel is None and feature_neutralize and need_ind:
+        industry_panel = _load_industry_panel_optional()
+        if industry_panel is not None:
+            logger.info("feature_neutralize (lazy): PIT industry_map_panel 逐日 as-of")
+        else:
+            logger.warning(
+                "feature_neutralize (lazy): 无 PIT 行业面板，行业哑变量用静态 map（前视）"
+            )
+    has_ind = industry_map is not None or industry_panel is not None
     do_neut = (
         feature_neutralize
         and barra_factors is not None
-        and industry_map is not None
+        and (has_ind or not need_ind)
     )
+    neut_barra = (
+        select_neut_control_factors(barra_factors, neut_mode) if do_neut else None
+    )
+    if do_neut and neut_mode == NEUT_CONTROLS_SIZE_INDUSTRY:
+        logger.info(
+            "feature_neutralize size_industry: Size+PIT行业 WLS，未用 9 风格"
+        )
+    elif do_neut and neut_mode == NEUT_CONTROLS_SIZE:
+        logger.info("feature_neutralize size: 仅 Size WLS，无行业")
+    ind_map_series = None
+    neut_weights = None
     if do_neut:
         from factors.barra_risk import barra_regression_weights
         ind_map_series = (
@@ -325,13 +469,40 @@ def _build_factor_dataset_lazy(
             "全调仓日 WLS（权重=√市值；pool_t 历史截面需要真实值）"
         )
 
+    membership_mask = None
+    if restan_in_universe:
+        tradable_for_mem = None
+        if apply_tradable_filter:
+            tradable_for_mem = _build_tradable_mask(
+                prices,
+                volume=volume,
+                masks=masks,
+                stock_names=stock_names,
+                is_st_current=is_st_current,
+                listing_dates=listing_dates,
+                delist_dates=delist_dates,
+                st_history=st_history,
+                exclude_limit_on_signal=exclude_limit_on_signal,
+                tradable_limit_mode=tradable_limit_mode,
+            )
+        membership_mask = _and_bool_masks(
+            tradable_for_mem, eligible_mask,
+            index=forward_return.index, columns=forward_return.columns,
+        )
+        if membership_mask is not None:
+            logger.info(
+                f"membership_mask (lazy) 档内回归 universe_tag={universe_tag or 'n/a'} "
+                f"min_industry_n={int(min_industry_n or 0)}"
+            )
+
     store = RollingPoolPanelStore(
         prices,
         registry_kwargs,
         compute_missing=not skip_factor_build,
         feature_neutralize=do_neut,
-        barra_factors=barra_factors if do_neut else None,
+        barra_factors=neut_barra if do_neut else None,
         industry_map=ind_map_series if do_neut else None,
+        industry_panel=industry_panel if do_neut else None,
         weight_panel=neut_weights if do_neut else None,
         active_dates_by_factor=None,
         rebalance_dates=rebalance_dates,
@@ -341,6 +512,12 @@ def _build_factor_dataset_lazy(
         hold_period=hold_period,
         rebalance_freq=freq,
         strict=strict,
+        neut_controls=neut_mode if do_neut else "barra",
+        membership_mask=membership_mask,
+        circ_mv=circ_mv,
+        min_industry_n=int(min_industry_n or 0),
+        restan_in_universe=bool(restan_in_universe and membership_mask is not None),
+        universe_tag=str(universe_tag or ""),
     )
 
     if apply_tradable_filter:
@@ -397,10 +574,12 @@ def _build_factor_dataset_lazy(
             f"/ {em.shape[0]} 日"
         )
 
-    if fwd_return_winsor and FWD_RETURN_WINSOR is not None:
-        lo, hi = FWD_RETURN_WINSOR
-        forward_return = winsorize_forward_return(forward_return, lower=lo, upper=hi)
-        logger.info(f"fwd_return_winsor: 截面 [{lo:.0%}, {hi:.0%}] 截尾（与 IC 同函数）")
+    forward_return = _maybe_winsor_forward_return(
+        forward_return,
+        fwd_return_winsor=fwd_return_winsor,
+        label_mode=label_mode,
+        cs_rank_winsor=cs_rank_winsor,
+    )
 
     log_rss("lazy_dataset_ready")
     return build_ml_dataset(
@@ -444,6 +623,7 @@ def build_factor_dataset(
     skip_factor_build: bool = False,
     rebuild_factor_cache: bool = False,
     feature_neutralize: bool = False,
+    neut_controls: str = "barra",
     barra_features: bool = False,
     special_factors: str | list | None = None,
     event_overlay: bool = False,
@@ -460,6 +640,8 @@ def build_factor_dataset(
     st_history: pd.DataFrame | None = None,
     apply_tradable_filter: bool = True,
     fwd_return_winsor: bool = True,
+    cs_rank_winsor: bool = False,
+    label_mode: str = LABEL_MODE_DEFAULT,
     rolling_pool_schedule: str | Path | None = None,
     rolling_pool_lazy: bool | None = None,
     rolling_pool_max_cached: int = 160,
@@ -467,6 +649,9 @@ def build_factor_dataset(
     tradable_limit_mode: str | None = None,
     exclude_limit_on_signal: bool | None = None,
     apply_exec_mask: bool | None = None,
+    restan_in_universe: bool = False,
+    min_industry_n: int = 0,
+    universe_tag: str = "",
 ):
     """
     构建 MLDataset，供 IndustryWalkForwardTrainer 等复用。
@@ -486,10 +671,16 @@ def build_factor_dataset(
     feature_neutralize : bool
         若为 True 且 ``barra_factors`` 与 ``industry_map`` 同时提供，则在因子
         registry 构建完成后、``build_ml_dataset`` 之前，对每个因子面板按
-        ``rebalance_dates`` 做截面 OLS 残差化（控制变量 = Barra 9 风格 + 行业
-        哑变量），与 IC 筛选阶段 ``research/ic/barra.py`` 用同一套口径。
+        ``rebalance_dates`` 做截面 WLS 残差化。默认控制变量 = Barra 9 风格 +
+        行业哑变量，与 IC 筛选 ``research/ic/barra.py`` 同口径。
+        ``neut_controls="size_industry"`` 时只控 ``Barra_Size``（东财
+        ``log(circ_mv)``）+ 行业，不用另外 8 个风格。
         Barra / special-factor packs（event、size 等，见
         ``factors.special_factors``）自身特征默认不中性化。
+
+    neut_controls : str
+        ``barra``（默认，9 风格+行业）或 ``size_industry``（Size+行业）。
+        写入 neut 缓存键，禁止两档残差面板共用 ``factor_panel_neut_*``。
 
     barra_features : bool
         若为 True 且 ``barra_factors`` 提供，则在 registry 白名单过滤之后把
@@ -535,6 +726,16 @@ def build_factor_dataset(
         若为 True 且 ``FWD_RETURN_WINSOR`` 非 None，在 tradable / eligible mask
         置 NaN 之后、``build_ml_dataset`` 之前，对 forward_return 做截面
         分位截尾（与 IC 共用 ``winsorize_forward_return``）。默认 True。
+        ``label_mode`` 为 ``cs_rank`` / ``cs_rank_softlong`` 时默认跳过截尾，
+        直接对 raw forward_return 做截面百分位。``cs_rank_winsor=True`` 时
+        rank 模式也先截尾再 rank（消融开关，默认关）。
+
+    cs_rank_winsor : bool
+        仅 rank 标签：True 时先截面 winsor 再 cs_rank。默认 False。
+
+    label_mode : str
+        训练标签模式。``cs_rank`` 在出口用 raw fwd；``cs_zscore`` / ``raw``
+        等非 rank 模式仍 winsor。IC 分析路径不受此开关影响。
 
     rolling_pool_schedule : str | Path | None
         ``research.rolling_pool`` 产出的长表 parquet/csv（date×factor）。
@@ -553,6 +754,17 @@ def build_factor_dataset(
         默认 True（fail-fast）：schedule 中的因子缺磁盘面板、或运行时 ``store.get``
         拿不到面板 / 日期对不上 → 直接 raise，禁止整列 NaN→``fillna(0)`` 静默变
         常数特征。False **仅 debug**：退回 warning + NaN 列。
+
+    restan_in_universe : bool
+        True 时在当日 ``membership``（可交易 ∩ eligible）上重做截面
+        winsor+zscore，再做档内 WLS。默认 False（全市场行为不变）。
+
+    min_industry_n : int
+        档内行业哑元最少有效样本；``<=1`` 关闭。亿元带默认由 ``run.py`` 传 10。
+
+    universe_tag : str
+        非空时写入 neut 缓存键 ``|u:`` 并落到子目录（如 ``mcap30_100``），
+        禁止覆盖全市场 ``factor_panel_neut_*``。
     """
     rk = _registry_kwargs(
         prices, financial, prices_raw, volume, amount,
@@ -617,6 +829,7 @@ def build_factor_dataset(
             sparse_from_ic=sparse_from_ic,
             barra_factors=barra_factors,
             industry_map=industry_map,
+            industry_panel=None,
             eligible_mask=eligible_mask,
             stock_names=stock_names,
             is_st_current=is_st_current,
@@ -625,6 +838,8 @@ def build_factor_dataset(
             st_history=st_history,
             apply_tradable_filter=apply_tradable_filter,
             fwd_return_winsor=fwd_return_winsor,
+            cs_rank_winsor=cs_rank_winsor,
+            label_mode=label_mode,
             tradable_limit_mode=tradable_limit_mode,
             exclude_limit_on_signal=exclude_limit_on_signal,
             apply_exec_mask=apply_exec_mask,
@@ -646,6 +861,10 @@ def build_factor_dataset(
             moneyflow=moneyflow,
             northbound=northbound,
             institution=institution,
+            neut_controls=neut_controls,
+            restan_in_universe=restan_in_universe,
+            min_industry_n=min_industry_n,
+            universe_tag=universe_tag,
         )
 
     registry = _load_or_compute_registry(
@@ -743,8 +962,49 @@ def build_factor_dataset(
         union_set = set(schedule_union_names or [])
         registry = apply_schedule_mask(registry, schedule_df, only_names=union_set)
 
-    if feature_neutralize and barra_factors is not None and industry_map is not None:
+    membership_mask = None
+    tradable_early = None
+    do_restan = bool(restan_in_universe)
+    if do_restan:
+        if apply_tradable_filter:
+            tradable_early = _build_tradable_mask(
+                prices,
+                volume=volume,
+                masks=masks,
+                stock_names=stock_names,
+                is_st_current=is_st_current,
+                listing_dates=listing_dates,
+                delist_dates=delist_dates,
+                st_history=st_history,
+                exclude_limit_on_signal=exclude_limit_on_signal,
+                tradable_limit_mode=tradable_limit_mode,
+            )
+        membership_mask = _and_bool_masks(
+            tradable_early, eligible_mask,
+            index=forward_return.index, columns=forward_return.columns,
+        )
+        if membership_mask is None:
+            logger.warning(
+                "restan_in_universe=True 但无 tradable/eligible_mask，跳过池内 restan"
+            )
+            do_restan = False
+        else:
+            per = membership_mask.sum(axis=1)
+            logger.info(
+                f"membership_mask 档内回归: 日均 {int(per.mean())} 只 "
+                f"(min={int(per.min())} max={int(per.max())}) "
+                f"universe_tag={universe_tag or 'n/a'} "
+                f"min_industry_n={int(min_industry_n or 0)}"
+            )
+
+    if feature_neutralize and barra_factors is not None:
         from factors.barra_risk import barra_regression_weights
+        from models.wf.labels import (
+            NEUT_CONTROLS_SIZE,
+            NEUT_CONTROLS_SIZE_INDUSTRY,
+            normalize_neut_controls,
+            select_neut_control_factors,
+        )
         from research.rolling_pool.neut_cache import (
             barra_bundle_sig,
             neut_cache_path,
@@ -755,128 +1015,160 @@ def build_factor_dataset(
         from research.rolling_pool.schedule_load import cs_zscore_sparse_rows
         from utils.rebalance_dates import get_rebalance_dates
 
-        # industry_map 可能是 DataFrame（多列），残差化需要 Series
-        ind_map_series = (
-            industry_map["sw_l2"]
-            if isinstance(industry_map, pd.DataFrame) and "sw_l2" in industry_map.columns
-            else industry_map
-        )
-        # WLS 权重 = √市值，与 IC 纯化（research/ic/barra.py）同口径
-        neut_weights = barra_regression_weights(
-            prices, circ_mv=circ_mv, total_mv=total_mv,
-        )
-        freq = rebalance_freq or REBALANCE_FREQ
-        rebalance_dates = get_rebalance_dates(
-            pd.DatetimeIndex(forward_return.index), freq,
-        )
-
-        # rolling-pool 急切 materialize：仅对「该因子曾入选」的调仓日残差化
-        # （lazy 路径用全调仓日；缓存键含 dates_sig，二者不会串味）
-        active_dates_by_factor: dict[str, pd.DatetimeIndex] | None = None
-        if schedule_df is not None:
-            from research.rolling_pool.schedule_load import active_factors_by_rebalance
-            af_map = active_factors_by_rebalance(schedule_df, rebalance_dates.tolist())
-            inv: dict[str, list] = {}
-            for d, facs in af_map.items():
-                for f in facs:
-                    inv.setdefault(f, []).append(d)
-            active_dates_by_factor = {
-                f: pd.DatetimeIndex(ds) for f, ds in inv.items()
-            }
-
-        ctrl_sig = barra_bundle_sig(
-            barra_factors,
-            industry_map=ind_map_series,
-            weight_panel=neut_weights,
-        )
-        # schedule 稀疏面板用 cs_zscore_sparse_rows；固定池仍用 cross_sectional_zscore
-        # （dense 上二者同口径；lazy store 一律 sparse，缓存键含 dates_sig 区分）
-        if schedule_df is not None:
-            _zscore_fn = cs_zscore_sparse_rows
-        else:
-            from factors.factor import cross_sectional_zscore as _zscore_fn
-
-        excluded = 0
-        n_hit = 0
-        n_miss = 0
-        new_registry: dict = {}
-        n_resid = sum(1 for n in registry if not should_skip_neutralize(n))
-        done_resid = 0
-        # 逐因子：HIT 则跳过 WLS；MISS 则残差化+re-zscore 后落盘。
-        # 清缓存：删 data/processed/factor_panels/factor_panel_neut_*.parquet
-        for name, panel in registry.items():
-            if should_skip_neutralize(name):
-                new_registry[name] = panel
-                excluded += 1
-                continue
-            dates_use = rebalance_dates
-            if active_dates_by_factor is not None:
-                dates_use = active_dates_by_factor.get(name, pd.DatetimeIndex([]))
-            path = neut_cache_path(
-                name, prices,
-                hold_period=int(hold_period),
-                rebalance_freq=str(freq),
-                rebalance_dates=dates_use,
-                ctrl_sig=ctrl_sig,
+        neut_mode = normalize_neut_controls(neut_controls)
+        need_ind = neut_mode != NEUT_CONTROLS_SIZE
+        industry_panel = _load_industry_panel_optional() if need_ind else None
+        if need_ind and industry_panel is not None:
+            logger.info("feature_neutralize: PIT industry_map_panel 逐日 as-of")
+        elif need_ind:
+            logger.warning(
+                "feature_neutralize: 无 PIT 行业面板，行业哑变量用静态 map（前视）"
             )
-            cached = try_load_neut_panel(path, prices=prices, name=name)
-            if cached is not None:
-                new_registry[name] = cached
-                n_hit += 1
-            else:
-                new_registry[name] = neutralize_one_factor(
-                    panel, name,
-                    barra_factors=barra_factors,
-                    industry_map=ind_map_series,
-                    dates_use=dates_use,
-                    weight_panel=neut_weights,
-                    zscore_fn=_zscore_fn,
-                )
-                save_neut_panel(path, new_registry[name], name=name)
-                n_miss += 1
-            done_resid += 1
-            if done_resid % 50 == 0:
+        if need_ind and industry_map is None and industry_panel is None:
+            logger.warning("feature_neutralize: 无行业映射，跳过残差化")
+        else:
+            # industry_map 可能是 DataFrame（多列），残差化需要 Series
+            ind_map_series = (
+                industry_map["sw_l2"]
+                if isinstance(industry_map, pd.DataFrame) and "sw_l2" in industry_map.columns
+                else industry_map
+            )
+            # WLS 权重 = √市值，与 IC 纯化（research/ic/barra.py）同口径
+            neut_weights = barra_regression_weights(
+                prices, circ_mv=circ_mv, total_mv=total_mv,
+            )
+            freq = rebalance_freq or REBALANCE_FREQ
+            rebalance_dates = get_rebalance_dates(
+                pd.DatetimeIndex(forward_return.index), freq,
+            )
+            neut_barra = select_neut_control_factors(barra_factors, neut_mode)
+            if neut_mode == NEUT_CONTROLS_SIZE_INDUSTRY:
                 logger.info(
-                    f"feature_neutralize: {done_resid}/{n_resid} "
-                    f"(HIT={n_hit}, MISS={n_miss})"
+                    "feature_neutralize size_industry: Size+PIT行业 WLS，未用 9 风格"
                 )
-            # 峰值内存：算完一个即可丢掉原 panel 引用（registry 稍后整体替换）
-            registry[name] = None
+            elif neut_mode == NEUT_CONTROLS_SIZE:
+                logger.info("feature_neutralize size: 仅 Size WLS，无行业")
 
-        registry = new_registry
-        logger.info(
-            f"feature_neutralize: {len(registry) - excluded} 个因子已 Barra+行业残差化"
-            f"（保留 {excluded} 个 Barra/special 特征不中性化）；"
-            f"neut cache HIT={n_hit} MISS={n_miss}；"
-            f"残差面板已 re-zscore（per-date mean≈0 std≈1）"
-        )
+            # rolling-pool 急切 materialize：仅对「该因子曾入选」的调仓日残差化
+            # （lazy 路径用全调仓日；缓存键含 dates_sig，二者不会串味）
+            active_dates_by_factor: dict[str, pd.DatetimeIndex] | None = None
+            if schedule_df is not None:
+                from research.rolling_pool.schedule_load import active_factors_by_rebalance
+                af_map = active_factors_by_rebalance(schedule_df, rebalance_dates.tolist())
+                inv: dict[str, list] = {}
+                for d, facs in af_map.items():
+                    for f in facs:
+                        inv.setdefault(f, []).append(d)
+                active_dates_by_factor = {
+                    f: pd.DatetimeIndex(ds) for f, ds in inv.items()
+                }
+
+            ctrl_sig = barra_bundle_sig(
+                neut_barra,
+                industry_map=ind_map_series,
+                weight_panel=neut_weights,
+                industry_panel=industry_panel,
+            )
+            if universe_tag:
+                _probe = neut_cache_path(
+                    "_probe", prices,
+                    hold_period=int(hold_period),
+                    rebalance_freq=str(freq),
+                    rebalance_dates=rebalance_dates,
+                    ctrl_sig=ctrl_sig,
+                    neut_controls=neut_mode,
+                    universe_tag=str(universe_tag),
+                )
+                logger.info(
+                    f"neut cache universe_tag={universe_tag} → {_probe.parent}"
+                )
+            # schedule 稀疏面板用 cs_zscore_sparse_rows；固定池仍用 cross_sectional_zscore
+            if schedule_df is not None:
+                _zscore_fn = cs_zscore_sparse_rows
+            else:
+                from factors.factor import cross_sectional_zscore as _zscore_fn
+
+            excluded = 0
+            n_hit = 0
+            n_miss = 0
+            new_registry: dict = {}
+            n_resid = sum(1 for n in registry if not should_skip_neutralize(n))
+            done_resid = 0
+            for name, panel in registry.items():
+                if should_skip_neutralize(name):
+                    new_registry[name] = panel
+                    excluded += 1
+                    continue
+                dates_use = rebalance_dates
+                if active_dates_by_factor is not None:
+                    dates_use = active_dates_by_factor.get(name, pd.DatetimeIndex([]))
+                path = neut_cache_path(
+                    name, prices,
+                    hold_period=int(hold_period),
+                    rebalance_freq=str(freq),
+                    rebalance_dates=dates_use,
+                    ctrl_sig=ctrl_sig,
+                    neut_controls=neut_mode,
+                    universe_tag=str(universe_tag or ""),
+                )
+                cached = try_load_neut_panel(path, prices=prices, name=name)
+                if cached is not None:
+                    new_registry[name] = cached
+                    n_hit += 1
+                else:
+                    new_registry[name] = neutralize_one_factor(
+                        panel, name,
+                        barra_factors=neut_barra,
+                        industry_map=ind_map_series,
+                        dates_use=dates_use,
+                        weight_panel=neut_weights,
+                        zscore_fn=_zscore_fn,
+                        industry_panel=industry_panel,
+                        membership_mask=membership_mask,
+                        circ_mv=circ_mv,
+                        min_industry_n=int(min_industry_n or 0),
+                        restan_in_universe=do_restan,
+                    )
+                    save_neut_panel(path, new_registry[name], name=name)
+                    n_miss += 1
+                done_resid += 1
+                if done_resid % 50 == 0:
+                    logger.info(
+                        f"feature_neutralize: {done_resid}/{n_resid} "
+                        f"(HIT={n_hit}, MISS={n_miss})"
+                    )
+                registry[name] = None
+
+            registry = new_registry
+            if neut_mode == NEUT_CONTROLS_SIZE:
+                neut_desc = "Size 残差化"
+            elif neut_mode == NEUT_CONTROLS_SIZE_INDUSTRY:
+                neut_desc = "Size+PIT行业残差化"
+            else:
+                neut_desc = "Barra+行业残差化"
+            logger.info(
+                f"feature_neutralize: {len(registry) - excluded} 个因子已 {neut_desc}"
+                f"（保留 {excluded} 个 Barra/special 特征不中性化）；"
+                f"neut cache HIT={n_hit} MISS={n_miss}"
+                f"{' universe_tag=' + universe_tag if universe_tag else ''}"
+                f"{' 档内 membership WLS' if membership_mask is not None else ''}；"
+                f"残差面板已 re-zscore（per-date mean≈0 std≈1）"
+            )
 
     # 与 IC 同口径的可交易池：信号日 ST / 停牌 / 次新 / 退市 → forward_return NaN
     # research 模式保留涨跌停；get_cross_section 的 y.dropna() 自然排除。
     if apply_tradable_filter:
-        from research.ic.universe import (
-            build_ic_tradability_mask,
-            load_stock_names,
-            load_is_st_current,
-            load_listing_dates,
-            load_delist_dates,
-            load_st_history,
-        )
-        sn = stock_names if stock_names is not None else load_stock_names()
-        ist = is_st_current if is_st_current is not None else load_is_st_current()
-        ld = listing_dates if listing_dates is not None else load_listing_dates()
-        dd = delist_dates if delist_dates is not None else load_delist_dates()
-        sth = st_history if st_history is not None else load_st_history()
-        tradable = build_ic_tradability_mask(
+        tradable = tradable_early if tradable_early is not None else _build_tradable_mask(
             prices,
             volume=volume,
             masks=masks,
-            stock_names=sn,
-            listing_dates=ld,
-            delist_dates=dd,
-            is_st_current=ist,
-            st_history=sth,
-            exclude_limit_on_signal=ex_lim,
+            stock_names=stock_names,
+            is_st_current=is_st_current,
+            listing_dates=listing_dates,
+            delist_dates=delist_dates,
+            st_history=st_history,
+            exclude_limit_on_signal=exclude_limit_on_signal,
+            tradable_limit_mode=tradable_limit_mode,
         )
         t = tradable.reindex(
             index=forward_return.index, columns=forward_return.columns,
@@ -905,11 +1197,13 @@ def build_factor_dataset(
         n_dates = em.shape[0]
         logger.info(f"eligible_mask 应用: {int(em.sum().sum())} 个 (date×stock) 有效格 / {n_dates} 日")
 
-    # 标签截面截尾：在 tradable / eligible 置 NaN 之后，分位数只在可交易样本上算
-    if fwd_return_winsor and FWD_RETURN_WINSOR is not None:
-        lo, hi = FWD_RETURN_WINSOR
-        forward_return = winsorize_forward_return(forward_return, lower=lo, upper=hi)
-        logger.info(f"fwd_return_winsor: 截面 [{lo:.0%}, {hi:.0%}] 截尾（与 IC 同函数）")
+    # 标签截面截尾：tradable / eligible 置 NaN 之后；cs_rank 跳过，对其它模式截尾
+    forward_return = _maybe_winsor_forward_return(
+        forward_return,
+        fwd_return_winsor=fwd_return_winsor,
+        label_mode=label_mode,
+        cs_rank_winsor=cs_rank_winsor,
+    )
 
     ds_kwargs = {}
     if rebalance_freq is not None:
@@ -965,7 +1259,7 @@ def run(
     rebuild_factor_cache: bool = False,
     trainer_engine: str = "v2",
     wf_selection: str = "ic_weighted",
-    label_mode: str = "cs_zscore",
+    label_mode: str = LABEL_MODE_DEFAULT,
     ensemble_method: str = "zscore",
     save_models: bool = False,
     objective: str = "regression",
@@ -977,6 +1271,7 @@ def run(
     triple_barrier_params: dict | None = None,
     regime_states: pd.Series | None = None,
     feature_neutralize: bool = False,
+    neut_controls: str = "barra",
     barra_features: bool = False,
     special_factors: str | list | None = None,
     event_overlay: bool = False,
@@ -991,6 +1286,7 @@ def run(
     st_history: pd.DataFrame | None = None,
     apply_tradable_filter: bool = True,
     fwd_return_winsor: bool = True,
+    cs_rank_winsor: bool = False,
     tradable_limit_mode: str | None = None,
     exclude_limit_on_signal: bool | None = None,
     apply_exec_mask: bool | None = None,
@@ -1011,8 +1307,13 @@ def run(
     long_weight_top: float | None = None,
     long_weight_ratio: float = 0.25,
     long_weight_curve: str = "smooth",
+    rank_weight_mid: float = 1.0,
     softlong_floor_slope: float = 0.25,
     retrain_every: int = RETRAIN_EVERY,
+    time_decay: float | None = None,
+    restan_in_universe: bool = False,
+    min_industry_n: int = 0,
+    universe_tag: str = "",
 ) -> tuple[pd.DataFrame, object]:
     """
     训练 ML 策略并返回样本外预测得分。
@@ -1060,6 +1361,7 @@ def run(
         skip_factor_build=skip_factor_build,
         rebuild_factor_cache=rebuild_factor_cache,
         feature_neutralize=feature_neutralize,
+        neut_controls=neut_controls,
         barra_features=barra_features,
         special_factors=special_factors,
         event_overlay=event_overlay,
@@ -1074,6 +1376,8 @@ def run(
         st_history=st_history,
         apply_tradable_filter=apply_tradable_filter,
         fwd_return_winsor=fwd_return_winsor,
+        cs_rank_winsor=cs_rank_winsor,
+        label_mode=label_mode,
         tradable_limit_mode=tradable_limit_mode,
         exclude_limit_on_signal=exclude_limit_on_signal,
         apply_exec_mask=apply_exec_mask,
@@ -1081,6 +1385,9 @@ def run(
         rolling_pool_lazy=rolling_pool_lazy,
         rolling_pool_max_cached=rolling_pool_max_cached,
         rolling_pool_strict=rolling_pool_strict,
+        restan_in_universe=restan_in_universe,
+        min_industry_n=min_industry_n,
+        universe_tag=universe_tag,
     )
     n_feat = len(dataset.feature_names)
     lazy_tag = " [lazy]" if getattr(dataset, "lazy_rolling_pool", False) else ""
@@ -1090,6 +1397,8 @@ def run(
         model_types=model_types,
         rebalance_freq=rebalance_freq or REBALANCE_FREQ,
         train_window_units=train_window_units,
+        feature_neutralize=bool(feature_neutralize),
+        neut_controls=neut_controls,
     )
     if train_windows is not None:
         trainer_kwargs["train_windows"] = train_windows
@@ -1098,6 +1407,8 @@ def run(
     if artifact_dir is not None:
         trainer_kwargs["artifact_dir"] = artifact_dir
     trainer_kwargs["retrain_every"] = int(retrain_every)
+    if time_decay is not None:
+        trainer_kwargs["time_decay"] = float(time_decay)
 
     # Regime-conditional：regime_states 提供时切换到 RegimeConditionalTrainer
     # （子类，与 WalkForwardTrainer 输出格式完全一致；regime_states=None 退化为父类）
@@ -1126,6 +1437,7 @@ def run(
             long_weight_top=long_weight_top,
             long_weight_ratio=long_weight_ratio,
             long_weight_curve=long_weight_curve,
+            rank_weight_mid=rank_weight_mid,
             softlong_floor_slope=softlong_floor_slope,
             **trainer_kwargs,
         )
@@ -1152,6 +1464,7 @@ def run(
             long_weight_top=long_weight_top,
             long_weight_ratio=long_weight_ratio,
             long_weight_curve=long_weight_curve,
+            rank_weight_mid=rank_weight_mid,
             softlong_floor_slope=softlong_floor_slope,
             **trainer_kwargs,
         )
@@ -1190,6 +1503,7 @@ def run(
         meta.setdefault("horizon", hold_period)
         meta.setdefault("pool_frac", float(stage2_pool_frac))
         meta.setdefault("feature_neutralize", bool(feature_neutralize))
+        meta.setdefault("neut_controls", neut_controls)
         meta.setdefault("tag", tag)
         meta.setdefault("model_types", list(model_types))
         _save_s1(

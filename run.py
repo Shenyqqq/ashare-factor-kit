@@ -22,7 +22,7 @@ run.py 启动时会自动 bootstrap UTF-8（config/encoding_bootstrap.py）。
     python run.py --sample 100
     python run.py --help-advanced   # 全部参数（含高级/deprecated）
 
-默认已含: feature-neutralize、bid-ask(settings=10bp)、research tradable、label=cs_zscore。
+默认已含: feature-neutralize、bid-ask(settings=10bp)、research tradable、label=cs_rank。
 详见 docs/CLI_QUICKSTART.md。
 """
 import argparse
@@ -69,19 +69,56 @@ def _resolve_dynamic_lookback(dynamic_lookback: int | None, rebalance_freq: str)
         return dynamic_lookback
     return months_to_rebalance_periods(6, rebalance_freq)
 
-from models.trainer import MODEL_TYPES  # 分行业模式默认模型列表
+from models.trainer import LABEL_MODE_DEFAULT, MODEL_TYPES, TIME_DECAY  # 分行业模式默认模型列表
 
 INDEX_MAP = {"沪深300": "000300", "创业板指": "399006"}
 
 
 def _load_indices() -> dict:
-    """加载沪深300和创业板指收盘价，优先读本地缓存，否则从AKShare拉取。"""
+    """加载沪深300和创业板指收盘价，优先读本地缓存，否则从AKShare拉取。
+
+    增量更新：缓存末日 < BACKTEST_END 时用 ak.index_zh_a_hist 从 last+1 拉到
+    BACKTEST_END，concat + drop_duplicates 后写回 parquet（写前 .bak）。
+    失败 warning 不 raise，保留旧缓存。
+    """
     import akshare as ak
+    import shutil
+
     result = {}
     for name, code in INDEX_MAP.items():
         cache = RAW_DIR / f"index_{code}.parquet"
         if cache.exists():
             s = pd.read_parquet(cache).squeeze()
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+            last = pd.Timestamp(s.index.max())
+            end_ts = pd.Timestamp(BACKTEST_END)
+            if last >= end_ts:
+                result[name] = s.rename(name) if s.name is None else s
+                continue
+            # 增量：从 last+1 拉到 BACKTEST_END
+            start_inc = (last + pd.Timedelta(days=1)).strftime("%Y%m%d")
+            end_inc = end_ts.strftime("%Y%m%d")
+            try:
+                df = ak.index_zh_a_hist(
+                    symbol=code, period="daily",
+                    start_date=start_inc, end_date=end_inc,
+                )
+                df["日期"] = pd.to_datetime(df["日期"])
+                inc = df.set_index("日期")["收盘"].rename(name)
+                merged = pd.concat([s, inc])
+                merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+                merged.name = name
+                try:
+                    shutil.copy2(cache, cache.with_suffix(cache.suffix + ".bak"))
+                except OSError:
+                    pass
+                merged.to_frame().to_parquet(cache)
+                logger.info(f"指数 {name}({code}) 增量更新 {start_inc}~{end_inc}: +{len(inc)} 行 → 末日 {merged.index.max().date()}")
+                result[name] = merged
+            except Exception as e:
+                logger.warning(f"指数 {name}({code}) 增量更新失败: {e}，沿用旧缓存（末日 {last.date()}）")
+                result[name] = s.rename(name) if s.name is None else s
         else:
             try:
                 df = ak.index_zh_a_hist(
@@ -96,7 +133,7 @@ def _load_indices() -> dict:
             except Exception as e:
                 logger.warning(f"指数 {name} 下载失败: {e}，跳过")
                 continue
-        result[name] = s
+            result[name] = s
     return result
 
 
@@ -173,8 +210,11 @@ def _load_data(skip_download, sample):
     # 北向已下线：仍可读 parquet 归档，但不进默认因子/白名单；此处不再加载以省内存
     _margin_raw     = _load_opt("margin_balance.parquet")
     margin          = clean_aux_panel(_margin_raw, name="margin") if _margin_raw is not None else None
-    _moneyflow_raw  = _load_opt("moneyflow_large.parquet")
-    moneyflow       = clean_aux_panel(_moneyflow_raw, name="moneyflow") if _moneyflow_raw is not None else None
+    # moneyflow 已弃用：akshare 东财大单资金流数据不足（全市场限流、单票历史短），
+    # 因子不可用。强制 None 跳过大单净流入/残差因子计算。详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
+    if _load_opt("moneyflow_large.parquet") is not None:
+        logger.warning("moneyflow_large 已弃用（akshare 资金流数据不足），跳过加载；大单净流入/残差因子不计算。")
+    moneyflow       = None
     northbound      = None  # 北向下线：默认不算、不进白名单生成路径（parquet 保留）
     institution = _load_opt("institution_holding.parquet")
     # 日频市值：东财 stock_value_em 主路径；缺则回退自算 *_computed
@@ -197,6 +237,29 @@ def _load_data(skip_download, sample):
     # 所有量价因子必须使用 clean_ret 而非 prices.pct_change()
     logger.info("Step 2b: 涨跌停清洗（生成 clean_ret）")
     clean_ret, masks = clean_ohlcv(prices, open_, high, low)
+
+    # 与 filter_universe 同口径：已落盘宽表仍可能含 B 股 / 8 开头，截面标准化前去掉
+    from data.download import drop_excluded_universe_columns
+
+    prices = drop_excluded_universe_columns(prices, name="prices")
+    prices_raw = drop_excluded_universe_columns(prices_raw)
+    open_ = drop_excluded_universe_columns(open_)
+    high = drop_excluded_universe_columns(high)
+    low = drop_excluded_universe_columns(low)
+    volume = drop_excluded_universe_columns(volume)
+    amount = drop_excluded_universe_columns(amount)
+    clean_ret = drop_excluded_universe_columns(clean_ret)
+    margin = drop_excluded_universe_columns(margin)
+    moneyflow = drop_excluded_universe_columns(moneyflow)
+    institution = drop_excluded_universe_columns(institution)
+    total_mv = drop_excluded_universe_columns(total_mv)
+    circ_mv = drop_excluded_universe_columns(circ_mv)
+    turnover_rate = drop_excluded_universe_columns(turnover_rate)
+    if masks:
+        masks = {
+            k: (drop_excluded_universe_columns(v) if isinstance(v, pd.DataFrame) else v)
+            for k, v in masks.items()
+        }
 
     # --sample N：即使 --skip-download 也截取前 N 只股票（冒烟 / 内存友好）
     if sample and sample > 0:
@@ -288,6 +351,7 @@ def _resolve_output_dir(output_dir: str | Path | None, tag: str) -> Path:
 
 def main(mode="linear", skip_download=False, sample=0,
          show_report=False, horizon=20,
+         hold_period: int | None = None,
          factor_config: str = None, show_holdings: bool = False,
          train_windows: list = None, train_window_units: str = "months",
          val_window: int | None = None,
@@ -300,7 +364,7 @@ def main(mode="linear", skip_download=False, sample=0,
          backtest_engine: str = "v2",
          trainer_engine: str = "v2",
          wf_selection: str = "ic_weighted",
-         label_mode: str = "cs_zscore",
+         label_mode: str = LABEL_MODE_DEFAULT,
          ensemble_method: str = "zscore",
        save_models: bool = False,
        objective: str = "regression",
@@ -315,17 +379,21 @@ def main(mode="linear", skip_download=False, sample=0,
       rank_change_threshold: float = 0.0,
       bid_ask_spread_bps: float | None = None,
       feature_neutralize: bool = False,
+      neut_controls: str = "barra",
       barra_features: bool = False,
       special_factors: str | list | None = None,
       event_overlay: bool = False,
       sparse_from_ic: str | None = None,
       regime_cs: bool = False,
       cap_band: str = "all",
+      mcap_min_yi: float | None = None,
+      mcap_max_yi: float | None = None,
       ridge_drop_regime: bool = False,
       include_regime: bool = False,
       position_regime: bool = False,
       force_exposure: float | None = None,
       fwd_return_winsor: bool = True,
+      cs_rank_winsor: bool = False,
       top_n: int | None = None,
       portfolio_opt: str = "ew",
       max_weight: float | None = None,
@@ -347,8 +415,10 @@ def main(mode="linear", skip_download=False, sample=0,
       long_weight_top: float | None = None,
       long_weight_ratio: float = 0.25,
       long_weight_curve: str = "smooth",
+      rank_weight_mid: float = 1.0,
       softlong_floor_slope: float = 0.25,
       retrain_every: int = RETRAIN_EVERY,
+      time_decay: float = TIME_DECAY,
       tradable_limit_mode: str | None = None,
       exclude_limit_on_signal: bool | None = None,
       apply_exec_mask: bool | None = None,
@@ -362,6 +432,9 @@ def main(mode="linear", skip_download=False, sample=0,
 
     rebalance_freq = _horizon_to_rebalance_freq(horizon)
     bt_freq = backtest_freq or rebalance_freq
+    # --hold-period / --label-horizon: 只改标签窗口与回测出场，不改调仓日历
+    # （--horizon 5 仍为 W-FRI；勿把 --horizon 改成 3 否则会变成 3D）。
+    label_hold = int(hold_period) if hold_period is not None else int(horizon)
     win_tag = ("_w" + "-".join(str(w) for w in train_windows)) if train_windows else ""
     units_tag = "_p" if train_window_units == "periods" else ""
     bt_tag = f"_bt{bt_freq.replace('-', '')}" if backtest_freq else ""
@@ -375,6 +448,11 @@ def main(mode="linear", skip_download=False, sample=0,
         f"_rc{rank_change_threshold}" if rank_change_threshold > 0.0 else ""
     )
     cap_tag = f"_{cap_band}" if cap_band and cap_band != "all" else ""
+    mcap_tag = ""
+    if mcap_min_yi is not None or mcap_max_yi is not None:
+        _lo = int(mcap_min_yi) if mcap_min_yi is not None else 0
+        _hi = int(mcap_max_yi) if mcap_max_yi is not None else 0
+        mcap_tag = f"_mcap{_lo}_{_hi}"
     barra_feat_tag = "_barrafeat" if barra_features else ""
     from factors.special_factors import resolve_special_factors
     sf_req = resolve_special_factors(
@@ -416,23 +494,32 @@ def main(mode="linear", skip_download=False, sample=0,
             f"_lw{int(round(float(long_weight_top) * 100))}"
             f"{_curve_ch}{int(round(float(long_weight_ratio) * 100)):03d}"
         )
+    tailw_tag = ""
+    if float(rank_weight_mid) < 1.0 - 1e-12:
+        tailw_tag = f"_tailw{int(round(float(rank_weight_mid) * 100)):02d}"
     softlong_tag = (
         f"_sl{int(round(float(softlong_floor_slope) * 100))}"
         if label_mode == "cs_rank_softlong" else ""
     )
     rt_tag = f"_rt{int(retrain_every)}" if int(retrain_every) > 1 else ""
+    hp_tag = f"_hp{label_hold}" if hold_period is not None else ""
     tag = (
         f"{mode}_h{horizon}{win_tag}{units_tag}{bt_tag}{mdl_tag}{dyn_tag}{dyn_lb_tag}"
-        f"{mh_tag}{mh_w_tag}{reg_tag}{to_tag}{cap_tag}{barra_feat_tag}"
+        f"{mh_tag}{mh_w_tag}{reg_tag}{to_tag}{cap_tag}{mcap_tag}{barra_feat_tag}"
         f"{special_tag}{posreg_tag}{opt_tag}{twostage_tag}{rp_tag}"
-        f"{lw_tag}{softlong_tag}{rt_tag}"
+        f"{lw_tag}{tailw_tag}{softlong_tag}{rt_tag}{hp_tag}"
     )
     out_dir = _resolve_output_dir(output_dir, tag)
     add_utf8_file_sink(out_dir / "run.log")
     logger.info(
-        f"模式={mode}, 持仓期={horizon}日, ML调仓={rebalance_freq}, "
+        f"模式={mode}, 持仓期={label_hold}日, ML调仓={rebalance_freq}, "
         f"回测调仓={bt_freq}, 训练窗单位={train_window_units}, 输出={out_dir}"
     )
+    if hold_period is not None:
+        logger.info(
+            f"hold_period={label_hold}: 标签/回测出场=close[t+{label_hold}]/"
+            f"open[t+1]（调仓日历仍 {rebalance_freq}，由 --horizon {horizon} 推断）"
+        )
     if multi_horizon:
         logger.info(
             f"Multi-Horizon: horizons={multi_horizon}, weights={mh_weights}"
@@ -576,6 +663,62 @@ def main(mode="linear", skip_download=False, sample=0,
     except Exception as e:
         logger.warning(f"universe meta 加载失败（build_factor_dataset 将自动回退加载）: {e}")
 
+    restan_in_universe = False
+    min_industry_n = 0
+    universe_tag = ""
+    if mcap_min_yi is not None or mcap_max_yi is not None:
+        if (
+            mcap_min_yi is not None
+            and mcap_max_yi is not None
+            and float(mcap_min_yi) >= float(mcap_max_yi)
+        ):
+            raise ValueError("--mcap-min-yi 必须 < --mcap-max-yi")
+        if circ_mv is None and total_mv is None:
+            raise ValueError(
+                "--mcap-min-yi/--mcap-max-yi 需要 circ_mv 或 total_mv"
+                "（请先 python -m data.download_stock_value_em）"
+            )
+        from research.ic.universe import build_ic_tradability_mask
+        from utils.universe import build_mcap_yi_band_mask
+
+        mcap_mask = build_mcap_yi_band_mask(
+            circ_mv, min_yi=mcap_min_yi, max_yi=mcap_max_yi, total_mv=total_mv,
+        )
+        eligible_mask = build_ic_tradability_mask(
+            prices,
+            volume=volume,
+            masks=masks,
+            stock_names=tradable_kwargs.get("stock_names"),
+            listing_dates=tradable_kwargs.get("listing_dates"),
+            delist_dates=tradable_kwargs.get("delist_dates"),
+            is_st_current=tradable_kwargs.get("is_st_current"),
+            st_history=tradable_kwargs.get("st_history"),
+            small_cap_mask=mcap_mask,
+            exclude_limit_on_signal=exclude_limit_on_signal,
+            tradable_limit_mode=tradable_limit_mode,
+        )
+        restan_in_universe = True
+        min_industry_n = 10
+        lo = int(mcap_min_yi) if mcap_min_yi is not None else 0
+        hi = int(mcap_max_yi) if mcap_max_yi is not None else 0
+        universe_tag = f"mcap{lo}_{hi}"
+        per = eligible_mask.sum(axis=1)
+        logger.info(
+            f"mcap-yi-band [{lo}, {hi}] 亿 ∩ 可交易: 日均 {int(per.mean())} 只 "
+            f"(min={int(per.min())} max={int(per.max())})；"
+            f"档内 restan + membership WLS universe_tag={universe_tag}"
+        )
+        if cap_band and cap_band != "all":
+            logger.warning(
+                f"--mcap-min-yi/--mcap-max-yi 优先于 --cap-band={cap_band}（已忽略 cap-band）"
+            )
+
+    midcap_ds_kwargs = dict(
+        restan_in_universe=restan_in_universe,
+        min_industry_n=min_industry_n,
+        universe_tag=universe_tag,
+    )
+
     # 共享的额外数据关键字参数（传给 get_factor_registry）
     # circ_mv / total_mv：市值 alpha（对数市值/分位/风格对齐）与 cap-band 共用
     extra_kwargs = dict(
@@ -606,20 +749,23 @@ def main(mode="linear", skip_download=False, sample=0,
         win_periods, val_periods = resolve_train_windows(
             tune_windows, val_window_months, rebalance_freq, units="months")
         ds = build_factor_dataset(
-            prices, financial, hold_period=horizon,
+            prices, financial, hold_period=label_hold,
             factor_whitelist=factor_whitelist,
             rebalance_freq=rebalance_freq,
             eligible_mask=eligible_mask,
             special_factors=sf_pass,
             regime_cs=False,
             fwd_return_winsor=fwd_return_winsor,
-            **tradable_kwargs, **extra_kwargs, **cache_kwargs,
+            cs_rank_winsor=cs_rank_winsor,
+            label_mode=label_mode,
+            **tradable_kwargs, **extra_kwargs, **cache_kwargs, **midcap_ds_kwargs,
         )
         best = tune_all_models(
             tune_models, ds,
             train_windows=win_periods, val_window=val_periods,
-            hold_period=horizon, n_trials=tune_trials,
+            hold_period=label_hold, n_trials=tune_trials,
             label_mode=label_mode,
+            time_decay=time_decay,
         )
         out = save_tuned_params(best)
         logger.info(f"超参搜索完成，结果存 {out}")
@@ -683,7 +829,7 @@ def main(mode="linear", skip_download=False, sample=0,
             weights=mh_weights,
             prices=prices, financial=financial,
             extra_kwargs={
-                **extra_kwargs, **tradable_kwargs,
+                **extra_kwargs, **tradable_kwargs, **midcap_ds_kwargs,
                 "special_factors": sf_pass,
                 "regime_cs": False,
                 "include_regime": False,
@@ -737,25 +883,28 @@ def main(mode="linear", skip_download=False, sample=0,
         else:
             model_types = list(MODEL_TYPES)
         logger.info(
-            f"Step 3: 分行业ML策略（申万二级，模型={model_types}，horizon={horizon}日）"
+            f"Step 3: 分行业ML策略（申万二级，模型={model_types}，horizon={horizon}日，"
+            f"hold={label_hold}日）"
         )
         from strategies.ml import build_factor_dataset
         from models.industry_trainer import IndustryWalkForwardTrainer
         dataset = build_factor_dataset(
-            prices, financial, hold_period=horizon,
+            prices, financial, hold_period=label_hold,
             factor_whitelist=factor_whitelist,
             rebalance_freq=rebalance_freq,
             eligible_mask=eligible_mask,
             special_factors=sf_pass,
             regime_cs=False,
             fwd_return_winsor=fwd_return_winsor,
-            **tradable_kwargs, **extra_kwargs, **cache_kwargs,
+            cs_rank_winsor=cs_rank_winsor,
+            label_mode=label_mode,
+            **tradable_kwargs, **extra_kwargs, **cache_kwargs, **midcap_ds_kwargs,
         )
         ind_kwargs = dict(
             model_types    = model_types,
             train_windows  = train_windows,
             rebalance_freq = rebalance_freq,
-            hold_period    = horizon,
+            hold_period    = label_hold,
             label_mode     = label_mode,
             wf_selection   = wf_selection,
             ensemble_method= ensemble_method,
@@ -779,7 +928,7 @@ def main(mode="linear", skip_download=False, sample=0,
             model_types = list(ML_MODES - {"ensemble"}) if mode == "ensemble" else [mode]
         logger.info(
             f"Step 3: ML 策略（{mode}，模型={model_types}，horizon={horizon}日，"
-            f"trainer={trainer_engine}）"
+            f"hold={label_hold}日，trainer={trainer_engine}）"
         )
         from strategies.ml import run as ml_run
 
@@ -799,7 +948,15 @@ def main(mode="linear", skip_download=False, sample=0,
             if label_mode == "barra_residual":
                 logger.info("label_mode=barra_residual: 计算 Barra 风格因子用于标签残差化...")
             if feature_neutralize:
-                logger.info("feature_neutralize=True: 计算 Barra 风格因子用于特征残差化...")
+                from models.wf.labels import NEUT_CONTROLS_SIZE_INDUSTRY, normalize_neut_controls
+                _nc = normalize_neut_controls(neut_controls)
+                if _nc == NEUT_CONTROLS_SIZE_INDUSTRY:
+                    logger.info(
+                        "feature_neutralize=True neut_controls=size_industry: "
+                        "计算 Barra 风格因子后仅用 Size+行业残差化..."
+                    )
+                else:
+                    logger.info("feature_neutralize=True: 计算 Barra 风格因子用于特征残差化...")
             if barra_features:
                 logger.info("barra_features=True: 计算 Barra 风格因子作为 ML 输入特征...")
             barra_factors_arg = get_barra_factors(
@@ -824,9 +981,11 @@ def main(mode="linear", skip_download=False, sample=0,
         from models.wf.stage1_cache import hash_file
         stage1_meta = {
             "horizon": horizon,
+            "hold_period": label_hold,
             "factor_config": factor_config,
             "factor_config_hash": hash_file(factor_config),
             "feature_neutralize": bool(feature_neutralize),
+            "neut_controls": neut_controls,
             "sparse_from_ic": sparse_from_ic,
             "special_factors": sf_pass,
             "pool_frac": float(stage2_pool_frac),
@@ -837,7 +996,7 @@ def main(mode="linear", skip_download=False, sample=0,
         factor_scores, trainer = ml_run(
             prices, financial,
             model_types=model_types,
-            hold_period=horizon,
+            hold_period=label_hold,
             show_report=show_report,
             factor_whitelist=factor_whitelist,
             train_windows=train_windows,
@@ -860,6 +1019,7 @@ def main(mode="linear", skip_download=False, sample=0,
             triple_barrier_params=triple_barrier_params,
             regime_states=regime_states_arg,
             feature_neutralize=feature_neutralize,
+            neut_controls=neut_controls,
             barra_features=barra_features,
             special_factors=sf_pass,
             regime_cs=False,
@@ -867,6 +1027,7 @@ def main(mode="linear", skip_download=False, sample=0,
             ridge_drop_regime=False,
             include_regime=False,
             fwd_return_winsor=fwd_return_winsor,
+            cs_rank_winsor=cs_rank_winsor,
             two_stage=two_stage,
             stage2_pool_frac=stage2_pool_frac,
             stage2_lookback=stage2_lookback,
@@ -884,9 +1045,11 @@ def main(mode="linear", skip_download=False, sample=0,
             long_weight_top=long_weight_top,
             long_weight_ratio=long_weight_ratio,
             long_weight_curve=long_weight_curve,
+            rank_weight_mid=rank_weight_mid,
             softlong_floor_slope=softlong_floor_slope,
             retrain_every=retrain_every,
-            **tradable_kwargs, **ml_extra_kwargs, **cache_kwargs,
+            time_decay=time_decay,
+            **tradable_kwargs, **ml_extra_kwargs, **cache_kwargs, **midcap_ds_kwargs,
         )
         if hasattr(trainer, "save_metrics"):
             trainer.save_metrics(tag, output_dir=out_dir)
@@ -914,18 +1077,21 @@ def main(mode="linear", skip_download=False, sample=0,
             # dynamic 轨道：用正交集 + Barra 残差化（与 IC 阶段同口径）
             # 禁止 special/sparse 注入（与 --mode dynamic 一致）
             dyn_dataset = build_factor_dataset(
-                prices, financial, hold_period=horizon,
+                prices, financial, hold_period=label_hold,
                 factor_whitelist=factor_whitelist_orth or factor_whitelist,
                 rebalance_freq=rebalance_freq,
                 eligible_mask=eligible_mask,
                 feature_neutralize=feature_neutralize,
+                neut_controls=neut_controls,
                 special_factors=None,
                 deny_special_inject=True,
                 regime_cs=False,
                 barra_factors=barra_factors_arg,
                 fwd_return_winsor=fwd_return_winsor,
+                cs_rank_winsor=cs_rank_winsor,
+                label_mode=label_mode,
                 include_regime=False,
-                **tradable_kwargs, **extra_kwargs, **cache_kwargs,
+                **tradable_kwargs, **extra_kwargs, **cache_kwargs, **midcap_ds_kwargs,
             )
             dyn_lb = _resolve_dynamic_lookback(dynamic_lookback, rebalance_freq)
             dyn_trainer = DynamicFactorTrainer(
@@ -943,7 +1109,8 @@ def main(mode="linear", skip_download=False, sample=0,
     elif mode == "dynamic":
         dyn_lb = _resolve_dynamic_lookback(dynamic_lookback, rebalance_freq)
         logger.info(
-            f"Step 3: 因子动态加权策略（ICIR 权重，lookback={dyn_lb}期，horizon={horizon}日）"
+            f"Step 3: 因子动态加权策略（ICIR 权重，lookback={dyn_lb}期，horizon={horizon}日，"
+            f"hold={label_hold}日）"
         )
         from strategies.ml import build_factor_dataset
         from models.dynamic_trainer import DynamicFactorTrainer
@@ -973,18 +1140,21 @@ def main(mode="linear", skip_download=False, sample=0,
             )
             logger.info(f"Barra 因子就绪: {len(barra_factors_arg)} 个")
         dataset = build_factor_dataset(
-            prices, financial, hold_period=horizon,
+            prices, financial, hold_period=label_hold,
             factor_whitelist=factor_whitelist_orth or factor_whitelist,
             rebalance_freq=rebalance_freq,
             eligible_mask=eligible_mask,
             feature_neutralize=feature_neutralize,
+            neut_controls=neut_controls,
             special_factors=None,
             deny_special_inject=True,
             regime_cs=False,
             barra_factors=barra_factors_arg,
             fwd_return_winsor=fwd_return_winsor,
+            cs_rank_winsor=cs_rank_winsor,
+            label_mode=label_mode,
             include_regime=False,
-            **tradable_kwargs, **extra_kwargs, **cache_kwargs,
+            **tradable_kwargs, **extra_kwargs, **cache_kwargs, **midcap_ds_kwargs,
         )
         trainer = DynamicFactorTrainer(
             lookback=dyn_lb, min_lookback=max(3, dyn_lb // 2), method="icir",
@@ -1127,7 +1297,7 @@ def main(mode="linear", skip_download=False, sample=0,
         factor_scores,
         prices,
         open_=open_,
-        hold_period=int(horizon),
+        hold_period=int(label_hold),
         volume=volume,
         masks=masks,
         stock_names=stock_names_ser,
@@ -1190,11 +1360,12 @@ def main(mode="linear", skip_download=False, sample=0,
         top_n=top_n_eff,
         position_regime=pos_regime_df,
         returns=clean_ret,
+        hold_period=int(label_hold) if hold_period is not None else None,
     )
     print_quantile_summary(result, rebalance_freq=bt_freq, rf=RISK_FREE_RATE)
     plot_quantile_result(
         result,
-        title=f"Q1-Q5 分组回测  |  mode={mode}  horizon={horizon}日",
+        title=f"Q1-Q5 分组回测  |  mode={mode}  horizon={horizon}日 hold={label_hold}日",
         save_path=str(out_dir / f"backtest_{tag}.png"),
         rebalance_freq=bt_freq,
         rf=RISK_FREE_RATE,
@@ -1236,7 +1407,7 @@ if __name__ == "__main__":
             "日常最短: python run.py --skip-download --mode ridge --horizon 5 "
             "--factor-config config/factor_configs.yaml\n"
             "默认已含: feature-neutralize / bid-ask(settings) / research tradable / "
-            "label=cs_zscore。全部参数: --help-advanced 或 docs/CLI_QUICKSTART.md"
+            "label=cs_rank。全部参数: --help-advanced 或 docs/CLI_QUICKSTART.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1250,7 +1421,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--horizon", type=int, default=20,
-        help="持仓期（交易日）: 5=周频 10=双周 20=月频(默认) 60=季频",
+        help="调仓频率锚点（交易日）: 5=周频 10=双周 20=月频(默认) 60=季频；"
+             "标签/回测持有默认同此，可用 --hold-period 覆盖",
     )
     parser.add_argument("--skip-download", action="store_true", help="跳过数据下载")
     parser.add_argument("--sample", type=int, default=0, help="仅前 N 只股票（调试）")
@@ -1304,6 +1476,23 @@ if __name__ == "__main__":
             "micro_30/micro_lt30: circ_mv∈(0,30亿]、无8亿地板，20d均额≥2000万；"
             "勿与 micro(8~30亿) 混淆"
         ),
+    )
+    parser.add_argument(
+        "--mcap-min-yi",
+        type=float,
+        default=None,
+        dest="mcap_min_yi",
+        help=(
+            "流通市值下限（亿元，含；单位元=亿×1e8）。与 --mcap-max-yi 构成每日宇宙，"
+            "无 20 日成交额过滤；档内 restan + membership WLS（与 research.midcap_ic 同口径）"
+        ),
+    )
+    parser.add_argument(
+        "--mcap-max-yi",
+        type=float,
+        default=None,
+        dest="mcap_max_yi",
+        help="流通市值上限（亿元，含）。例: --mcap-min-yi 30 --mcap-max-yi 100",
     )
 
     # ── 高级（默认 --help 隐藏）──────────────────────────────────────────
@@ -1367,8 +1556,29 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--time-decay",
+        type=float,
+        default=TIME_DECAY,
+        dest="time_decay",
+        help=_h(
+            f"训练样本指数时间衰减（默认 {TIME_DECAY}，与历史实验一致；"
+            "0=窗内等权，仍保留 universe 归一化与 overlap 权重）",
+            advanced=True,
+        ),
+    )
+    parser.add_argument(
         "--backtest-freq", default=None,
         help=_h("回测调仓频率覆盖（如 ME）；用于复现训练/回测频率错位", advanced=True),
+    )
+    parser.add_argument(
+        "--hold-period", "--label-horizon",
+        type=int, default=None, dest="hold_period",
+        help=_h(
+            "标签与回测持有交易日（如 3=close[t+3]/open[t+1]）。"
+            "不改 --horizon 推断的调仓日历（W-FRI 等）；默认=--horizon。"
+            "embargo/purge 按此换算",
+            advanced=True,
+        ),
     )
     parser.add_argument(
         "--top-n", type=int, default=None,
@@ -1396,12 +1606,12 @@ if __name__ == "__main__":
         help=_h("多窗口/模型验证 IC 加权方式（默认 ic_weighted）", advanced=True),
     )
     parser.add_argument(
-        "--label-mode", default="cs_zscore",
+        "--label-mode", default=LABEL_MODE_DEFAULT,
         choices=[
             "raw", "cs_rank", "cs_zscore", "top40_cs_zscore",
             "cs_rank_softlong", "triple_barrier", "barra_residual",
         ],
-        help=_h("训练标签截面标准化（默认 cs_zscore）", advanced=True),
+        help=_h("训练标签截面标准化（默认 cs_rank）", advanced=True),
     )
     parser.add_argument(
         "--long-weight-top", type=float, default=None,
@@ -1414,6 +1624,23 @@ if __name__ == "__main__":
     parser.add_argument(
         "--long-weight-curve", default="smooth", choices=["smooth", "step"],
         help=_h("多头偏置权重曲线：smooth|step", advanced=True),
+    )
+    parser.add_argument(
+        "--rank-weight-mid",
+        type=float,
+        default=1.0,
+        dest="rank_weight_mid",
+        help=_h(
+            "截面分位 U 形 sample_weight 的中间权重（默认 1.0=关闭；"
+            "0.6=中间 0.6、两端 1.0，乘到 time-decay/universe/overlap 上）",
+            advanced=True,
+        ),
+    )
+    parser.add_argument(
+        "--rank-tail-weight",
+        action="store_true",
+        dest="rank_tail_weight",
+        help=_h("开启两端加权（等价 --rank-weight-mid 0.6）", advanced=True),
     )
     parser.add_argument(
         "--softlong-floor-slope", type=float, default=0.25,
@@ -1493,7 +1720,20 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=True,
         help=_h(
-            "ML/dynamic 特征 Barra+行业残差化（默认开；--no-feature-neutralize 关）",
+            "ML/dynamic 特征残差化（默认开；--no-feature-neutralize 关）。"
+            "控制变量集合见 --neut-controls",
+            advanced=True,
+        ),
+    )
+    parser.add_argument(
+        "--neut-controls",
+        dest="neut_controls",
+        choices=("barra", "size_industry", "size"),
+        default="barra",
+        help=_h(
+            "feature-neutralize 控制变量：barra=9风格+行业（默认）；"
+            "size_industry=仅 log(流通市值)+PIT行业哑变量；"
+            "size=仅 Size（无行业）；WLS 仍√市值",
             advanced=True,
         ),
     )
@@ -1502,7 +1742,14 @@ if __name__ == "__main__":
         dest="fwd_return_winsor",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help=_h("forward_return 截面 1%/99% 截尾（默认开）", advanced=True),
+        help=_h("forward_return 截面 1%/99% 截尾（默认开；cs_rank 仍默认跳过）", advanced=True),
+    )
+    parser.add_argument(
+        "--cs-rank-winsor",
+        dest="cs_rank_winsor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=_h("cs_rank 先截面 winsor 再 rank（默认关；消融用）", advanced=True),
     )
     parser.add_argument(
         "--tradable-strict",
@@ -1683,6 +1930,7 @@ if __name__ == "__main__":
         sample=args.sample,
         show_report=args.report,
         horizon=args.horizon,
+        hold_period=args.hold_period,
         factor_config=args.factor_config,
         show_holdings=args.holdings,
         train_windows=train_windows,
@@ -1703,8 +1951,13 @@ if __name__ == "__main__":
         long_weight_top=args.long_weight_top,
         long_weight_ratio=args.long_weight_ratio,
         long_weight_curve=args.long_weight_curve,
+        rank_weight_mid=(
+            0.6 if args.rank_tail_weight and abs(float(args.rank_weight_mid) - 1.0) < 1e-12
+            else float(args.rank_weight_mid)
+        ),
         softlong_floor_slope=args.softlong_floor_slope,
         retrain_every=args.retrain_every,
+        time_decay=args.time_decay,
         ensemble_method=args.ensemble_method,
         save_models=args.save_models,
         objective=args.objective,
@@ -1724,7 +1977,10 @@ if __name__ == "__main__":
         rank_change_threshold=args.rank_change_threshold,
         bid_ask_spread_bps=args.bid_ask_spread,
         feature_neutralize=args.feature_neutralize,
+        neut_controls=args.neut_controls,
         cap_band=args.cap_band,
+        mcap_min_yi=args.mcap_min_yi,
+        mcap_max_yi=args.mcap_max_yi,
         barra_features=args.barra_features,
         special_factors=args.special_factors,
         event_overlay=args.event_overlay,
@@ -1735,6 +1991,7 @@ if __name__ == "__main__":
         position_regime=args.position_regime,
         force_exposure=args.force_exposure,
         fwd_return_winsor=args.fwd_return_winsor,
+        cs_rank_winsor=args.cs_rank_winsor,
         tradable_limit_mode=args.tradable_limit_mode,
         exclude_limit_on_signal=exclude_limit,
         apply_exec_mask=apply_exec,

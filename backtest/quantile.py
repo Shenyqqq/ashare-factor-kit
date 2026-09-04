@@ -7,7 +7,9 @@ backtest/quantile.py — 分组回测（Q1-Q5）模块化引擎（原 quantile_v
   signal_date       — 周期末收盘后观察因子得分
   execution_date    — T+1 开盘买入（传入 open_prices 时）
   next_signal_date  — 下一调仓信号
-  hold window       — [execution_date, next_signal_date]
+  hold window       — 默认 [execution_date, next_signal_date]；
+                      传入 hold_period 时改为 [execution_date, t+N 收盘]
+                      （与标签 close[t+N]/open[t+1] 对齐）
 
 执行模型（贴近实盘）：
   • 真实 buy-and-hold：每股 NAV 从 exec-open 起，组合 = Σ w×stock_NAV
@@ -87,6 +89,7 @@ def run_quantile_backtest(
     position_regime: pd.DataFrame | None = None,
     position_exposure: pd.Series | None = None,
     returns: pd.DataFrame | None = None,
+    hold_period: int | None = None,
 ) -> QuantileResult:
     """
     Run Q1-Q5 + Top-N quantile backtest.
@@ -108,6 +111,9 @@ def run_quantile_backtest(
     position_exposure : 可选，调仓日 → 敞口标量；优先于从 regime 表按日查找。
     returns : 可选日频收益面板（优先 ``clean_ret``），供 ``mv``/``invvol``/``rp``
         估计 Σ/σ；None 时由 ``prices.pct_change()`` 推导。
+    hold_period : 可选。标签持有交易日数。传入后持有窗在 ``close[t+N]``
+        收盘结束（周一开→周三收 = 3），不再拿到下一信号日。None 保持
+        ``[execution_date, next_signal_date]``（默认，与历史实验一致）。
     """
     if factor_scores.empty or not isinstance(factor_scores.index, pd.DatetimeIndex):
         raise ValueError(
@@ -189,7 +195,10 @@ def run_quantile_backtest(
         if execution_date is None:
             continue
 
-        hold_dates = hold_dates_between(prices_a.index, execution_date, next_signal_date)
+        hold_dates = hold_dates_between(
+            prices_a.index, execution_date, next_signal_date,
+            signal_date=signal_date, hold_period=hold_period,
+        )
         if len(hold_dates) == 0:
             continue
 
@@ -333,7 +342,10 @@ def run_quantile_backtest(
         for idx_name, idx_price in indices.items():
             idx_rets = []
             for signal_date, next_signal_date, exec_d in period_meta:
-                hdates = hold_dates_between(prices_a.index, exec_d, next_signal_date)
+                hdates = hold_dates_between(
+                    prices_a.index, exec_d, next_signal_date,
+                    signal_date=signal_date, hold_period=hold_period,
+                )
                 idx_rets.append(index_period_return(idx_price, hdates, exec_d))
             period_rets[idx_name] = idx_rets
 

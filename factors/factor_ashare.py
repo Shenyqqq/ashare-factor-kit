@@ -176,7 +176,10 @@ def _safe_normalize(panel: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. 大单残差净流入
+# 1. 大单残差净流入 — 【已弃用 / DEPRECATED】
+# 弃用：依赖东财 moneyflow_large，akshare 全市场拉不稳、单票历史短，因子不可用。
+# 勿再进入 IC / 生产池。保留实现供 Tushare DC 接入后复活。
+# 详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
 # ══════════════════════════════════════════════════════════════════════════════
 
 def factor_moneyflow_residual(
@@ -188,7 +191,9 @@ def factor_moneyflow_residual(
     window: int = 5,
 ) -> pd.DataFrame:
     """
-    大单残差净流入_5d：先算净流入/成交额滚动均值，再对当日收益与换手截面回归取残差。
+    [DEPRECATED] 大单残差净流入_5d：先算净流入/成交额滚动均值，再对当日收益与换手截面回归取残差。
+
+    弃用：akshare 资金流数据不足，因子不可用。勿再进入 IC / 生产池。
 
     开源证券口径近似：剔除「跟涨/跟换手」的被动资金流，保留主动残差。
     缺 amount/ret/turnover 时降级为标准化净流入（仍可用）。

@@ -1,0 +1,19 @@
+{
+  "horizon": 5,
+  "note": "user-selected sparse ablation whitelist 20260814; not IC-gated; LHB only the three named columns",
+  "factors_sparse": [
+    "龙虎榜换手上榜_20d",
+    "龙虎榜连续上榜",
+    "龙虎榜上榜次数_20d",
+    "解禁定增压力_60d",
+    "大宗机构接盘_20d",
+    "大宗交易频次_20d",
+    "涨跌停净强度_20d",
+    "连板数",
+    "涨跌停状态",
+    "未来60日解禁市值占比",
+    "高管净增持额_60d",
+    "高管减持次数_60d",
+    "股份回购强度_60d"
+  ]
+}

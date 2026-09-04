@@ -45,7 +45,7 @@ python -m data.download_delisted
 
 | 入口 | 默认 |
 |------|------|
-| `run.py` | `--feature-neutralize`、`BID_ASK_SPREAD_BPS=10`、research tradable、`--label-mode cs_zscore`、`--bt-score-universe strict`、`--retrain-every 4`（周频≈月度重训；每期用 `1`） |
+| `run.py` | `--feature-neutralize`、`BID_ASK_SPREAD_BPS=10`、research tradable、`--label-mode cs_rank`、`--bt-score-universe strict`、`--retrain-every 4`（周频≈月度重训；每期用 `1`） |
 | `ic_analysis_v2` | `--use-fdr`、`--t-threshold 2.5`、`--corr-dedup`、decay/emerging/sparse 标注轨；`--gram-schmidt` 默认 OFF |
 
 关闭示例：`--no-feature-neutralize`、`--no-use-fdr`、`--no-corr-dedup`。GS 显式开：`--gram-schmidt`。

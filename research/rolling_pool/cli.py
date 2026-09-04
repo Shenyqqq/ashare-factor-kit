@@ -17,16 +17,38 @@ from research.rolling_pool.io import (
 )
 from research.rolling_pool.schedule import PoolParams, build_pool_schedule
 
+# 周频调仓：1y≈52 期，2y≈104 期（与 --train-windows 104 对齐）
+_LOOKBACK_WEEKS = {
+    "1y": 52,
+    "1": 52,
+    "52": 52,
+    "52w": 52,
+    "2y": 104,
+    "2": 104,
+    "104": 104,
+    "104w": 104,
+}
+
+
+def _parse_lookback(value: str) -> int:
+    key = (value or "").strip().lower()
+    if key not in _LOOKBACK_WEEKS:
+        raise argparse.ArgumentTypeError(
+            f"--lookback 仅支持 1y/2y（或 52/104），收到 {value!r}"
+        )
+    return _LOOKBACK_WEEKS[key]
+
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="周频 Barra pure IC 轮动定池 → schedule 长表",
+        description="周频 pure IC 轮动定池 → schedule 长表（默认 1 年窗；2 年请显式 --lookback 2y）",
     )
     p.add_argument(
         "--ckpt",
         type=str,
         default=str(DEFAULT_CKPT),
-        help="barra_pure checkpoint（默认 research/output/_checkpoints/barra_pure_h5.pkl）",
+        help="pure-IC checkpoint（默认 research/output/_checkpoints/barra_pure_h5.pkl；"
+             "size_industry 请传 barra_pure_h5_nc_size_industry_tmr_v2.pkl）",
     )
     p.add_argument("--horizon", type=int, default=5, help="输出文件名 h{N} 标签（默认 5）")
     p.add_argument(
@@ -35,7 +57,19 @@ def build_argparser() -> argparse.ArgumentParser:
         default="",
         help="输出前缀（默认 research/output/rolling_pool_schedule_h{horizon}）",
     )
-    p.add_argument("--window", type=int, default=52)
+    p.add_argument(
+        "--window",
+        type=int,
+        default=52,
+        help="回看周数（默认 52=近一年）。两年请用 --lookback 2y 或 --window 104",
+    )
+    p.add_argument(
+        "--lookback",
+        type=_parse_lookback,
+        default=None,
+        metavar="1y|2y",
+        help="便利别名：1y=52 周，2y=104 周；若传入则覆盖 --window。不传则保持一年窗",
+    )
     p.add_argument("--abs-mean-min", type=float, default=0.015)
     p.add_argument("--abs-icir-min", type=float, default=0.3)
     p.add_argument("--min-periods", type=int, default=52)
@@ -68,6 +102,11 @@ def build_argparser() -> argparse.ArgumentParser:
         help="只跑前 5 个决策日（冒烟）",
     )
     p.add_argument("--progress-every", type=int, default=25)
+    p.add_argument(
+        "--dense-only",
+        action="store_true",
+        help="从 IC 宇宙剔除稀疏因子（默认混轨；冻结池 dense/sparse 分轨时用此对齐 dense）",
+    )
     return p
 
 
@@ -75,11 +114,27 @@ def main(argv: list[str] | None = None) -> int:
     args = build_argparser().parse_args(argv)
     t0 = time.perf_counter()
 
+    if args.lookback is not None:
+        if int(args.window) != 52 and int(args.window) != int(args.lookback):
+            print(
+                f"  [rolling_pool] --lookback={args.lookback} 覆盖 --window={args.window}"
+            )
+        args.window = int(args.lookback)
+
     print("=" * 60)
     print("[rolling_pool] load pure IC")
     print(f"  ckpt: {args.ckpt}")
     ic_dict = load_barra_pure_ic(args.ckpt)
     print(f"  n_factors={len(ic_dict)}")
+    if args.dense_only:
+        from factors.sparse_factors import partition_sparse
+
+        dense_names, sparse_names = partition_sparse(list(ic_dict))
+        ic_dict = {n: ic_dict[n] for n in dense_names if n in ic_dict}
+        print(
+            f"  dense-only: drop_sparse={len(sparse_names)} "
+            f"remain={len(ic_dict)}"
+        )
 
     params = PoolParams(
         window=args.window,
@@ -132,6 +187,9 @@ def main(argv: list[str] | None = None) -> int:
         cs_provider=cs_provider,
         progress_every=args.progress_every,
     )
+    meta["ckpt"] = str(args.ckpt)
+    meta["dense_only"] = bool(args.dense_only)
+    meta["lookback_weeks"] = int(args.window)
 
     out_prefix = args.out_prefix or str(
         OUTPUT_DIR / f"rolling_pool_schedule_h{args.horizon}"

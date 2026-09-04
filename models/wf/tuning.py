@@ -26,6 +26,8 @@ from pathlib import Path
 import numpy as np
 import optuna
 
+from models.trainer import LABEL_MODE_DEFAULT, TIME_DECAY
+
 from models.wf.metrics import spearman_ic
 from models.wf.splits import (
     embargo_train_end,
@@ -176,7 +178,10 @@ def tune_one_model(model_type: str,
 
 # ── 数据集 → 单折训练/验证集 ──────────────────────────────────────────────
 
-def _stack_sections(dataset, date_list, label_mode: str = "cs_zscore"):
+def _stack_sections(
+    dataset, date_list, label_mode: str = LABEL_MODE_DEFAULT,
+    time_decay: float = TIME_DECAY,
+):
     """把多个调仓日的截面堆成 (X, y, w)；y 走 transform_labels，w 用时间衰减。"""
     X_list, y_list, w_list = [], [], []
     for i, d in enumerate(date_list):
@@ -184,7 +189,7 @@ def _stack_sections(dataset, date_list, label_mode: str = "cs_zscore"):
         if X is None or len(X) < 5:
             continue
         y_t = transform_labels(y.values.astype(np.float32), label_mode)
-        decay = float(np.exp(0.015 * i))  # TIME_DECAY=0.015，与 trainer 一致
+        decay = float(np.exp(float(time_decay) * i))
         X_list.append(X.values.astype(np.float32))
         y_list.append(y_t)
         w_list.extend([decay] * len(y_t))
@@ -198,7 +203,8 @@ def _stack_sections(dataset, date_list, label_mode: str = "cs_zscore"):
 
 
 def _extract_first_fold(dataset, train_windows: list, val_window: int,
-                        hold_period: int, label_mode: str = "cs_zscore"):
+                        hold_period: int, label_mode: str = LABEL_MODE_DEFAULT,
+                        time_decay: float = TIME_DECAY):
     """
     取第一个可用 walk-forward 折的训练+验证集（purged + embargo）。
     返回 (X_tr, y_tr, w_tr, X_va, y_va) 或 None。
@@ -232,7 +238,9 @@ def _extract_first_fold(dataset, train_windows: list, val_window: int,
                 continue
             if not no_val and len(val_dates) < 2:
                 continue
-            tr = _stack_sections(dataset, train_dates, label_mode)
+            tr = _stack_sections(
+                dataset, train_dates, label_mode, time_decay=time_decay,
+            )
             if tr is None:
                 continue
             if no_val:
@@ -244,7 +252,9 @@ def _extract_first_fold(dataset, train_windows: list, val_window: int,
                 if cut >= n:
                     continue
                 return X_tr[:cut], y_tr[:cut], w_tr[:cut], X_tr[cut:], y_tr[cut:]
-            va = _stack_sections(dataset, val_dates, label_mode)
+            va = _stack_sections(
+                dataset, val_dates, label_mode, time_decay=time_decay,
+            )
             if va is None:
                 continue
             X_tr, y_tr, w_tr = tr
@@ -257,14 +267,17 @@ def _extract_first_fold(dataset, train_windows: list, val_window: int,
 
 def tune_all_models(model_types: list, dataset,
                     train_windows: list, val_window: int, hold_period: int,
-                    n_trials: int = 15, label_mode: str = "cs_zscore") -> dict:
+                    n_trials: int = 15, label_mode: str = LABEL_MODE_DEFAULT,
+                    time_decay: float = TIME_DECAY) -> dict:
     """
     对多个模型做 Optuna 搜索。
     用 dataset 第一个 walk-forward 折作为 CV 数据。
     返回 {model_type: best_params}。
     """
-    fold = _extract_first_fold(dataset, train_windows, val_window,
-                               hold_period, label_mode=label_mode)
+    fold = _extract_first_fold(
+        dataset, train_windows, val_window,
+        hold_period, label_mode=label_mode, time_decay=time_decay,
+    )
     if fold is None:
         raise RuntimeError("无法从 dataset 构建首个 walk-forward 折（数据不足）")
     X_tr, y_tr, w_tr, X_va, y_va = fold
@@ -328,7 +341,7 @@ def _cli_main(argv: list | None = None) -> None:
                         help="因子白名单 YAML/JSON（与 run.py 一致）")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--sample", type=int, default=0)
-    parser.add_argument("--label-mode", default="cs_zscore",
+    parser.add_argument("--label-mode", default=LABEL_MODE_DEFAULT,
                         choices=["raw", "cs_rank", "cs_zscore"],
                         help="标签模式（barra_residual 需额外依赖，此处不开放）")
     parser.add_argument("--output", default=str(TUNED_PARAMS_PATH),

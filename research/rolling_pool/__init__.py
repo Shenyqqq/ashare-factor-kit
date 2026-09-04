@@ -3,7 +3,7 @@ research.rolling_pool — 周频 Barra pure IC 轮动定池。
 
 规则摘要
 --------
-- 窗口：决策日（含）前近 ``window`` 周 pure IC（因果）
+- 窗口：决策日前近 ``window`` 周 pure IC（``index < t``，不含当日；默认 52≈1y，两年用 ``--lookback 2y``）
 - 硬门：``|mean(IC)| > abs_mean_min`` 且 ``|ICIR| > abs_icir_min``
   （ICIR = mean/std，signed 序列上算再取绝对值；std 默认 ddof=0）
 - 排序：``|ICIR|`` 降序，并列 ``|mean|``

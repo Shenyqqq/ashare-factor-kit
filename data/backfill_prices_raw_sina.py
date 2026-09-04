@@ -64,7 +64,11 @@ def main():
     data = {c: existing[c].dropna() for c in existing.columns}
 
     u = pd.read_parquet(UNIVERSE_DIR / "stock_list.parquet")
-    codes = [c for c in u["code"].astype(str).str.zfill(6) if not c.startswith("8")]
+    from data.download import is_excluded_universe_code
+    codes = [
+        c for c in u["code"].astype(str).str.zfill(6)
+        if not is_excluded_universe_code(c)
+    ]
     need = []
     for c in codes:
         last = data[c].index[-1] if c in data and len(data[c]) else None

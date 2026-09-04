@@ -213,7 +213,6 @@ def print_quantile_summary(
     rf: float = 0.0,
 ):
     q_labels = [c for c in result.nav.columns if c.startswith("Q")]
-    top_label = next((c for c in result.nav.columns if c.startswith("Top")), None)
 
     # 年化优先（与图表 / risk_metrics 同口径）；累计仅作辅列
     rm = None
@@ -235,32 +234,51 @@ def print_quantile_summary(
             return abs(float(rm.loc[col, "最大回撤"])) * 100
         return float("nan")
 
+    def _rate_pct(col: str, metric: str) -> float:
+        if rm is not None and col in rm.index and metric in rm.columns:
+            v = rm.loc[col, metric]
+            if not np.isnan(v):
+                return float(v) * 100
+        return float("nan")
+
+    def _rate_s(pct: float, width: int = 9) -> str:
+        return f"{pct:>{width-1}.1f}%" if not np.isnan(pct) else f"{'nan':>{width}}"
+
+    top_labels = [c for c in result.nav.columns if c.startswith("Top")]
+
     lines = [
-        "=" * 60,
+        "=" * 78,
         "  分组回测摘要 (v2 engine)",
-        "=" * 60,
-        f"  {'组别':<10} {'年化收益':>10} {'累计收益':>10} {'最大回撤':>10}",
-        "-" * 60,
+        "=" * 78,
+        f"  {'组别':<10} {'年化收益':>10} {'累计收益':>10} {'最大回撤':>10}"
+        f" {'期胜率':>8} {'超额胜率':>8}",
+        "-" * 78,
     ]
     for q in q_labels:
         cum = (result.nav[q].iloc[-1] - 1) * 100
         mdd = _mdd_pct(q)
-        mdd_s = f"{mdd:>9.1f}%" if not np.isnan(mdd) else f"{'nan':>10}"
-        lines.append(f"  {q:<10} {_ann_pct(q):>9.1f}%  {cum:>9.1f}%  {mdd_s}")
-    if top_label and top_label in result.nav.columns:
-        top_cum = (result.nav[top_label].iloc[-1] - 1) * 100
-        mdd = _mdd_pct(top_label)
-        mdd_s = f"{mdd:>9.1f}%" if not np.isnan(mdd) else f"{'nan':>10}"
+        wr = _rate_pct(q, "胜率")
+        beat = _rate_pct(q, "超额胜率")
         lines.append(
-            f"  {top_label:<10} {_ann_pct(top_label):>9.1f}%  {top_cum:>9.1f}%  "
-            f"{mdd_s}  ← 实操参考"
+            f"  {q:<10} {_ann_pct(q):>9.1f}%  {cum:>9.1f}%  {_rate_s(mdd, 10)}"
+            f"  {_rate_s(wr, 8)}  {_rate_s(beat, 8)}"
+        )
+    for tl in top_labels:
+        top_cum = (result.nav[tl].iloc[-1] - 1) * 100
+        mdd = _mdd_pct(tl)
+        wr = _rate_pct(tl, "胜率")
+        beat = _rate_pct(tl, "超额胜率")
+        lines.append(
+            f"  {tl:<10} {_ann_pct(tl):>9.1f}%  {top_cum:>9.1f}%  {_rate_s(mdd, 10)}"
+            f"  {_rate_s(wr, 8)}  {_rate_s(beat, 8)}  ← 实操参考"
         )
     if "benchmark" in result.nav.columns:
         bm = (result.nav["benchmark"].iloc[-1] - 1) * 100
         mdd = _mdd_pct("benchmark")
-        mdd_s = f"{mdd:>9.1f}%" if not np.isnan(mdd) else f"{'nan':>10}"
+        wr = _rate_pct("benchmark", "胜率")
         lines.append(
-            f"  {'等权基准':<10} {_ann_pct('benchmark'):>9.1f}%  {bm:>9.1f}%  {mdd_s}"
+            f"  {'等权基准':<10} {_ann_pct('benchmark'):>9.1f}%  {bm:>9.1f}%  "
+            f"{_rate_s(mdd, 10)}  {_rate_s(wr, 8)}"
         )
 
     # 多空：有足够期数时给年化，否则只打累计
@@ -275,7 +293,16 @@ def print_quantile_summary(
     except Exception:
         lines.append(f"  多空累计: {ls_cum:.1f}%")
     lines.append(f"  单调性:   {result.ic_monotonicity:.3f}")
-    lines.append("=" * 60)
+    if top_labels:
+        lines.append("-" * 78)
+        for tl in top_labels:
+            wr = _rate_pct(tl, "胜率")
+            beat = _rate_pct(tl, "超额胜率")
+            lines.append(
+                f"  ★ {tl}  期胜率 {_rate_s(wr, 6).strip()}  |  "
+                f"超额胜率(vs等权) {_rate_s(beat, 6).strip()}"
+            )
+    lines.append("=" * 78)
 
     # ── 风险调整指标表 ────────────────────────────────────────────────────────
     if rm is not None:

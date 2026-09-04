@@ -109,9 +109,59 @@ def test_no_industry():
     print(f"[OK] precompute no-industry: shape={arr.shape}")
 
 
+def test_residualize_panel_pit_as_of():
+    """PIT as-of 行业与静态回填产生不同残差（足够截面、非插值）。"""
+    from models.wf.labels import residualize_panel
+
+    rng = np.random.default_rng(1)
+    n = 40
+    cols = [f"{i:06d}" for i in range(n)]
+    dates = pd.DatetimeIndex(["2019-06-03", "2021-06-03"])
+    # 一半 4401、一半 6401；前 10 只 2020 年起改 4402（静态已是 4402）
+    rows = []
+    static = {}
+    for i, c in enumerate(cols):
+        if i < 10:
+            rows.append({"code": c, "effective_date": "2015-01-01",
+                         "sw_l1": "44", "sw_l2": "4401", "end_date": "2019-12-31"})
+            rows.append({"code": c, "effective_date": "2020-01-01",
+                         "sw_l1": "44", "sw_l2": "4402", "end_date": pd.NaT})
+            static[c] = "4402"
+        elif i < 20:
+            rows.append({"code": c, "effective_date": "2015-01-01",
+                         "sw_l1": "44", "sw_l2": "4401", "end_date": pd.NaT})
+            static[c] = "4401"
+        else:
+            rows.append({"code": c, "effective_date": "2015-01-01",
+                         "sw_l1": "64", "sw_l2": "6401", "end_date": pd.NaT})
+            static[c] = "6401"
+    panel = pd.DataFrame(rows)
+    size = pd.DataFrame(rng.normal(size=(2, n)), index=dates, columns=cols)
+    # 因子含行业均值：2019 的 4401 组应与静态 4402 回填不同
+    ind2019 = np.array([0.0 if i < 20 else 1.0 for i in range(n)])
+    fac = pd.DataFrame(
+        size.to_numpy() + np.vstack([ind2019, ind2019]) * 2.0
+        + rng.normal(scale=0.1, size=(2, n)),
+        index=dates, columns=cols,
+    )
+    pit = residualize_panel(
+        fac, {"Barra_Size": size}, pd.Series(static), dates,
+        min_stocks=10, industry_panel=panel,
+    )
+    st = residualize_panel(
+        fac, {"Barra_Size": size}, pd.Series(static), dates, min_stocks=10,
+    )
+    assert pit.notna().sum().sum() > 10
+    a_pit, a_st = pit.loc[dates[0]], st.loc[dates[0]]
+    corr = float(a_pit.corr(a_st))
+    assert corr < 0.999, f"2019 PIT vs 静态残差几乎相同 corr={corr:.6f}"
+    print("[OK] residualize_panel PIT as-of differs from static backfill")
+
+
 if __name__ == "__main__":
     test_as_of()
     test_dummies_pit_vs_static()
     test_precompute_pit_and_static()
     test_no_industry()
+    test_residualize_panel_pit_as_of()
     print("\nALL PIT SMOKE TESTS PASSED")

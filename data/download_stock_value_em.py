@@ -27,7 +27,8 @@ data/download_stock_value_em.py — 东财日频估值/市值面板（Size 主�
 
 特性：
   - 增量：缺票 / max(date) < today-stale_days → 重拉；``--force-refresh`` 全量
-  - 中断可 resume（单票缓存 + 定期组装 wide）
+  - 中断可 resume（单票缓存）。wide 只在**整轮下载结束后**原子替换，
+    禁止把未完成批次 assemble 进官方 parquet（否则末日行只剩先跑到的 600xxx）
   - ``--sample`` / ``--codes`` 调试
   - 不碰 Tushare
 
@@ -38,10 +39,12 @@ data/download_stock_value_em.py — 东财日频估值/市值面板（Size 主�
     python -m data.download_stock_value_em --refresh-stale-days 5 --force-refresh
     python -m data.download_stock_value_em --start 2018-01-01
     python -m data.download_stock_value_em --assemble-only   # 仅从缓存重装 wide
+    python -m data.download_stock_value_em --bj-only --workers 1  # 只补北交所 92xxxx 缺失列
 """
 from __future__ import annotations
 
 import argparse
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -92,17 +95,39 @@ LONG_COLS = [
 ]
 
 
-def _load_stock_codes(sample: int = 0, codes_csv: str | None = None) -> list[str]:
+def _load_stock_codes(
+    sample: int = 0,
+    codes_csv: str | None = None,
+    *,
+    bj_only: bool = False,
+) -> list[str]:
+    from data.download import collect_bj_stock_codes, is_excluded_universe_code
+
     if codes_csv:
         codes = [c.strip().zfill(6) for c in codes_csv.split(",") if c.strip()]
         logger.info(f"使用指定代码列表: {len(codes)} 只 → {codes}")
         return codes
+
+    if bj_only:
+        codes = collect_bj_stock_codes()
+        if sample:
+            codes = codes[:sample]
+            logger.info(f"调试模式：北交所仅取前 {sample} 只 → {codes}")
+        logger.info(f"北交所 92xxxx 下载名单: {len(codes)} 只")
+        return codes
+
     p = UNIVERSE_DIR / "stock_list.parquet"
     if not p.exists():
         raise FileNotFoundError(f"找不到 {p}，请先运行 `python -m data.download` 生成股票列表")
     df = pd.read_parquet(p)
     codes = df["code"].astype(str).str.zfill(6).tolist()
-    codes = [c for c in codes if not c.startswith("8")]
+    codes = [c for c in codes if not is_excluded_universe_code(c)]
+    # stock_list 历史可能缺 92：从 prices_hfq / BJ 接口补入，不依赖整表重写名单
+    have = set(codes)
+    extra = [c for c in collect_bj_stock_codes(use_api=False) if c not in have]
+    if extra:
+        logger.info(f"stock_list 未收录北交所 {len(extra)} 只，已并入下载名单")
+        codes = list(codes) + extra
     if sample:
         codes = codes[:sample]
         logger.info(f"调试模式：仅取前 {sample} 只 → {codes}")
@@ -164,11 +189,12 @@ def _cache_path(code: str) -> Path:
     return CACHE_DIR / f"{code}.parquet"
 
 
-def _fetch_one(code: str) -> tuple[str, pd.DataFrame | None]:
+def _fetch_one(code: str, sleep: float | None = None) -> tuple[str, pd.DataFrame | None]:
+    pause = SLEEP if sleep is None else float(sleep)
     for attempt in range(MAX_RETRY + 1):
         try:
             raw = ak.stock_value_em(symbol=code)
-            time.sleep(SLEEP)
+            time.sleep(pause)
             if raw is None or raw.empty:
                 return code, None
             df = _map_em_columns(raw)
@@ -274,56 +300,163 @@ def _pivot_wide(long_df: pd.DataFrame, value_col: str, start: str | None) -> pd.
     return wide
 
 
-def _merge_wide_preserve(existing_path: Path, new_wide: pd.DataFrame) -> pd.DataFrame:
-    """把新东财列合并进已有 wide，避免局部下载截断全市场列。"""
+def _backup_parquet(path: Path) -> None:
+    """写前 ``*.parquet.bak``，避免窗口切片覆盖后无法回滚。"""
+    if not path.exists():
+        return
+    bak = path.with_suffix(path.suffix + ".bak")
+    try:
+        shutil.copy2(path, bak)
+    except OSError as e:
+        logger.warning(f".bak 备份失败（继续）: {path.name} -> {e}")
+
+
+def _atomic_to_parquet(df: pd.DataFrame, path: Path) -> None:
+    """先写 ``*.tmp`` 再 replace，避免 kill 半截把官方 parquet 写坏。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_parquet(tmp)
+    tmp.replace(path)
+
+
+def _drop_sparse_trailing_dates(
+    wide: pd.DataFrame,
+    *,
+    min_frac: float = 0.5,
+    lookback: int = 40,
+) -> pd.DataFrame:
+    """丢掉末尾覆盖过低的新日期（未完成批次 assemble 的典型症状）。
+
+    用「去掉最近 10 日」后的 lookback 窗口中位数作典型覆盖；从末日往回
+    连续低于 ``typical * min_frac`` 的日期一律不写入官方面板。
+    历史中段低覆盖（次新上市爬升）不动。
+    """
+    if wide is None or wide.empty or len(wide.index) < 10:
+        return wide
+    cov = wide.notna().sum(axis=1)
+    body = cov.iloc[:-10] if len(cov) > 20 else cov
+    window = body.iloc[-int(lookback) :] if len(body) else cov
+    typical = float(window.median()) if len(window) else float(cov.median())
+    if not np.isfinite(typical) or typical <= 0:
+        return wide
+    thresh = typical * float(min_frac)
+    drop: list = []
+    for d in reversed(list(cov.index)):
+        if float(cov.loc[d]) < thresh:
+            drop.append(d)
+        else:
+            break
+    if not drop:
+        return wide
+    drop_sorted = sorted(drop)
+    logger.warning(
+        f"丢弃覆盖过低的末尾 {len(drop_sorted)} 日"
+        f"（typical={typical:.0f}, thresh={thresh:.0f}）: "
+        f"{pd.Timestamp(drop_sorted[0]).date()} → {pd.Timestamp(drop_sorted[-1]).date()} "
+        f"cov={int(cov.loc[drop_sorted[0]])}..{int(cov.loc[drop_sorted[-1]])}。"
+        f"未完成批次不写进官方 parquet"
+    )
+    return wide.drop(index=drop_sorted)
+
+
+def _norm_wide(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.index = pd.DatetimeIndex(pd.to_datetime(out.index))
+    out.columns = out.columns.astype(str).str.zfill(6)
+    out.index.name = "date"
+    return out
+
+
+def _merge_wide_preserve(
+    existing_path: Path,
+    new_wide: pd.DataFrame,
+    *,
+    fill_missing_cols_only: bool = False,
+) -> pd.DataFrame:
+    """新 wide 与已有面板按 index/columns outer 合并。
+
+    默认：重叠格新值优先（全市场增量）。
+    ``fill_missing_cols_only=True``：只追加旧面板没有的列，已有沪深列格点完全不动
+    （北交所 92xxxx 补洞用；禁止用缓存重写主链）。
+
+    禁止用 start~end 窗口切片整表覆盖全历史。列完全重叠时也必须保留
+    旧面板中窗口外的日期（live ``lookback`` 曾因此把市值砍成最近一个月）。
+    """
     if new_wide is None or new_wide.empty:
         if existing_path.exists():
-            old = pd.read_parquet(existing_path)
-            old.index = pd.to_datetime(old.index)
-            old.columns = old.columns.astype(str).str.zfill(6)
-            return old
-        return new_wide
-    new_wide = new_wide.copy()
-    new_wide.columns = new_wide.columns.astype(str).str.zfill(6)
+            return _norm_wide(pd.read_parquet(existing_path))
+        return new_wide if new_wide is not None else pd.DataFrame()
+
+    new_wide = _norm_wide(new_wide)
     if not existing_path.exists():
         return new_wide
     try:
-        old = pd.read_parquet(existing_path)
-        old.index = pd.to_datetime(old.index)
-        old.columns = old.columns.astype(str).str.zfill(6)
+        old = _norm_wide(pd.read_parquet(existing_path))
     except Exception as e:
         logger.warning(f"读取已有 {existing_path.name} 失败，将整表替换: {e}")
         return new_wide
     if old.empty:
         return new_wide
-    # 未在本轮东财缓存中的旧列保留；重叠列用新值覆盖
-    keep_cols = [c for c in old.columns if c not in new_wide.columns]
-    if keep_cols:
+
+    if fill_missing_cols_only:
+        add_cols = [c for c in new_wide.columns if c not in old.columns]
+        skipped = [c for c in new_wide.columns if c in old.columns]
+        if skipped:
+            logger.info(
+                f"{existing_path.name}: 跳过已有 {len(skipped)} 列（沪深主链不动），"
+                f"仅补 {len(add_cols)} 列"
+            )
+        if not add_cols:
+            return old
+        add = new_wide.loc[:, add_cols]
+        extra_idx = add.index.difference(old.index)
+        if len(extra_idx) > 0:
+            logger.info(
+                f"{existing_path.name}: 新列带来 {len(extra_idx)} 个新交易日 "
+                f"{extra_idx.min().date()} → {extra_idx.max().date()}"
+            )
+        logger.info(f"{existing_path.name}: 追加缺失列 {len(add_cols)} 只")
+        merged = old.join(add, how="outer")
+        merged.index.name = "date"
+        return merged.sort_index()
+
+    extra_cols = [c for c in old.columns if c not in new_wide.columns]
+    if extra_cols:
         logger.warning(
-            f"{existing_path.name}: 保留尚未被东财缓存覆盖的 {len(keep_cols)} 列"
+            f"{existing_path.name}: 保留尚未被东财缓存覆盖的 {len(extra_cols)} 列"
             f"（本轮仅更新 {new_wide.shape[1]} 列）。请尽快跑全市场 "
             f"`download_stock_value_em` 以统一口径。"
         )
-        union_idx = old.index.union(new_wide.index).sort_values()
-        merged = old.reindex(union_idx)
-        for c in new_wide.columns:
-            merged[c] = new_wide[c].reindex(union_idx)
-        return merged
-    return new_wide
+    extra_idx = old.index.difference(new_wide.index)
+    if len(extra_idx) > 0:
+        logger.info(
+            f"{existing_path.name}: outer 合并保留历史 "
+            f"{extra_idx.min().date()} → {extra_idx.max().date()} "
+            f"共 {len(extra_idx)} 日（本轮新窗口 {len(new_wide.index)} 日）"
+        )
+
+    # 新非 NA 覆盖旧值；窗口外日期与未覆盖列由旧面板补上
+    return new_wide.combine_first(old).sort_index()
 
 
 def assemble_wide_panels(
     codes: list[str] | None = None,
     start: str | None = "2018-01-01",
+    *,
+    fill_missing_cols_only: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """从单票缓存组装 wide 面板并落盘。
 
-    始终读取 ``_cache/stock_value_em/`` 下**全部**已缓存票，避免
+    默认读取 ``_cache/stock_value_em/`` 下**全部**已缓存票，避免
     ``--sample`` / ``--codes`` 局部下载时把全市场 wide 面板截断成子集。
-    若磁盘上已有更宽的主面板，未覆盖列会被保留并 warning。
-    ``codes`` 仅用于日志提示。
+    写出前与磁盘已有面板按 index/columns outer 合并（新值优先），
+    避免 ``start`` 窗口切片覆盖全历史。``codes`` 仅用于日志提示。
+
+    ``fill_missing_cols_only=True``（北交所补洞）：只从缓存读取 ``codes``，
+    且只把旧面板**没有的列** outer join 进去，沪深已有列格点保持不动。
     """
-    long_df = _load_all_cached(None)
+    load_codes = codes if fill_missing_cols_only else None
+    long_df = _load_all_cached(load_codes)
     if long_df.empty:
         logger.warning("无缓存可组装")
         return {}
@@ -333,14 +466,22 @@ def assemble_wide_panels(
         logger.info(
             f"组装 wide：缓存共 {len(have)} 只；本次目标 {len(codes)} 只"
             + (f"；其中尚未缓存 {len(miss)} 只" if miss else "")
+            + ("；仅补缺失列" if fill_missing_cols_only else "")
         )
     LONG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    long_df.to_parquet(LONG_PATH, index=False)
-    logger.info(
-        f"stock_value_em_long: {long_df.shape}  "
-        f"覆盖 {long_df['code'].nunique()} 只  "
-        f"{long_df['date'].min().date()} → {long_df['date'].max().date()}"
-    )
+    if not fill_missing_cols_only:
+        long_df.to_parquet(LONG_PATH, index=False)
+        logger.info(
+            f"stock_value_em_long: {long_df.shape}  "
+            f"覆盖 {long_df['code'].nunique()} 只  "
+            f"{long_df['date'].min().date()} → {long_df['date'].max().date()}"
+        )
+    else:
+        logger.info(
+            f"北交所补洞长表: {long_df.shape}  "
+            f"覆盖 {long_df['code'].nunique()} 只  "
+            f"{long_df['date'].min().date()} → {long_df['date'].max().date()}"
+        )
 
     mapping = {
         "total_mv": OUT_TOTAL_MV,
@@ -362,10 +503,17 @@ def assemble_wide_panels(
             wide = wide.where(wide > 0)
         else:
             wide = wide.replace([np.inf, -np.inf], np.nan)
-        # 主市值面板：与已有宽表合并，防止 sample 截断
-        if col in ("total_mv", "circ_mv"):
-            wide = _merge_wide_preserve(path, wide)
-        wide.to_parquet(path)
+        # 北交所补洞：只 outer join 缺失列。全市场增量仍走新值优先 merge。
+        wide = _merge_wide_preserve(
+            path, wide, fill_missing_cols_only=fill_missing_cols_only
+        )
+        if not fill_missing_cols_only:
+            wide = _drop_sparse_trailing_dates(wide)
+        if wide.empty:
+            logger.warning(f"{col}: 丢弃稀疏末日后为空，跳过写出")
+            continue
+        _backup_parquet(path)
+        _atomic_to_parquet(wide, path)
         out[col] = wide
         logger.info(
             f"写出 {path.name}: shape={wide.shape}  "
@@ -392,20 +540,30 @@ def download_stock_value_em(
     save_every: int = SAVE_EVERY,
     assemble: bool = True,
     workers: int = WORKERS,
+    *,
+    fill_missing_cols_only: bool = False,
+    sleep: float | None = None,
 ) -> dict[str, pd.DataFrame]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     need, _fresh = _codes_needing_refresh(codes, refresh_stale_days, force_refresh)
     n_workers = max(1, int(workers))
+    pause = SLEEP if sleep is None else float(sleep)
 
     if need:
-        logger.info(f"需下载 {len(need)}/{len(codes)} 只（并发={n_workers}，sleep={SLEEP}s）")
+        logger.info(
+            f"需下载 {len(need)}/{len(codes)} 只（并发={n_workers}，sleep={pause}s"
+            f"{'，仅补缺失列' if fill_missing_cols_only else ''}）"
+        )
         lock = threading.Lock()
         success = 0
         failed: list[str] = []
         done = 0
 
+        def _fetch_paused(code: str) -> tuple[str, pd.DataFrame | None]:
+            return _fetch_one(code, sleep=pause)
+
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(_fetch_one, c): c for c in need}
+            futures = {executor.submit(_fetch_paused, c): c for c in need}
             for fut in as_completed(futures):
                 code, df = fut.result()
                 with lock:
@@ -418,9 +576,8 @@ def download_stock_value_em(
                     if done % save_every == 0:
                         logger.info(
                             f"进度 {done}/{len(need)}  成功={success} 失败={len(failed)}"
+                            f"（单票缓存已落盘；wide 等整轮结束后再 assemble）"
                         )
-                        if assemble:
-                            assemble_wide_panels(codes=codes, start=start)
 
         if failed:
             logger.warning(f"最终失败 {len(failed)} 只: {failed[:30]}")
@@ -429,7 +586,11 @@ def download_stock_value_em(
         logger.info("全部股票 stock_value_em 仍新鲜，跳过下载")
 
     if assemble:
-        return assemble_wide_panels(codes=codes, start=start)
+        return assemble_wide_panels(
+            codes=codes,
+            start=start,
+            fill_missing_cols_only=fill_missing_cols_only,
+        )
     return {}
 
 
@@ -453,19 +614,59 @@ def main():
         help="不下载，仅从 _cache/stock_value_em 重装 wide 面板",
     )
     parser.add_argument("--workers", type=int, default=WORKERS, help="并发线程数")
+    parser.add_argument(
+        "--bj-only",
+        action="store_true",
+        help="只下载 92xxxx 北交所，并仅把缺失列写入现有 circ_mv/total_mv/pe_ttm/pb",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=None,
+        help="单票请求间隔秒（默认 0.12；--bj-only 建议 0.25）",
+    )
     args = parser.parse_args()
 
-    codes = _load_stock_codes(sample=args.sample, codes_csv=args.codes)
+    fill_missing = bool(args.bj_only)
+    bj_codes: list[str] | None = None
+    if args.bj_only:
+        from data.download import append_bj_codes_to_stock_list, collect_bj_stock_codes
+
+        bj_codes = collect_bj_stock_codes(use_api=True)
+        n_appended = append_bj_codes_to_stock_list(bj_codes)
+        logger.info(f"stock_list 追加北交所 {n_appended} 只（未改沪深/B 股历史行）")
+
+    codes = bj_codes if bj_codes is not None else _load_stock_codes(
+        sample=args.sample, codes_csv=args.codes, bj_only=False
+    )
+    if args.bj_only and args.sample:
+        codes = codes[: args.sample]
+        logger.info(f"调试模式：北交所仅取前 {args.sample} 只")
+    if args.bj_only:
+        logger.info(f"北交所 92xxxx 下载名单: {len(codes)} 只")
     if args.assemble_only:
-        assemble_wide_panels(codes=codes, start=args.start)
+        assemble_wide_panels(
+            codes=codes,
+            start=args.start,
+            fill_missing_cols_only=fill_missing,
+        )
         return
+
+    sleep = args.sleep
+    if sleep is None and args.bj_only:
+        sleep = 0.25
+    workers = 1 if args.bj_only and args.workers == WORKERS else args.workers
+    save_every = 500 if args.bj_only else SAVE_EVERY
 
     download_stock_value_em(
         codes,
         start=args.start,
         refresh_stale_days=args.refresh_stale_days,
         force_refresh=args.force_refresh,
-        workers=args.workers,
+        workers=workers,
+        fill_missing_cols_only=fill_missing,
+        sleep=sleep,
+        save_every=save_every,
     )
 
 

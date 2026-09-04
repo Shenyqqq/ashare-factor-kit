@@ -27,9 +27,15 @@ def pack_barra_pure_ckpt(
     quantile_df: pd.DataFrame | None = None,
     *,
     version: str | None = None,
+    neut_controls: str | None = None,
+    universe_tag: str | None = None,
 ) -> tuple:
     """落盘格式：``(means, barra_ctrl_names, series, quantile_df, meta)``。"""
-    meta = {"barra_version": version or barra_pure_cache_version()}
+    meta = {
+        "barra_version": version or barra_pure_cache_version(),
+        "neut_controls": str(neut_controls or "barra"),
+        "universe_tag": str(universe_tag or ""),
+    }
     qdf = quantile_df if isinstance(quantile_df, pd.DataFrame) else pd.DataFrame()
     return (means, list(names), series, qdf, meta)
 
@@ -111,6 +117,7 @@ def _industry_dummies(
     reference: str | None = None,
     industry_panel: pd.DataFrame | None = None,
     date: pd.Timestamp | None = None,
+    min_industry_n: int = 0,
 ) -> dict[str, pd.Series]:
     """
     Industry dummy columns for cross-section OLS.
@@ -129,6 +136,9 @@ def _industry_dummies(
         ind = ind_series.reindex(stock_index).fillna("未分类")
     else:
         ind = industry_map.reindex(stock_index).fillna("未分类")
+    if min_industry_n and int(min_industry_n) > 1:
+        from models.wf.labels import collapse_rare_industries
+        ind = collapse_rare_industries(ind, int(min_industry_n))
     cats = sorted(ind.unique())
     if len(cats) <= 1:
         return {}
@@ -163,6 +173,9 @@ def precompute_ctrl_matrices(
     industry_reference: str | None = None,
     industry_panel: pd.DataFrame | None = None,
     weight_panel: pd.DataFrame | None = None,
+    membership_mask: pd.DataFrame | None = None,
+    circ_mv: pd.DataFrame | None = None,
+    min_industry_n: int = 0,
 ) -> dict:
     """
     Cache control matrices per rebalance date: (ctrl_arr, ctrl_idx, fwd_arr, w_arr).
@@ -175,17 +188,27 @@ def precompute_ctrl_matrices(
     见 ``factors/barra_risk.py::barra_regression_weights``）。传入后残差化
     改用 WLS，抑制小微盘噪声主导风格系数；None 时退化为等权 OLS。
 
-    TODO: cache QR / (X'X)^-1 X' per date for multi-factor Barra pass —
-    currently recomputes lstsq per factor per date (acceptable for ~30 factors).
+    membership_mask: 逐日宇宙。提供时先裁成当日成员再估 β / 建行业哑元
+    （禁止全市场 WLS 再 mask）。``None`` 时全市场，行为与旧版一致。
+    circ_mv: 与 membership 联用，Size 控制改为池内 log(流通市值) z-score。
+    min_industry_n: 档内行业有效样本下限，少则并入「其他」；0=关闭。
     """
+    from models.wf.labels import (
+        SIZE_NEUT_FACTOR,
+        collapse_rare_industries,
+        inpool_log_mcap_control,
+    )
+
     target_dates = dates if dates is not None else forward_return.index
     ref = industry_reference or INDUSTRY_REFERENCE
     use_pit = industry_panel is not None
+    use_members = membership_mask is not None
+    min_ind = int(min_industry_n or 0)
 
-    # 静态路径：行业哑变量只构建一次
+    # 静态路径：行业哑变量只构建一次（membership 时改为逐日在成员上建）
     ind_arr = None
     ind_index = None
-    if not use_pit and industry_map is not None:
+    if not use_pit and not use_members and industry_map is not None:
         ind_full = industry_map.fillna("未分类")
         cats = sorted(ind_full.unique())
         drop = cats[0] if ref == "drop_first" else ref
@@ -214,12 +237,42 @@ def precompute_ctrl_matrices(
         if not ctrl_cols:
             continue
 
-        barra_df = pd.DataFrame(ctrl_cols).fillna(0.0)
+        barra_df = pd.DataFrame(ctrl_cols)
+        if use_members:
+            if date not in membership_mask.index:
+                continue
+            mem = membership_mask.loc[date].reindex(barra_df.index)
+            mem = mem.fillna(False).astype(bool)
+            barra_df = barra_df.loc[mem]
+            if barra_df.empty:
+                continue
+        if (
+            use_members
+            and circ_mv is not None
+            and SIZE_NEUT_FACTOR in barra_df.columns
+            and date in circ_mv.index
+        ):
+            barra_df[SIZE_NEUT_FACTOR] = inpool_log_mcap_control(
+                circ_mv.loc[date], barra_df.index,
+            )
+            other = [c for c in barra_df.columns if c != SIZE_NEUT_FACTOR]
+            if other:
+                barra_df[other] = barra_df[other].fillna(0.0)
+            barra_df = barra_df.dropna(subset=[SIZE_NEUT_FACTOR])
+            if barra_df.empty:
+                continue
+        else:
+            barra_df = barra_df.fillna(0.0)
 
-        if use_pit:
-            # PIT 路径：按当期行业构建哑变量（每调仓日独立 OLS，列可不同）
-            ind_series = load_industry_as_of(industry_panel, date, level="sw_l2")
-            ind = ind_series.reindex(barra_df.index).fillna("未分类")
+        rebuild_ind = use_pit or (use_members and industry_map is not None)
+        if rebuild_ind:
+            if use_pit:
+                ind_series = load_industry_as_of(industry_panel, date, level="sw_l2")
+                ind = ind_series.reindex(barra_df.index).fillna("未分类")
+            else:
+                ind = industry_map.reindex(barra_df.index).fillna("未分类")
+            if min_ind > 1:
+                ind = collapse_rare_industries(ind, min_ind)
             cats_d = sorted(ind.unique())
             if len(cats_d) > 1:
                 drop_d = cats_d[0] if ref == "drop_first" else ref
@@ -346,6 +399,11 @@ def run_barra_pure_ic(
     total_mv: pd.DataFrame | None = None,
     turnover_rate: pd.DataFrame | None = None,
     amount: pd.DataFrame | None = None,
+    neut_controls: str = "barra",
+    skip_names: set[str] | frozenset[str] | None = None,
+    membership_mask: pd.DataFrame | None = None,
+    min_industry_n: int = 0,
+    restan_in_universe: bool = False,
 ) -> tuple[dict[str, float], dict[str, pd.Series], pd.DataFrame]:
     """Compute pure IC per factor; optionally Q1/Q5 long-short contribution.
 
@@ -376,6 +434,11 @@ def run_barra_pure_ic(
         日频换手率 / 成交额面板，供 ``Barra_Liquidity``（63/252 日换手率等权平均）。
     """
     from factors.barra_risk import barra_regression_weights, get_barra_factors
+    from models.wf.labels import (
+        NEUT_CONTROLS_SIZE,
+        normalize_neut_controls,
+        select_neut_control_factors,
+    )
     from research.ic.quantile_decomp import (
         compute_quantile_ls_from_resid_loop,
         quantile_decomp_table,
@@ -410,6 +473,9 @@ def run_barra_pure_ic(
     )
     if not barra_factors:
         return {}, {}, pd.DataFrame()
+    neut_mode = normalize_neut_controls(neut_controls)
+    barra_factors = select_neut_control_factors(barra_factors, neut_mode)
+    use_industry = neut_mode != NEUT_CONTROLS_SIZE
 
     # WLS 权重 = √市值（同一日截面）；None → 等权 OLS（barra_regression_weights 已 warning）
     weight_panel = barra_regression_weights(
@@ -417,7 +483,7 @@ def run_barra_pure_ic(
     )
 
     if names_sink is not None:
-        names_sink.extend(list(barra_factors.keys()))
+        names_sink.extend(list(barra_factors.keys()) if barra_factors else [])
 
     if log_fn:
         log_fn("Barra 风格因子", 0)
@@ -425,20 +491,29 @@ def run_barra_pure_ic(
     date_ctrl = precompute_ctrl_matrices(
         barra_factors,
         forward_return,
-        industry_map,
+        industry_map if use_industry else None,
         dates=rebalance_dates,
-        industry_panel=industry_panel,
+        industry_panel=industry_panel if use_industry else None,
         weight_panel=weight_panel,
+        membership_mask=membership_mask,
+        circ_mv=circ_mv,
+        min_industry_n=min_industry_n or 0,
     )
     del barra_factors, weight_panel
     gc.collect()
 
-    barra_names = [n for n in summary_index if n in registry]
+    skip = set(skip_names or ())
+    barra_names = [n for n in summary_index if n in registry and n not in skip]
     do_q = bool(quantile_decomp)
     y_mode = (quantile_y_mode or "residual").lower().strip()
 
     def _one(name):
         fac = registry[name]
+        if restan_in_universe and membership_mask is not None:
+            from research.ic.universe import restan_within_mask
+            fac = restan_within_mask(
+                fac, membership_mask, dates=rebalance_dates,
+            )
         if do_q:
             pure, daily_q = compute_quantile_ls_from_resid_loop(
                 fac, date_ctrl, rebalance_dates, y_mode=y_mode,

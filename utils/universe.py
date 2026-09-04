@@ -329,6 +329,59 @@ def build_mcap_percentile_mask(
     return mask
 
 
+# 东财 circ_mv / total_mv 面板单位 = 元；1 亿 = 1e8 元。
+YI_TO_YUAN = 1e8
+
+
+def build_mcap_yi_band_mask(
+    circ_mv: pd.DataFrame | None,
+    min_yi: float = 30.0,
+    max_yi: float = 100.0,
+    *,
+    total_mv: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """按流通市值亿元区间构造逐日 bool mask（**不含** 20 日成交额过滤）。
+
+    产品口径：东财 ``circ_mv`` 单位=元，``[min_yi, max_yi]`` 亿元含边界
+    （默认 30–100 亿 → ``[30e8, 100e8]`` 元）。缺市值格子 → False。
+
+    与 :func:`build_cap_band_mask` / :func:`build_small_cap_universe` 的差别：
+    那些函数会再 AND 20 日均成交额；本函数只做市值带，可交易（ST/停牌/零成交/
+    次新）交给 ``build_ic_tradability_mask``。
+    """
+    if circ_mv is not None:
+        mv = circ_mv
+        mv_label = "circ_mv"
+    elif total_mv is not None:
+        mv = total_mv
+        mv_label = "total_mv (circ_mv 不可用，近似)"
+        logger.warning(
+            "build_mcap_yi_band_mask: circ_mv 缺失，用 total_mv 近似亿元带"
+        )
+    else:
+        raise ValueError("circ_mv 和 total_mv 至少需提供一个")
+
+    lo = None if min_yi is None else float(min_yi) * YI_TO_YUAN
+    hi = None if max_yi is None else float(max_yi) * YI_TO_YUAN
+    in_band = pd.DataFrame(True, index=mv.index, columns=mv.columns)
+    if lo is not None:
+        in_band = in_band & (mv >= lo)
+    if hi is not None:
+        in_band = in_band & (mv <= hi)
+    mask = in_band.fillna(False).astype(bool)
+
+    n_dates = len(mask)
+    per = mask.sum(axis=1)
+    avg = int(per.mean()) if n_dates else 0
+    lo_lbl = "无界" if lo is None else f"{lo / YI_TO_YUAN:.0f}亿"
+    hi_lbl = "无界" if hi is None else f"{hi / YI_TO_YUAN:.0f}亿"
+    logger.info(
+        f"市值亿元带 ({mv_label}): {n_dates} 日 × {mask.shape[1]} 股，"
+        f"平均 {avg} 只/日，区间=[{lo_lbl}, {hi_lbl}]（含边界，无成交额过滤）"
+    )
+    return mask
+
+
 def load_universe_mask_file(path: str | Path) -> pd.DataFrame:
     """从 parquet 加载外部 universe mask（wide bool；True=纳入）。"""
     path = Path(path)

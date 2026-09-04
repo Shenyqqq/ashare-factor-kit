@@ -42,11 +42,26 @@ from pathlib import Path
 
 import akshare as ak
 import pandas as pd
+import requests
 from loguru import logger
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import RAW_DIR, BACKTEST_START, UNIVERSE_DIR
+
+
+def _disable_env_proxy() -> None:
+    """绕过 WinIE / 本机 7890 代理。东财 push2 经代理常 ProxyError。"""
+    _orig = requests.Session.__init__
+
+    def _init(self, *args, **kwargs):
+        _orig(self, *args, **kwargs)
+        self.trust_env = False
+        self.proxies = {"http": None, "https": None}
+
+    if not getattr(requests.Session, "_qt_no_proxy", False):
+        requests.Session.__init__ = _init
+        requests.Session._qt_no_proxy = True
 
 # AKShare 深交所简称变更接口的真实列名（已实测确认 unicode）
 _COL_SZ_DATE = "变更日期"        # 变更日期
@@ -113,6 +128,102 @@ def _fetch_sz_name_changes() -> pd.DataFrame:
     return df
 
 
+_EM_ST_URLS = (
+    "https://push2delay.eastmoney.com/api/qt/clist/get",
+    "https://82.push2.eastmoney.com/api/qt/clist/get",
+    "https://88.push2.eastmoney.com/api/qt/clist/get",
+    "https://40.push2.eastmoney.com/api/qt/clist/get",
+)
+_EM_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _fetch_em_st_board() -> pd.DataFrame:
+    """直连东财风险警示板（绕过 WinIE/7890 代理；多 host 重试）。
+
+    Returns
+    -------
+    pd.DataFrame with columns: 代码, 名称
+    """
+    import time
+
+    params = {
+        "pn": "1",
+        "pz": "100",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f12",
+        "fs": "m:0 f:4,m:1 f:4",
+        "fields": "f12,f14",
+    }
+    headers = {
+        "User-Agent": _EM_UA,
+        "Referer": "https://quote.eastmoney.com/center/gridlist.html",
+        "Connection": "close",
+    }
+    last_err = None
+    for url in _EM_ST_URLS:
+        s = requests.Session()
+        s.trust_env = False
+        s.proxies = {"http": None, "https": None}
+        rows = []
+        try:
+            pn = 1
+            total = None
+            while pn <= 20:
+                params["pn"] = str(pn)
+                r = s.get(url, params=params, timeout=12, headers=headers)
+                r.raise_for_status()
+                data = (r.json() or {}).get("data") or {}
+                diff = data.get("diff") or []
+                if not diff:
+                    break
+                rows.extend(diff)
+                total = int(data.get("total") or 0)
+                if total and len(rows) >= total:
+                    break
+                pn += 1
+                time.sleep(0.2)
+            if not rows:
+                raise RuntimeError(f"empty ST board from {url}")
+            df = pd.DataFrame(rows)
+            code_col = "f12" if "f12" in df.columns else df.columns[0]
+            name_col = "f14" if "f14" in df.columns else df.columns[1]
+            out = pd.DataFrame({
+                _COL_ST_CODE: df[code_col].astype(str).str.zfill(6),
+                _COL_ST_NAME: df[name_col].astype(str),
+            })
+            logger.info(f"东财 ST 板: {len(out)} 只  via {url.split('/')[2]}")
+            return out
+        except Exception as e:
+            last_err = e
+            logger.warning(f"东财 ST 板失败 {url.split('/')[2]}: {type(e).__name__}: {e}")
+            continue
+    raise RuntimeError(f"东财 ST 板全部失败: {last_err}")
+
+
+def _current_st_from_stock_list() -> pd.DataFrame:
+    """用 stock_list 名称含 ST 兜底当前快照（沪市 fallback 依赖此表）。"""
+    p = UNIVERSE_DIR / "stock_list.parquet"
+    if not p.exists():
+        raise FileNotFoundError(f"无 stock_list: {p}")
+    u = pd.read_parquet(p)
+    u["code"] = u["code"].astype(str).str.zfill(6)
+    u["name"] = u["name"].astype(str)
+    mask = u["name"].str.contains("ST", case=False, na=False)
+    if "is_st_current" in u.columns:
+        mask = mask | u["is_st_current"].fillna(False).astype(bool)
+    df = u.loc[mask, ["code", "name"]].drop_duplicates("code")
+    df = df.rename(columns={"code": _COL_ST_CODE, "name": _COL_ST_NAME})
+    logger.info(f"stock_list 名称/is_st_current 含 ST: {len(df)} 只")
+    return df.reset_index(drop=True)
+
+
 def _fetch_current_st() -> pd.DataFrame:
     """拉取当前 ST/*ST 股快照。
 
@@ -121,11 +232,26 @@ def _fetch_current_st() -> pd.DataFrame:
     pd.DataFrame with columns: code (str zfilled 6), name (str), st_type (str)
     """
     logger.info("拉取当前 ST/*ST 快照 ...")
-    raw = ak.stock_zh_a_st_em()
+    parts = []
+    try:
+        parts.append(_fetch_em_st_board())
+    except Exception as e:
+        logger.warning(f"东财 ST 板失败: {e}")
+        try:
+            parts.append(ak.stock_zh_a_st_em())
+        except Exception as e2:
+            logger.warning(f"ak.stock_zh_a_st_em 仍失败: {e2}")
+    try:
+        parts.append(_current_st_from_stock_list())
+    except Exception as e:
+        logger.warning(f"stock_list ST 兜底失败: {e}")
+    if not parts:
+        raise RuntimeError("无法获取当前 ST 快照")
+    raw = pd.concat(parts, ignore_index=True)
     df = pd.DataFrame({
         "code": raw[_COL_ST_CODE].astype(str).str.zfill(6),
         "name": raw[_COL_ST_NAME].astype(str),
-    })
+    }).drop_duplicates("code")
     df["st_type"] = df["name"].map(_classify_st_type)
     # 极少数行可能分类失败（名称异常），回退为 ST
     df["st_type"] = df["st_type"].fillna(_ST_TYPE_PLAIN)
@@ -297,6 +423,7 @@ def main(start: str | None = None, save_path: Path | None = None) -> Path:
         save_path = RAW_DIR / "st_history.parquet"
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
+    _disable_env_proxy()
     df = build_st_history(backtest_start=backtest_start)
     df.to_parquet(save_path, index=False)
     logger.info(

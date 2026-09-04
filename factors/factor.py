@@ -1105,6 +1105,10 @@ def _iter_factor_registry_raw(
                 )
             if margin is not None and _want_factor("融资余额变化_20d", fn_set):
                 yield _emit("融资余额变化_20d", factor_margin_change(margin, window=20))
+            # ── moneyflow 因子已弃用（akshare 资金流数据不足）──
+            # 大单净流入_5d / 大单残差净流入_5d 不再计算；moneyflow 上游已不加载（恒 None）。
+            # 保留 yield 守卫以兼容旧 YAML；新生产 YAML 不应包含这两个因子名。
+            # 详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
             if moneyflow is not None and _want_factor("大单净流入_5d", fn_set):
                 yield _emit(
                     "大单净流入_5d",

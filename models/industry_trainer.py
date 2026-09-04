@@ -29,7 +29,7 @@ from models.trainer import (
     WalkForwardTrainer, MLDataset,
     MIN_STOCKS_PER_DATE, MODEL_TYPES,
     TRAIN_WINDOWS_MONTHS, VAL_WINDOW_MONTHS, REBALANCE_FREQ,
-    spearman_ic,
+    LABEL_MODE_DEFAULT, spearman_ic,
 )
 from config.settings import PROCESSED_DIR
 
@@ -78,7 +78,7 @@ class IndustryWalkForwardTrainer:
         min_stocks: int = MIN_STOCKS_INDUSTRY,
         rebalance_freq: str = None,
         hold_period: int = 20,
-        label_mode: str = "cs_zscore",
+        label_mode: str = LABEL_MODE_DEFAULT,
         wf_selection: str = "ic_weighted",
         ensemble_method: str = "zscore",
         output_rank: bool = False,

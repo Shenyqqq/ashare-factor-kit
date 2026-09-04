@@ -20,6 +20,7 @@ from backtest.risk_metrics import (
     compute_risk_metrics,
     format_risk_metrics_table,
     export_risk_metrics,
+    period_returns_from_nav,
 )
 
 
@@ -148,7 +149,7 @@ def test_empty_nav():
     m = compute_risk_metrics(pd.DataFrame(), rebalance_freq="ME")
     assert m.empty
     assert list(m.columns) == ["年化收益", "年化波动", "Sharpe", "Sortino",
-                                "最大回撤", "Calmar", "IR", "胜率"]
+                                "最大回撤", "Calmar", "IR", "胜率", "超额胜率"]
 
 
 # ── 格式化表可读 ───────────────────────────────────────────────────────────
@@ -221,8 +222,74 @@ def test_export_csv(tmp_path):
     assert "track" in df.columns
     assert "sharpe" in df.columns
     assert "ann_return" in df.columns
+    assert "win_rate" in df.columns
+    assert "beat_bm_rate" in df.columns
     # 返回的 metrics 与 compute 一致
     assert "Sharpe" in m.columns
+
+
+def test_beat_bm_rate_distinct_from_win_rate():
+    """超额胜率 = 期收益>benchmark，与「收益>0」胜率分列；fillna(0) 含首期。"""
+    # W-FRI 调仓：Top100 每期都赢基准，但第 3 期绝对收益为负
+    rets = {
+        "Q5": [0.02, 0.01, -0.01, 0.03],
+        "Top100": [0.03, 0.02, -0.01, 0.04],
+        "benchmark": [0.01, 0.00, -0.02, 0.02],
+    }
+    nav = _nav_from_rets(rets, start="2023-01-06", freq="W-FRI")
+    # 还原期收益应含首期、与手工 fillna(0) 一致
+    recovered = period_returns_from_nav(nav["Top100"])
+    assert list(np.round(recovered.values, 10)) == [0.03, 0.02, -0.01, 0.04]
+
+    m = compute_risk_metrics(nav, rebalance_freq="W-FRI")
+    # Top100 期胜率 3/4；超额 4/4（含负收益那期仍打赢基准）
+    assert m.loc["Top100", "胜率"] == pytest.approx(0.75)
+    assert m.loc["Top100", "超额胜率"] == pytest.approx(1.0)
+    assert np.isnan(m.loc["benchmark", "超额胜率"])
+    # CSV 英文字段不与 win_rate 混名
+    txt = format_risk_metrics_table(m)
+    assert "超额胜率" in txt
+    assert "Top100" in txt
+
+
+def test_print_quantile_summary_highlights_top100_win_rates():
+    """摘要表打印 Top100 期胜率与超额胜率，不只藏在 CSV。"""
+    from unittest.mock import patch
+
+    from backtest.quantile import QuantileResult
+    from backtest.report import print_quantile_summary
+
+    rets = {
+        "Q1": [-0.02, 0.01, -0.01, 0.00],
+        "Q5": [0.02, 0.01, 0.00, 0.03],
+        "Top100": [0.03, 0.02, -0.01, 0.04],
+        "benchmark": [0.01, 0.00, -0.02, 0.02],
+    }
+    nav = _nav_from_rets(rets, start="2023-01-06", freq="W-FRI")
+    ls = (1 + (nav["Q5"] / nav["Q5"].shift(1).fillna(1.0) - 1)
+          - (nav["Q1"] / nav["Q1"].shift(1).fillna(1.0) - 1)).cumprod()
+    result = QuantileResult(
+        nav=nav,
+        annual_returns=pd.DataFrame(
+            {"Q1": [0.1], "Q5": [0.2], "Top100": [0.25]}, index=[2023],
+        ),
+        ic_monotonicity=0.9,
+        long_short_nav=ls,
+        turnover=pd.DataFrame(),
+        top_holdings={},
+    )
+    captured: list[str] = []
+    with patch("backtest.report.logger") as log:
+        log.info.side_effect = lambda msg: captured.append(str(msg))
+        print_quantile_summary(result, rebalance_freq="W-FRI")
+    text = "\n".join(captured)
+    assert "期胜率" in text
+    assert "超额胜率" in text
+    assert "★ Top100" in text
+    assert "实操参考" in text
+    # 75.0% 期胜率、100.0% 超额
+    assert "75.0%" in text
+    assert "100.0%" in text
 
 
 if __name__ == "__main__":

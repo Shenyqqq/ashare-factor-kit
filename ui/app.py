@@ -54,8 +54,8 @@ CAP_BANDS = [
     "mid",
 ]
 LABEL_MODES = [
-    "cs_zscore",
     "cs_rank",
+    "cs_zscore",
     "raw",
     "top40_cs_zscore",
     "cs_rank_softlong",
@@ -189,7 +189,7 @@ def build_run_argv(
         argv.append("--feature-neutralize")
     else:
         argv.append("--no-feature-neutralize")
-    if label_mode and label_mode != "cs_zscore":
+    if label_mode and label_mode != "cs_rank":
         argv.extend(["--label-mode", label_mode])
     if objective and objective != "regression":
         argv.extend(["--objective", objective])
@@ -464,7 +464,7 @@ def _render_backtest_tab(python: Path) -> None:
             "标签 label-mode（模型要预测的目标怎么标准化）",
             LABEL_MODES,
             index=0,
-            help="默认 cs_zscore=截面 z 分数。barra_residual=先扣掉风格再当标签。",
+            help="默认 cs_rank=截面百分位。cs_zscore=截面 z 分数。barra_residual=先扣掉风格再当标签。",
         )
         objective = st.selectbox(
             "训练目标 objective（回归 / 排序）",

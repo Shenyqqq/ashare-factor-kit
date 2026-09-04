@@ -67,12 +67,62 @@ def test_winsorize_empty_frame():
 
 
 def test_ml_and_ic_share_winsorize_helper():
-    """IC cli 与 ML build_factor_dataset 均调用同一 winsorize_forward_return。"""
+    """IC cli 与 ML 标签路径均调用同一 winsorize_forward_return。"""
     import strategies.ml as ml
     from research.ic import cli as ic_cli
 
-    ml_src = inspect.getsource(ml.build_factor_dataset)
+    ml_src = inspect.getsource(ml._maybe_winsor_forward_return)
     assert "winsorize_forward_return" in ml_src
 
     cli_src = inspect.getsource(ic_cli.run)
     assert "winsorize_forward_return" in cli_src
+
+
+def test_cs_rank_skips_fwd_return_winsor():
+    """cs_rank / cs_rank_softlong 默认不截尾；cs_zscore / raw 仍截尾。"""
+    import strategies.ml as ml
+
+    assert ml.should_winsor_fwd_return("cs_rank", True) is False
+    assert ml.should_winsor_fwd_return("cs_rank_softlong", True) is False
+    assert ml.should_winsor_fwd_return("cs_zscore", True) is True
+    assert ml.should_winsor_fwd_return("raw", True) is True
+    assert ml.should_winsor_fwd_return("barra_residual", True) is True
+    assert ml.should_winsor_fwd_return("cs_zscore", False) is False
+    # 消融开关：cs_rank 也可先 winsor 再 rank；仍受 --no-fwd-return-winsor 约束
+    assert ml.should_winsor_fwd_return("cs_rank", True, cs_rank_winsor=True) is True
+    assert ml.should_winsor_fwd_return("cs_rank_softlong", True, cs_rank_winsor=True) is True
+    assert ml.should_winsor_fwd_return("cs_rank", False, cs_rank_winsor=True) is False
+
+    helper_src = inspect.getsource(ml._maybe_winsor_forward_return)
+    assert "cs_rank: skip fwd_return_winsor, rank on raw forward_return" in helper_src
+
+    # 出口走 helper，不再对所有 label 无条件 winsor
+    eager_src = inspect.getsource(ml.build_factor_dataset)
+    lazy_src = inspect.getsource(ml._build_factor_dataset_lazy)
+    assert "_maybe_winsor_forward_return" in eager_src
+    assert "_maybe_winsor_forward_return" in lazy_src
+    assert "if fwd_return_winsor and FWD_RETURN_WINSOR" not in eager_src
+    assert "if fwd_return_winsor and FWD_RETURN_WINSOR" not in lazy_src
+
+
+def test_cs_rank_winsor_clips_then_keeps_rank_mode(monkeypatch):
+    """--cs-rank-winsor 时 cs_rank 也走 winsorize，并打 fwd_return_winsor 日志。"""
+    import strategies.ml as ml
+
+    rng = np.linspace(-0.5, 0.49, 100)
+    rng[0] = -10.0
+    rng[-1] = 10.0
+    codes = [f"{i:06d}" for i in range(100)]
+    fwd = pd.DataFrame(
+        [rng],
+        index=pd.to_datetime(["2024-01-02"]),
+        columns=codes,
+    )
+    monkeypatch.setattr(ml, "FWD_RETURN_WINSOR", (0.01, 0.99))
+    out = ml._maybe_winsor_forward_return(
+        fwd, fwd_return_winsor=True, label_mode="cs_rank", cs_rank_winsor=True,
+    )
+    lo = pd.Series(rng).quantile(0.01)
+    hi = pd.Series(rng).quantile(0.99)
+    assert out.iloc[0, 0] == pytest.approx(lo)
+    assert out.iloc[0, -1] == pytest.approx(hi)

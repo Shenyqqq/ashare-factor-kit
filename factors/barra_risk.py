@@ -458,13 +458,15 @@ def barra_value(financial: pd.DataFrame, prices: pd.DataFrame,
     当日不复权价）。两者都不可用则跳过。
     """
     if "pb" in financial.columns:
-        pb = _pivot_ffill(financial, "pb", prices.index)
+        pb = _pivot_ffill(financial, "pb", prices.index).reindex(columns=prices.columns)
         bp = 1.0 / pb.replace(0, np.nan)
         return _normalize_barra(bp)
 
     if "bvps" in financial.columns and prices_raw is not None:
-        bvps = _pivot_ffill(financial, "bvps", prices_raw.index)
-        price = prices_raw.reindex(columns=bvps.columns)
+        bvps = _pivot_ffill(financial, "bvps", prices_raw.index).reindex(
+            columns=prices.columns
+        )
+        price = prices_raw.reindex(columns=prices.columns)
         bp = bvps / price.replace(0, np.nan)
         bp = bp.replace([np.inf, -np.inf], np.nan)
         logger.info("Barra_Value 用 bvps / prices_raw 计算 B/P（同 factor_value_pb）")
@@ -561,7 +563,9 @@ def barra_leverage(financial: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFram
     for col in ("debt_to_assets", "debt_asset_ratio", "liabilities_to_assets",
                 "debt_ratio"):
         if col in financial.columns:
-            lev = _pivot_ffill(financial, col, prices.index)
+            lev = _pivot_ffill(financial, col, prices.index).reindex(
+                columns=prices.columns
+            )
             logger.info(f"Barra_Leverage = DTOA，使用列: {col}")
             return _normalize_barra(lev)
 
@@ -570,8 +574,12 @@ def barra_leverage(financial: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFram
          if c in financial.columns), None,
     )
     if liab_col is not None and "total_assets" in financial.columns:
-        liab = _pivot_ffill(financial, liab_col, prices.index)
-        assets = _pivot_ffill(financial, "total_assets", prices.index)
+        liab = _pivot_ffill(financial, liab_col, prices.index).reindex(
+            columns=prices.columns
+        )
+        assets = _pivot_ffill(financial, "total_assets", prices.index).reindex(
+            columns=prices.columns
+        )
         dtoa = liab / assets.where(assets > 0)
         logger.info(f"Barra_Leverage = DTOA（{liab_col} / total_assets 自算）")
         return _normalize_barra(dtoa.replace([np.inf, -np.inf], np.nan))
@@ -605,7 +613,7 @@ def barra_growth(financial: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame 
         col = next((c for c in cols if c in financial.columns), None)
         if col is None:
             continue
-        yoy = _pivot_ffill(financial, col, prices.index)
+        yoy = _pivot_ffill(financial, col, prices.index).reindex(columns=prices.columns)
         legs.append(_normalize_barra(yoy))
         used.append(f"{label}={col}")
 
@@ -623,7 +631,9 @@ def barra_growth(financial: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame 
     # fallback：从 revenue 自算同比（季度频率，所以近似用4个季报间隔）
     for col in ("revenue", "total_revenue", "or"):
         if col in financial.columns:
-            pivot = _pivot_ffill(financial, col, prices.index)
+            pivot = _pivot_ffill(financial, col, prices.index).reindex(
+                columns=prices.columns
+            )
             # 用252交易日近似1年同比（已 ffill，所以是滚动的）
             yoy = pivot.pct_change(252)
             logger.warning(f"Barra_Growth 用 {col}.pct_change(252) 近似同比（降级）")

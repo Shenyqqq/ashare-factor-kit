@@ -52,6 +52,9 @@ def save_models_manifest(
     entries: list[dict],
     out_dir: Path,
     metadata: dict | None = None,
+    *,
+    feature_neutralize: bool | None = None,
+    neut_controls: str | None = None,
 ) -> None:
     """
     写模型 manifest JSON。
@@ -66,9 +69,20 @@ def save_models_manifest(
         训练级共享元信息，会合并进每条 entry，建议包含：
         ``feature_names`` / ``rebalance_freq`` / ``hold_period`` /
         ``label_mode`` / ``params`` / ``git_commit``。
+    feature_neutralize : bool | None
+        训练时是否做了 Barra+行业残差化。显式传入时合并进 metadata
+        （若 metadata 已含同名键则以 metadata 为准，避免双重覆盖）。
+        live.daily_update 据此与 CLI ``--feature-neutralize`` 校验一致性。
+    neut_controls : str | None
+        残差化控制变量集合（``barra`` | ``size_industry``）。写入后
+        live.daily_update 按同口径中性化；缺字段时 live 默认 ``barra``。
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = dict(metadata or {})
+    if "feature_neutralize" not in meta and feature_neutralize is not None:
+        meta["feature_neutralize"] = bool(feature_neutralize)
+    if "neut_controls" not in meta and neut_controls is not None:
+        meta["neut_controls"] = str(neut_controls)
     # 若未显式提供 git_commit，则自动获取一次
     if "git_commit" not in meta:
         meta["git_commit"] = _git_commit(out_dir.resolve() if hasattr(out_dir, "resolve") else None)

@@ -39,6 +39,8 @@
 
 真正缺的日频主力流仍是：**东财大单/超大单面板**（注册已有、raw 未就绪）或 Tushare **个股资金流向（DC）** 等付费长历史。
 
+> **2026-08-13 弃用决定**：akshare 东财大单/超大单全市场长期拉不稳（push2his 限流重、单票历史常仅近数月），`moneyflow_large` 长期缺失或过短 → **`大单净流入_5d` / `大单残差净流入_5d` 因子已标记弃用**，不再进入 IC / 生产 YAML。`live/daily_update.py::incremental_download` 与 `run.py::_load_data` 均不再加载 `moneyflow_large`（强制 `moneyflow=None`）；`factors/factor_alpha.py::load_moneyflow` / `factor_moneyflow_large`、`factors/factor_ashare.py::factor_moneyflow_residual`、`factors/factor.py` registry yield 块已加 `[DEPRECATED]` 标注。实现保留，待接 Tushare DC 长历史后复活。`data/download_moneyflow.py` 脚本保留但不再被 live/研究管线调用。
+
 ---
 
 ## 2. Tushare 清单 → 仓库覆盖速览

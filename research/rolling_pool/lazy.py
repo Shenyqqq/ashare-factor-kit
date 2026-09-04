@@ -11,9 +11,11 @@ Lazy rolling-pool factor panels for ML / Walk-Forward.
 正确性约定
 ----------
 1. **neut 缓存键**（``research.rolling_pool.neut_cache``，与急切
-   ``build_factor_dataset`` 共用）：名 + ``neut_v6`` + hold_period +
-   rebalance_freq + 宇宙指纹 + 调仓日历指纹 + Barra/行业/权重指纹。
-   **跨 horizon / 跨调仓频率 / 跨样本绝不可共用。**
+   ``build_factor_dataset`` 共用）：名 + ``neut_v6`` + hold_period
+   + rebalance_freq + 宇宙指纹 + 调仓日历指纹 + Barra/行业/权重指纹。
+   默认 ``barra`` 不加 ``nc:``（与旧 ``neut_v6`` 文件兼容）；
+   仅 ``size_industry`` 等非默认集合插入 ``|nc:{mode}``。
+   **跨 horizon / 跨调仓频率 / 跨样本 / 跨控制变量集合绝不可共用。**
    清缓存：删 ``data/processed/factor_panels/factor_panel_neut_*.parquet``。
 2. **所有面板同口径清洗**：磁盘面板、registry 现算、``seed_panels``（always_on
    的 Barra / special）都过 ``_prepare``（reindex prices → float32 → inf→NaN）。
@@ -237,6 +239,13 @@ class RollingPoolPanelStore:
         hold_period: int | None = None,
         rebalance_freq: str | None = None,
         strict: bool = True,
+        neut_controls: str = "barra",
+        industry_panel: pd.DataFrame | None = None,
+        membership_mask: pd.DataFrame | None = None,
+        circ_mv: pd.DataFrame | None = None,
+        min_industry_n: int = 0,
+        restan_in_universe: bool = False,
+        universe_tag: str = "",
     ):
         self.prices = prices
         self.registry_kwargs = registry_kwargs
@@ -244,6 +253,7 @@ class RollingPoolPanelStore:
         self.feature_neutralize = feature_neutralize
         self.barra_factors = barra_factors
         self.industry_map = industry_map
+        self.industry_panel = industry_panel
         # 截面残差化的 WLS 权重面板（= √市值），None → 等权 OLS
         self.weight_panel = weight_panel
         self.active_dates_by_factor = active_dates_by_factor or {}
@@ -257,6 +267,12 @@ class RollingPoolPanelStore:
         self.hold_period = hold_period
         self.rebalance_freq = rebalance_freq
         self.strict = bool(strict)
+        self.neut_controls = str(neut_controls or "barra")
+        self.membership_mask = membership_mask
+        self.circ_mv = circ_mv
+        self.min_industry_n = int(min_industry_n or 0)
+        self.restan_in_universe = bool(restan_in_universe)
+        self.universe_tag = str(universe_tag or "")
         if self.feature_neutralize and self.neut_disk_cache and (
             hold_period is None or rebalance_freq is None
         ):
@@ -271,6 +287,7 @@ class RollingPoolPanelStore:
                 barra_factors if feature_neutralize else None,
                 industry_map=industry_map if feature_neutralize else None,
                 weight_panel=weight_panel if feature_neutralize else None,
+                industry_panel=industry_panel if feature_neutralize else None,
             )
             if feature_neutralize
             else "ctrl:na"
@@ -417,6 +434,8 @@ class RollingPoolPanelStore:
             rebalance_freq=str(self.rebalance_freq or "na"),
             rebalance_dates=dates,
             ctrl_sig=self._ctrl_sig,
+            neut_controls=self.neut_controls,
+            universe_tag=self.universe_tag,
         )
 
     def _try_load_neut_disk(self, name: str) -> pd.DataFrame | None:
@@ -476,7 +495,10 @@ class RollingPoolPanelStore:
 
         if should_skip_neutralize(name):
             return panel
-        if self.barra_factors is None or self.industry_map is None:
+        if self.barra_factors is None:
+            return panel
+        need_ind = str(self.neut_controls or "barra") != "size"
+        if need_ind and self.industry_map is None and self.industry_panel is None:
             return panel
 
         dates_use = self.active_dates_by_factor.get(name)
@@ -485,9 +507,17 @@ class RollingPoolPanelStore:
         if dates_use is None or len(dates_use) == 0:
             return panel
 
+        src = panel
+        if self.restan_in_universe and self.membership_mask is not None:
+            from research.ic.universe import restan_within_mask
+            src = restan_within_mask(panel, self.membership_mask, dates=dates_use)
         resid = residualize_panel(
-            panel, self.barra_factors, self.industry_map, dates_use,
+            src, self.barra_factors, self.industry_map, dates_use,
             weight_panel=self.weight_panel,
+            industry_panel=self.industry_panel,
+            membership_mask=self.membership_mask,
+            circ_mv=self.circ_mv,
+            min_industry_n=self.min_industry_n,
         )
         return cs_zscore_sparse_rows(resid)
 

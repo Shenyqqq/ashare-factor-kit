@@ -279,14 +279,47 @@ def resolve_execution_date(
     return signal_date if signal_date in trading_index else None
 
 
+def hold_exit_date(
+    trading_index: pd.DatetimeIndex,
+    signal_date: pd.Timestamp,
+    hold_period: int,
+) -> pd.Timestamp | None:
+    """Trading day ``t+hold_period`` (label ``close[t+N]``)."""
+    if hold_period is None or int(hold_period) <= 0:
+        return None
+    if signal_date not in trading_index:
+        return None
+    loc = trading_index.get_loc(signal_date)
+    if isinstance(loc, slice):
+        loc = loc.start or 0
+    exit_loc = int(loc) + int(hold_period)
+    if exit_loc >= len(trading_index):
+        return None
+    return trading_index[exit_loc]
+
+
 def hold_dates_between(
     trading_index: pd.DatetimeIndex,
     execution_date: pd.Timestamp,
     next_signal_date: pd.Timestamp,
+    *,
+    signal_date: pd.Timestamp | None = None,
+    hold_period: int | None = None,
 ) -> pd.DatetimeIndex:
-    """Trading days in [execution_date, next_signal_date] inclusive."""
+    """Trading days in [execution_date, exit] inclusive.
+
+    Default exit is ``next_signal_date`` (hold to the next rebalance signal).
+    If ``hold_period`` and ``signal_date`` are set, exit at the trading day
+    ``hold_period`` after the signal (``close[t+N]``), matching
+    ``build_forward_return``.
+    """
+    end = next_signal_date
+    if hold_period is not None and int(hold_period) > 0 and signal_date is not None:
+        exit_d = hold_exit_date(trading_index, signal_date, int(hold_period))
+        if exit_d is not None:
+            end = exit_d
     return trading_index[
-        (trading_index >= execution_date) & (trading_index <= next_signal_date)
+        (trading_index >= execution_date) & (trading_index <= end)
     ]
 
 

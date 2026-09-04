@@ -38,6 +38,9 @@ import pandas as pd
 from loguru import logger
 
 
+from models.trainer import LABEL_MODE_DEFAULT
+
+
 def _resolve_rebalance_freq(horizon: int) -> str:
     """与 run.py._horizon_to_rebalance_freq 对齐。"""
     if horizon <= 3:
@@ -105,7 +108,7 @@ def run_multi_horizon(
     val_window: int | None = None,
     artifact_dir=None,
     wf_selection: str = "ic_weighted",
-    label_mode: str = "cs_zscore",
+    label_mode: str = LABEL_MODE_DEFAULT,
     ensemble_method: str = "zscore",
     save_models: bool = False,
     objective: str = "regression",

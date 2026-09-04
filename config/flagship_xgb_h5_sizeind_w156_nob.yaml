@@ -1,0 +1,66 @@
+# 旗舰：xgb_h5_sizeind_w156_nob
+# 生产出分：python -m live.flagship_last_window
+# 全量 WF 复现（慢，不必每日）：见 reproduce.run_py
+#
+# 定义：mode=xgb, h=5, train=156 期, val=0, retrain_every=4, time-decay=0,
+# cs_rank 不 winsor, feature-neutralize size_industry, PIT 行业,
+# dense 53 + sparse 11, bid-ask 10bp, 无 B 股(200/900), 北交所 92 保留。
+
+name: xgb_h5_sizeind_w156_nob
+as_of: null  # null=今天；对齐到数据末日
+output_dir: results/xgb_h5_sizeind_w156_nob_20260817
+top_n: 100
+lookback_days: 14  # 仅 OHLCV 增量窗口；东财 circ_mv 禁止把 lookback 当 start
+
+model:
+  mode: xgb
+  horizon: 5
+  hold_period: 5
+  rebalance_freq: W-FRI
+  train_windows: [156]
+  train_window_units: periods
+  val_window: 0
+  retrain_every: 4
+  time_decay: 0.0
+  label_mode: cs_rank
+  cs_rank_winsor: false
+  fwd_return_winsor: true  # cs_rank 路径仍跳过截尾
+  objective: regression
+  wf_selection: ic_weighted
+  device: cpu
+
+neutralize:
+  feature_neutralize: true
+  neut_controls: size_industry  # Size + PIT sw_l2；非 9 风格 Barra
+
+factors:
+  dense_yaml: config/factor_configs_h5_sizeind_20260815.yaml
+  dense_n: 53
+  special_factors: sparse
+  sparse_from_ic: research/output/selected_factors_h5_sizeind_20260815.json
+  sparse_n: 11
+
+costs:
+  bid_ask_spread_bps: 10.0
+
+universe:
+  exclude_b_share: true  # 200/900
+  keep_bj_92: true
+  bt_score_universe: strict
+  tradable: research  # 训练池；出分用 live strict 可买
+
+reproduce:
+  run_py: >
+    python run.py --skip-download --mode xgb --horizon 5
+    --factor-config config/factor_configs_h5_sizeind_20260815.yaml
+    --special-factors sparse
+    --sparse-from-ic research/output/selected_factors_h5_sizeind_20260815.json
+    --train-windows 156 --train-window-units periods --val-window 0
+    --retrain-every 4 --time-decay 0 --feature-neutralize
+    --neut-controls size_industry --bid-ask-spread 10
+    --output-dir results/xgb_h5_sizeind_w156_nob_20260817
+  last_window: python -m live.flagship_last_window
+  note: >
+    日常生产只训最新调仓日的过去 156 期（一窗 xgb）再对数据末日出分；
+    live.daily_update 不能自己重训，需先有 models_manifest。
+    全量 2021 起 WF 仅在要历史回测或 --save-models 全折时跑。

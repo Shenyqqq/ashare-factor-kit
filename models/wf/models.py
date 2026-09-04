@@ -145,7 +145,8 @@ def prepare_rank_labels(
     Parameters
     ----------
     y :
-        堆叠后的训练/验证标签（通常为 per-date ``cs_rank``）。
+        堆叠后的训练/验证标签（通常为 per-date ``cs_rank``，来自未 winsor
+        的 raw forward_return）。
     group_sizes :
         各调仓日样本数；``None`` 时把整段 ``y`` 视为单个截面。
 

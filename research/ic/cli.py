@@ -134,6 +134,8 @@ _IC_SKIP_PREFIXES = ("市场", "HMM_")
 
 # IC 阶段 checkpoint 宇宙后缀（换 universe 不得复用全市场 IC）
 _CKPT_TAG = ""
+_CKPT_NEUT_TAG = ""
+_NEUT_CKPT_STAGES = frozenset({"barra_pure", "selection", "gramschmidt"})
 
 
 def _is_ic_skippable(name: str) -> bool:
@@ -154,7 +156,8 @@ def _is_ic_skippable(name: str) -> bool:
 # 阶段 checkpoint：崩溃后 --resume 跳过已完成阶段，避免重算 34min 因子 IC
 # ══════════════════════════════════════════════════════════════════════════════
 
-_CKPT_DIR = Path("research/output/_checkpoints")
+_CKPT_DIR_DEFAULT = Path("research/output/_checkpoints")
+_CKPT_DIR = _CKPT_DIR_DEFAULT
 
 
 def _universe_tag(
@@ -162,10 +165,20 @@ def _universe_tag(
     quantile: float,
     universe_mask: str | None,
     cap_band: str | None,
+    mcap_min_yi: float | None = None,
+    mcap_max_yi: float | None = None,
+    calendar_fp: str = "",
 ) -> str:
     """Checkpoint / 落盘文件名后缀；全市场返回空串（兼容旧路径）。"""
     import hashlib
 
+    if mcap_min_yi is not None or mcap_max_yi is not None:
+        lo = int(mcap_min_yi) if mcap_min_yi is not None else 0
+        hi = int(mcap_max_yi) if mcap_max_yi is not None else 0
+        tag = f"mcap{lo}_{hi}"
+        if calendar_fp:
+            tag = f"{tag}_{calendar_fp}"
+        return tag
     if universe_mask:
         h = hashlib.md5(str(universe_mask).encode("utf-8")).hexdigest()[:8]
         return f"umask_{h}"
@@ -179,14 +192,40 @@ def _universe_tag(
     return ""
 
 
+def _calendar_fp(index) -> str:
+    """交易日历指纹：首尾日期 + 长度。换数据区间不得 resume 旧 ckpt。"""
+    import hashlib
+
+    if index is None or len(index) == 0:
+        return "nocal"
+    idx = pd.DatetimeIndex(index)
+    payload = f"{idx.min().date()}_{idx.max().date()}_{len(idx)}"
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:6]
+
+
 def _set_ckpt_tag(tag: str) -> None:
     global _CKPT_TAG
     _CKPT_TAG = tag or ""
 
 
+def _set_ckpt_dir(path: Path | None) -> None:
+    """全市场用默认目录；亿元带落到 ``_checkpoints/mcap{lo}_{hi}/``，禁止同名覆盖。"""
+    global _CKPT_DIR
+    _CKPT_DIR = path if path is not None else _CKPT_DIR_DEFAULT
+
+
+def _set_ckpt_neut_tag(tag: str) -> None:
+    """raw / size / size_industry 与 9 风格 barra_pure 隔离；barra 保持空后缀。"""
+    global _CKPT_NEUT_TAG
+    _CKPT_NEUT_TAG = tag or ""
+
+
 def _ckpt_path(period: int, stage: str) -> Path:
     tag = f"_{_CKPT_TAG}" if _CKPT_TAG else ""
-    return _CKPT_DIR / f"{stage}_h{period}{tag}.pkl"
+    neut = ""
+    if stage in _NEUT_CKPT_STAGES and _CKPT_NEUT_TAG:
+        neut = f"_{_CKPT_NEUT_TAG}"
+    return _CKPT_DIR / f"{stage}_h{period}{neut}{tag}.pkl"
 
 
 def _save_ckpt(period: int, stage: str, obj) -> None:
@@ -218,10 +257,11 @@ def _load_ckpt(period: int, stage: str):
 def _clear_ckpts(period: int) -> None:
     if not _CKPT_DIR.exists():
         return
-    tag = f"_{_CKPT_TAG}" if _CKPT_TAG else ""
-    for f in _CKPT_DIR.glob(f"*_h{period}{tag}.pkl"):
+    stages = ("ic_series", "summary", "yearly", "barra_pure", "selection", "gramschmidt")
+    for stage in stages:
+        p = _ckpt_path(period, stage)
         try:
-            f.unlink()
+            p.unlink()
         except OSError:
             pass
 
@@ -265,8 +305,10 @@ def _resolve_domain_mask(
     amount: pd.DataFrame | None,
     rebalance_dates: pd.DatetimeIndex,
     trading_index: pd.DatetimeIndex,
+    mcap_min_yi: float | None = None,
+    mcap_max_yi: float | None = None,
 ) -> tuple[pd.DataFrame | None, str]:
-    """解析宇宙域 mask。优先级：--universe-mask > --universe > --cap-band。
+    """解析宇宙域 mask。优先级：--universe-mask > 亿元带 > --universe > --cap-band。
 
     返回 (mask_or_None, 人类可读描述)。因子面板列集不变，仅截面 AND。
     """
@@ -274,6 +316,25 @@ def _resolve_domain_mask(
         mask = load_universe_mask_file(universe_mask_path)
         mask = mask.reindex(index=trading_index).ffill().fillna(False).astype(bool)
         desc = f"universe-mask file={universe_mask_path}"
+        return mask, desc
+
+    if mcap_min_yi is not None or mcap_max_yi is not None:
+        if circ_mv is None and total_mv is None:
+            raise SystemExit(
+                "--mcap-min-yi/--mcap-max-yi 需要 circ_mv 或 total_mv"
+                "（请先 `python -m data.download_stock_value_em`）"
+            )
+        from utils.universe import build_mcap_yi_band_mask
+        mask = build_mcap_yi_band_mask(
+            circ_mv, min_yi=mcap_min_yi, max_yi=mcap_max_yi, total_mv=total_mv,
+        )
+        lo = "无" if mcap_min_yi is None else f"{float(mcap_min_yi):.0f}"
+        hi = "无" if mcap_max_yi is None else f"{float(mcap_max_yi):.0f}"
+        src = "circ_mv" if circ_mv is not None else "total_mv"
+        desc = (
+            f"mcap-yi-band: {src} ∈ [{lo}, {hi}] 亿元（含边界，单位元=亿×1e8；"
+            f"无 20 日成交额过滤）"
+        )
         return mask, desc
 
     u = (universe or "all").strip().lower()
@@ -507,6 +568,8 @@ def run(
     industry: bool = False,
     allow_static_industry: bool = False,
     barra: bool = False,
+    neut_controls: str | None = None,
+    save_suffix: str = "",
     lookback_years: int = 0,
     workers: int | None = None,
     barra_workers: int | None = None,
@@ -533,6 +596,10 @@ def run(
     universe: str = "all",
     universe_quantile: float = SMALL_MCAP_QUANTILE,
     universe_mask: str | None = None,
+    mcap_min_yi: float | None = None,
+    mcap_max_yi: float | None = None,
+    restan_in_universe: bool | None = None,
+    min_industry_n: int | None = None,
     fwd_return_winsor: bool = True,
     corr_dedup: bool = True,
     corr_threshold: float = 0.70,
@@ -598,15 +665,51 @@ def run(
         raise ValueError(
             f"quantile_y_mode 须为 residual|raw，收到 {quantile_y_mode!r}"
         )
-    # 宇宙 + 可交易口径标签：checkpoint / 落盘后缀
-    u_tag = _universe_tag(universe, universe_quantile, universe_mask, cap_band)
+    # 宇宙 + 可交易口径标签：checkpoint 后缀在载入日历后才钉死（含 mcap 日历指纹）
     tmr_tag = tradable_ckpt_tag(
         exclude_limit_on_signal, apply_exec_mask, tradable_limit_mode
     )
-    ckpt_tag = "_".join(x for x in (u_tag, tmr_tag) if x)
-    _set_ckpt_tag(ckpt_tag)
-    if ckpt_tag:
-        print(f"  [checkpoint] 后缀: _{ckpt_tag} ({tmr_meta})")
+    use_mcap_band = mcap_min_yi is not None or mcap_max_yi is not None
+    # 每次 run 重置，避免同进程二次调用残留全市场 / 中盘目录
+    _set_ckpt_tag("")
+    _set_ckpt_neut_tag("")
+    _set_ckpt_dir(None)
+    if use_mcap_band:
+        lo = int(mcap_min_yi) if mcap_min_yi is not None else 0
+        hi = int(mcap_max_yi) if mcap_max_yi is not None else 0
+        _set_ckpt_dir(_CKPT_DIR_DEFAULT / f"mcap{lo}_{hi}")
+    if restan_in_universe is None:
+        restan_in_universe = bool(use_mcap_band)
+    if min_industry_n is None:
+        min_industry_n = 10 if use_mcap_band else 0
+    min_industry_n = int(min_industry_n)
+    # 中性化口径：None=raw；size / size_industry / barra。--barra ≡ barra。
+    from models.wf.labels import (
+        NEUT_CONTROLS_CHOICES,
+        NEUT_CONTROLS_SIZE,
+        NEUT_CONTROLS_SIZE_INDUSTRY,
+    )
+    nc_raw = (str(neut_controls).strip().lower() if neut_controls else "")
+    if barra and nc_raw and nc_raw not in ("barra",):
+        raise ValueError(
+            "--barra 是 9 风格纯 IC，与 --neut-controls size/size_industry 互斥"
+        )
+    if nc_raw in ("", "raw", "none"):
+        neut_mode = "barra" if barra else None
+    elif nc_raw in NEUT_CONTROLS_CHOICES:
+        neut_mode = nc_raw
+    else:
+        raise ValueError(
+            f"未知 --neut-controls={neut_controls!r}，可选: raw / "
+            f"{list(NEUT_CONTROLS_CHOICES)}"
+        )
+    do_neut = neut_mode is not None
+    if neut_mode and neut_mode != "barra":
+        _set_ckpt_neut_tag(f"nc_{neut_mode}")
+    elif not do_neut:
+        _set_ckpt_neut_tag("nc_raw")
+    else:
+        _set_ckpt_neut_tag("")
     print(
         f"  [tradable] mode={tmr_meta['tradable_mode']} "
         f"exclude_limit_signal_day={ex_lim} "
@@ -621,7 +724,6 @@ def run(
             print("  [警告] --fresh 与 --only-new/--factors 互斥：--fresh 优先，将全量重算")
             only_new = False
             factors = None
-        _clear_ckpts(period)
     # 增量模式：保留 ic_series + barra_pure（指纹匹配时只补新区）；
     # summary/selection/GS 等下游仍强制重跑。
     incremental = bool(only_new or factors) and not fresh
@@ -666,6 +768,8 @@ def run(
         amount=bundle.amount,
         rebalance_dates=rebalance_dates,
         trading_index=bundle.prices.index,
+        mcap_min_yi=mcap_min_yi,
+        mcap_max_yi=mcap_max_yi,
     )
     if domain_mask is not None:
         print(f"  [universe] {domain_desc}")
@@ -702,6 +806,32 @@ def run(
         print("  可交易池 mask: " + " + ".join(parts))
         _log_mask_coverage(tradable, rebalance_dates, "tradable")
 
+    # checkpoint 后缀：mcap 带必须含日历指纹，禁止 resume 全市场 barra_pure_h5
+    cal_fp = _calendar_fp(bundle.prices.index) if use_mcap_band else ""
+    u_tag = _universe_tag(
+        universe, universe_quantile, universe_mask, cap_band,
+        mcap_min_yi=mcap_min_yi, mcap_max_yi=mcap_max_yi, calendar_fp=cal_fp,
+    )
+    ckpt_tag = "_".join(x for x in (u_tag, tmr_tag) if x)
+    _set_ckpt_tag(ckpt_tag)
+    if fresh:
+        _clear_ckpts(period)
+    if ckpt_tag or _CKPT_NEUT_TAG or _CKPT_DIR != _CKPT_DIR_DEFAULT:
+        print(
+            f"  [checkpoint] dir={_CKPT_DIR.as_posix()} "
+            f"后缀: _{ckpt_tag} neut={_CKPT_NEUT_TAG or 'barra/legacy'} "
+            f"({tmr_meta})"
+        )
+    if use_mcap_band:
+        print(
+            f"  [midcap] restan_in_universe={bool(restan_in_universe)} "
+            f"min_industry_n={min_industry_n} "
+            f"Size=池内 log(circ_mv)  WLS=√circ_mv 池内归一  "
+            f"禁止 --barra 9 风格"
+        )
+    if restan_in_universe and tradable is not None:
+        print("  [restan] 全市场 winsor+zscore 面板将在当日宇宙上重做截面步")
+
     # 先 mask 再 winsorize：分位数只在可交易样本上算；未开启截尾时仍由
     # compute_ic_series(tradable=...) 按需屏蔽，避免改变 universe 统计口径。
     if fwd_return_winsor and FWD_RETURN_WINSOR is not None:
@@ -716,10 +846,10 @@ def run(
 
     industry_map = resolve_industry_map(
         bundle.industry_map_df,
-        need=industry or barra,
+        need=industry or do_neut,
     )
     industry_panel = None
-    if barra:
+    if do_neut and neut_mode != NEUT_CONTROLS_SIZE:
         # 严格默认：必须有 PIT 行业面板；禁止静默静态 fallback（PIT 泄漏）。
         # 仅 --allow-static-industry 允许退化。
         industry_panel = require_industry_panel(allow_static=allow_static_industry)
@@ -731,6 +861,8 @@ def run(
             print("  [PIT] industry_map_panel.parquet 不存在，"
                   "已启用 --allow-static-industry → 静态 industry_map"
                   "（行业哑变量可能含 PIT 泄漏）")
+    elif do_neut and neut_mode == NEUT_CONTROLS_SIZE:
+        print("  [neut] size-only：不加载行业面板")
 
     # tradable mask 已构建完成，stock_names / is_st_current 不再需要 → 释放
     bundle.stock_names = None
@@ -890,6 +1022,9 @@ def run(
 
         def _compute_ic_for_panel(name, panel):
             panel_f32 = _to_float32_panel(panel)
+            if restan_in_universe and tradable is not None:
+                from research.ic.universe import restan_within_mask
+                panel_f32 = restan_within_mask(panel_f32, tradable)
             ic = compute_ic_series(panel_f32, forward_return, tradable=tradable)
             all_ic_full[name] = ic
             computed_names.append(name)
@@ -1201,6 +1336,10 @@ def run(
                     "universe_quantile": universe_quantile,
                     "universe_mask": universe_mask,
                     "cap_band": cap_band,
+                    "mcap_min_yi": mcap_min_yi,
+                    "mcap_max_yi": mcap_max_yi,
+                    "restan_in_universe": bool(restan_in_universe),
+                    "min_industry_n": min_industry_n,
                     **tmr_meta,
                 },
                 "orthogonalization": None,
@@ -1222,7 +1361,7 @@ def run(
                 emerging_factors=emerging_kept,
                 categories=categories,
                 labels=labels,
-                name_suffix=u_tag,
+                name_suffix="_".join(x for x in (save_suffix, u_tag) if x),
             )
             print(f"\n结果已保存至 {json_path.parent}  ({json_path.name})")
         _maybe_plot_rolling_ic(
@@ -1252,7 +1391,7 @@ def run(
     if decay:
         print("\n计算IC衰减...")
         decay_registry = _LazyFactorRegistry(
-            set(all_ic_full.keys()), data_kwargs, cache=True
+            set(all_ic_full.keys()), data_kwargs, cache=False
         )
         decay_df = ic_decay_table(
             decay_registry, bundle.prices, bundle.open_,
@@ -1267,7 +1406,7 @@ def run(
     if corr:
         print("\n因子相关矩阵...")
         corr_registry = _LazyFactorRegistry(
-            set(all_ic_full.keys()), data_kwargs, cache=True
+            set(all_ic_full.keys()), data_kwargs, cache=False
         )
         corr_mat = factor_corr_matrix(
             corr_registry, bundle.prices, names=list(all_ic_full.keys())
@@ -1284,10 +1423,21 @@ def run(
     pure_ic_series = {}
     barra_names_used: list = []
     quantile_df = pd.DataFrame()
-    # 分位分解仅在 --barra 路径有意义；未开 barra 时忽略开关
-    do_quantile = bool(barra) and bool(quantile_decomp)
-    if barra:
-        # ── Stage 5 checkpoint：Barra 纯 IC（仅在成功时保存，失败则 resume 重试） ──
+    # 分位分解仅在中性化路径有意义；raw 时忽略开关
+    do_quantile = bool(do_neut) and bool(quantile_decomp)
+    skip_neut_names: set[str] = set()
+    if do_neut:
+        from factors.sparse_factors import partition_sparse
+        from factors.special_factors import should_skip_neutralize
+        _dense_n, _sparse_n = partition_sparse(list(summary_df.index))
+        skip_neut_names = set(_sparse_n) | {
+            n for n in summary_df.index if should_skip_neutralize(n)
+        }
+        print(
+            f"  [neut-controls] {neut_mode}；"
+            f"跳过残差化 {len(skip_neut_names)} 个（sparse/special/size pack）"
+        )
+        # ── Stage 5 checkpoint：纯 IC（仅在成功时保存，失败则 resume 重试） ──
         # 格式演进：
         #   2-tuple → 无 series，重算
         #   3-tuple (means, names, series) → 无分位表；若需要 quantile 则重算
@@ -1314,6 +1464,22 @@ def run(
                 ver_ok = barra_pure_version_ok(
                     bmeta, for_incremental=bool(incremental),
                 )
+                stored_nc = (bmeta or {}).get("neut_controls", "barra")
+                stored_u = (bmeta or {}).get("universe_tag", "")
+                if str(stored_nc) != str(neut_mode or "barra"):
+                    print(
+                        f"  [resume] barra_pure neut_controls 不匹配 "
+                        f"（stored={stored_nc!r}, current={neut_mode!r}），将重算"
+                    )
+                    ver_ok = False
+                if _CKPT_TAG and str(stored_u) != str(_CKPT_TAG):
+                    if "mcap" in (_CKPT_TAG or "") or "mcap" in str(stored_u):
+                        print(
+                            f"  [resume] barra_pure universe_tag 不匹配 "
+                            f"（stored={stored_u!r}, current={_CKPT_TAG!r}），"
+                            f"禁止 resume 全市场/其它宇宙 ckpt"
+                        )
+                        ver_ok = False
                 if not ver_ok:
                     stored = (bmeta or {}).get("barra_version")
                     print(
@@ -1429,6 +1595,11 @@ def run(
                     total_mv=bundle.total_mv,
                     turnover_rate=bundle.turnover_rate,
                     amount=bundle.amount,
+                    neut_controls=neut_mode or "barra",
+                    skip_names=skip_neut_names,
+                    membership_mask=tradable,
+                    min_industry_n=min_industry_n,
+                    restan_in_universe=bool(restan_in_universe),
                 )
                 del barra_registry
                 gc.collect()
@@ -1463,6 +1634,8 @@ def run(
                             barra_names_used,
                             pure_ic_series,
                             quantile_df,
+                            neut_controls=neut_mode or "barra",
+                            universe_tag=_CKPT_TAG,
                         ),
                     )
                     print_barra_comparison(summary_df, pure_ic_means)
@@ -1533,7 +1706,7 @@ def run(
         # ── 多轨：稠密（panel corr 去重）+ 稀疏独立轨道 + 新兴观察 ──
         cm = corr_method or IC_CORR_METHOD
         select_registry = _LazyFactorRegistry(
-            set(all_ic_full.keys()), data_kwargs, cache=True
+            set(all_ic_full.keys()), data_kwargs, cache=False
         )
         sel = select_factors_multi_track(
             summary_df,
@@ -1700,6 +1873,7 @@ def run(
             "ic_series_length": ic_series_length,
             "sample_period": sample_period,
             "barra_factors_used": barra_names_used,
+            "neut_controls": neut_mode or "raw",
             "industry_reference": INDUSTRY_REFERENCE,
             "nw_lag": nw_lag,
             "config_snapshot": {
@@ -1707,7 +1881,8 @@ def run(
                 "IC_CORR_METHOD": IC_CORR_METHOD,
                 "IC_RANK_METHOD": IC_RANK_METHOD,
                 "IC_MIN_LISTING_DAYS": IC_MIN_LISTING_DAYS,
-                "barra": bool(barra),
+                "barra": bool(do_neut and neut_mode == "barra"),
+                "neut_controls": neut_mode or "raw",
                 "use_fdr": use_fdr,
                 "t_threshold": t_threshold,
                 "corr_dedup": corr_dedup,
@@ -1719,12 +1894,16 @@ def run(
                 "universe_quantile": universe_quantile,
                 "universe_mask": universe_mask,
                 "cap_band": cap_band,
+                "mcap_min_yi": mcap_min_yi,
+                "mcap_max_yi": mcap_max_yi,
+                "restan_in_universe": bool(restan_in_universe),
+                "min_industry_n": min_industry_n,
                 "enable_decay_gate": enable_decay_gate,
                 "enable_emerging": enable_emerging,
                 "enable_sparse_track": enable_sparse_track,
                 "ic_threshold": ic_threshold,
                 "icir_threshold": icir_threshold,
-                "ic_icir_gate": "pure_AND" if barra else "raw_AND",
+                "ic_icir_gate": "pure_AND" if do_neut else "raw_AND",
                 "decay_retention_min": decay_retention_min,
                 "decay_recent_icir_max": decay_recent_icir_max,
                 "decay_recent_ic_max": decay_recent_ic_max,
@@ -1780,7 +1959,7 @@ def run(
             categories=categories,
             labels=labels,
             quantile_df=quantile_df if do_quantile else None,
-            name_suffix=u_tag,
+            name_suffix="_".join(x for x in (save_suffix, u_tag) if x),
         )
         print(f"\n结果已保存至 {json_path.parent}  ({json_path.name})")
 
@@ -1823,8 +2002,24 @@ def main():
 
     # ── 日常必用 ──────────────────────────────────────────────────────────
     parser.add_argument("--period", type=int, default=20, help="持仓期 / IC horizon（默认 20）")
-    parser.add_argument("--barra", action="store_true", help="Barra 纯 IC（生产推荐）")
+    parser.add_argument("--barra", action="store_true", help="Barra 9 风格纯 IC（勿与 --neut-controls size* 同用）")
+    parser.add_argument(
+        "--neut-controls",
+        dest="neut_controls",
+        choices=("raw", "size", "size_industry", "barra"),
+        default=None,
+        help=(
+            "中性化控制变量：默认 raw（不残差）；size=仅 Size；"
+            "size_industry=Size+PIT行业；barra=9风格+行业（同 --barra）"
+        ),
+    )
     parser.add_argument("--save", action="store_true", help="写出 selected_factors / YAML 素材")
+    parser.add_argument(
+        "--save-suffix",
+        dest="save_suffix",
+        default="",
+        help="落盘文件名后缀（如 raw_20260815），避免覆盖旗舰 JSON/YAML",
+    )
     parser.add_argument("--sample", type=int, default=0, help="仅前 N 个因子（快速 smoke）")
     parser.add_argument(
         "--resume",
@@ -1859,6 +2054,34 @@ def main():
             f"市值带预设（默认 {CAP_BAND_DEFAULT}）；"
             "micro_30/micro_lt30=circ_mv≤30亿无地板（≠micro 8~30亿）"
         ),
+    )
+    parser.add_argument(
+        "--mcap-min-yi",
+        type=float,
+        default=None,
+        dest="mcap_min_yi",
+        help=_h("流通市值下限（亿元，含；单位元=亿×1e8）。与 --mcap-max-yi 构成每日宇宙，无成交额过滤", advanced=False),
+    )
+    parser.add_argument(
+        "--mcap-max-yi",
+        type=float,
+        default=None,
+        dest="mcap_max_yi",
+        help=_h("流通市值上限（亿元，含）。例: 30–100 亿中盘", advanced=False),
+    )
+    parser.add_argument(
+        "--restan-in-universe",
+        dest="restan_in_universe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=_h("在当日宇宙上重做截面 winsor+zscore（亿元带默认开）", advanced=True),
+    )
+    parser.add_argument(
+        "--min-industry-n",
+        type=int,
+        default=None,
+        dest="min_industry_n",
+        help=_h("档内行业哑元最少有效样本，少则并入「其他」（亿元带默认 10；0=关闭）", advanced=True),
     )
 
     # ── 高级 ──────────────────────────────────────────────────────────────
@@ -2332,6 +2555,8 @@ def main():
         industry=args.industry,
         allow_static_industry=args.allow_static_industry,
         barra=args.barra,
+        neut_controls=args.neut_controls,
+        save_suffix=args.save_suffix,
         lookback_years=args.lookback_years,
         workers=args.workers,
         barra_workers=args.barra_workers,
@@ -2358,6 +2583,10 @@ def main():
         universe=args.universe,
         universe_quantile=args.universe_quantile,
         universe_mask=args.universe_mask,
+        mcap_min_yi=args.mcap_min_yi,
+        mcap_max_yi=args.mcap_max_yi,
+        restan_in_universe=args.restan_in_universe,
+        min_industry_n=args.min_industry_n,
         fwd_return_winsor=args.fwd_return_winsor,
         corr_dedup=args.corr_dedup,
         corr_threshold=args.corr_threshold,

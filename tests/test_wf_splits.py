@@ -91,6 +91,41 @@ def test_single_window_val0_ok():
     assert t.train_windows == [13]
 
 
+def test_time_decay_default_and_zero():
+    """默认 0.015；0 合法（窗内等权）；负数拒绝。"""
+    from models.trainer import TIME_DECAY
+    import numpy as np
+
+    t_default = WalkForwardTrainer(
+        train_windows=[13],
+        val_window=0,
+        train_window_units="periods",
+        model_types=["ridge"],
+    )
+    assert t_default.time_decay == TIME_DECAY == 0.015
+
+    t_zero = WalkForwardTrainer(
+        train_windows=[13],
+        val_window=0,
+        train_window_units="periods",
+        model_types=["ridge"],
+        time_decay=0,
+    )
+    assert t_zero.time_decay == 0.0
+    # 0 → exp(0*i)=1，窗内各期 decay 相等
+    assert float(np.exp(t_zero.time_decay * 0)) == 1.0
+    assert float(np.exp(t_zero.time_decay * 103)) == 1.0
+
+    with pytest.raises(ValueError, match="time_decay"):
+        WalkForwardTrainer(
+            train_windows=[13],
+            val_window=0,
+            train_window_units="periods",
+            model_types=["ridge"],
+            time_decay=-0.01,
+        )
+
+
 def test_legacy_offset_val_differs_by_window():
     """Deprecated window_specific_val=False: longer W pushes val earlier."""
     idx, val_w = 100, 6
@@ -134,6 +169,9 @@ def test_purge_empty_val_still_purges_pred():
 def test_hold_period_to_embargo_periods():
     dates = pd.date_range("2020-01-01", periods=30, freq="W-FRI").tolist()
     assert hold_period_to_embargo_periods(5, dates) >= 1
+    # 周频日历 + 3 日标签：缺口约 7 个自然日 → embargo 仍为 1 期
+    assert hold_period_to_embargo_periods(3, dates) == 1
+    assert hold_period_to_embargo_periods(3, dates) == hold_period_to_embargo_periods(5, dates)
 
 
 def test_is_retrain_step_default_every_period():

@@ -208,6 +208,7 @@ def _pairwise_corr_matrix(
     cand_registry,
     sample_dates: list,
     candidates: list | None = None,
+    tradable: pd.DataFrame | None = None,
 ) -> list[pd.DataFrame]:
     """
     流式构建逐调仓日截面 corr 矩阵，避免同时持有所有候选因子完整面板。
@@ -259,6 +260,9 @@ def _pairwise_corr_matrix(
         # requiring all factors non-null collapses the cross-section below 30
         # and silently skips corr dedup (seen on h20 overnight runs).
         df_slice = pd.DataFrame(row)
+        if tradable is not None and date in tradable.index:
+            mem = tradable.loc[date].reindex(df_slice.index).fillna(False)
+            df_slice = df_slice.loc[mem.astype(bool)]
         if df_slice.shape[0] <= 30:
             continue
         c = df_slice.corr(method="spearman", min_periods=30)
@@ -317,6 +321,7 @@ def select_factors(
     worst_period_ic_threshold: float | None = None,
     corr_dedup: bool = True,
     min_long_share: float | None = IC_MIN_LONG_SHARE,
+    tradable: pd.DataFrame | None = None,
 ) -> tuple[list, dict]:
     """
     Auto factor selection:
@@ -421,7 +426,9 @@ def select_factors(
 
     # 流式 corr：传 LazyRegistry + candidates 列表，_pairwise_corr_matrix 内部
     # 逐候选加载 → 取 sample_dates 切片 → 释放全面板（峰值 1 个面板 + 切片集合）
-    corr_list = _pairwise_corr_matrix(factor_registry, sample_dates, candidates=candidates)
+    corr_list = _pairwise_corr_matrix(
+        factor_registry, sample_dates, candidates=candidates, tradable=tradable,
+    )
     if not corr_list:
         print(
             f"  [warn] 相关去重：截面 corr 矩阵为空（{len(candidates)} 候选 / "
@@ -964,6 +971,7 @@ def _dedup_sparse_by_corr(
     corr_threshold: float = IC_SPARSE_CORR_THRESHOLD,
     corr_method: str | None = None,
     sample_step: int = 20,
+    tradable: pd.DataFrame | None = None,
 ) -> tuple[list[str], dict]:
     """稀疏名单 corr-dedup（只影响 ``sparse_kept`` / ``factors_sparse``）。
 
@@ -1005,6 +1013,7 @@ def _dedup_sparse_by_corr(
                 factor_registry.release_cache()
             corr_list = _pairwise_corr_matrix(
                 factor_registry, sample_dates, candidates=candidates,
+                tradable=tradable,
             )
             if corr_list:
                 agg_corr = _aggregate_corr(corr_list, method)
@@ -1341,6 +1350,7 @@ def select_sparse_factors(
             corr_threshold=corr_threshold,
             corr_method=corr_method,
             sample_step=sample_step,
+            tradable=tradable,
         )
         exclusions.update(dedup_ex)
 
@@ -1477,7 +1487,8 @@ def select_factors_multi_track(
             icir_threshold=sparse_icir_threshold,
             win_rate_min=sparse_win_rate_min,
             payoff_min=sparse_payoff_min,
-            pure_ic_means=pure_ic_means,
+            # 稀疏轨始终用 raw IC，不把 residual/pure 混进稀疏排序
+            pure_ic_means=None,
             sparse_names=frozenset(sparse_names),
             factor_registry=factor_registry,
             forward_return=forward_return,
@@ -1559,6 +1570,7 @@ def select_factors_multi_track(
             worst_period_ic_threshold=worst_period_ic_threshold,
             corr_dedup=corr_dedup,
             min_long_share=min_long_share,
+            tradable=tradable,
         )
     result.exclusions.update(base_ex)
 

@@ -8,8 +8,67 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from loguru import logger
 
 from utils.wls import wls_residual
+
+# ``--feature-neutralize`` 控制变量集合。``barra`` = 9 风格 + 行业（现状）；
+# ``size_industry`` = 仅 Barra_Size（东财 circ_mv 的 log）+ 行业哑变量；
+# ``size`` = 仅 Barra_Size，无行业（PIT 行业覆盖不足时的退路）。
+NEUT_CONTROLS_BARRA = "barra"
+NEUT_CONTROLS_SIZE_INDUSTRY = "size_industry"
+NEUT_CONTROLS_SIZE = "size"
+NEUT_CONTROLS_CHOICES = (
+    NEUT_CONTROLS_BARRA,
+    NEUT_CONTROLS_SIZE_INDUSTRY,
+    NEUT_CONTROLS_SIZE,
+)
+SIZE_NEUT_FACTOR = "Barra_Size"
+
+
+def normalize_neut_controls(
+    value: str | None,
+    *,
+    missing_warn: bool = False,
+) -> str:
+    """规范化 ``neut_controls``；缺字段时默认 ``barra``。"""
+    if value is None or (isinstance(value, str) and not str(value).strip()):
+        if missing_warn:
+            logger.warning(
+                "manifest 无 neut_controls 字段（旧训练产物），按 barra 默认处理"
+            )
+        return NEUT_CONTROLS_BARRA
+    v = str(value).strip().lower()
+    if v not in NEUT_CONTROLS_CHOICES:
+        raise ValueError(
+            f"未知 neut_controls={value!r}，可选: {list(NEUT_CONTROLS_CHOICES)}"
+        )
+    return v
+
+
+def select_neut_control_factors(
+    barra_factors: dict[str, pd.DataFrame] | None,
+    neut_controls: str | None = NEUT_CONTROLS_BARRA,
+) -> dict[str, pd.DataFrame] | None:
+    """按 ``neut_controls`` 从完整 Barra dict 取出残差化控制变量。
+
+    ``barra``：原样返回 9 风格。
+    ``size_industry`` / ``size``：只留 ``Barra_Size``（log 流通市值）。
+    行业哑变量由 ``residualize_panel`` 的 ``industry_map`` / ``industry_panel``
+    单独拼，不在此 dict（``size`` 模式不拼行业）。
+    """
+    mode = normalize_neut_controls(neut_controls)
+    if barra_factors is None:
+        return None
+    if mode == NEUT_CONTROLS_BARRA:
+        return barra_factors
+    size = barra_factors.get(SIZE_NEUT_FACTOR)
+    if size is None or getattr(size, "empty", False):
+        raise ValueError(
+            f"neut-controls={mode} 需要 Barra_Size（东财 circ_mv 的 log），"
+            "但 get_barra_factors 未产出该面板"
+        )
+    return {SIZE_NEUT_FACTOR: size}
 
 
 def cross_sectional_rank(y: np.ndarray) -> np.ndarray:
@@ -106,6 +165,48 @@ def long_bias_sample_weights(
         s = t * t * (3.0 - 2.0 * t)  # hermite smoothstep
         return (bw + (1.0 - bw) * s).astype(np.float64)
     raise ValueError(f"未知 curve: {curve}，可选 smooth | step")
+
+
+def rank_tail_sample_weights(
+    y: np.ndarray,
+    mid_weight: float = 0.6,
+) -> np.ndarray:
+    """
+    截面分位 U 形样本权重（两端对比 + 头部区分）。
+
+    每个训练截面用该样本自己的 y：已是 cs_rank ∈ [0, 1]（且几乎铺满
+    单位区间）则直接当 r；否则先在该截面 ``cross_sectional_rank`` 到 0–1。
+
+    公式（平滑抛物线，非三档阶跃）::
+
+        w = mid + (1 - mid) * (2 * |r - 0.5|) ** 2
+
+    mid=0.6 → w(0)=w(1)=1.0，w(0.5)=0.6；|r-0.5|≥0.4（r≤0.1 或 r≥0.9）
+    时 w≥0.856，接近两端满权。mid≥1 → 全 1（关闭）。
+    """
+    y_f = np.asarray(y, dtype=float)
+    n = len(y_f)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    mid = float(mid_weight)
+    if not np.isfinite(mid) or mid <= 0:
+        raise ValueError(f"mid_weight 须为正有限值，收到 {mid_weight}")
+    if mid >= 1.0 - 1e-12:
+        return np.ones(n, dtype=np.float64)
+    finite = y_f[np.isfinite(y_f)]
+    use_as_rank = (
+        finite.size >= 2
+        and float(np.min(finite)) >= -1e-9
+        and float(np.max(finite)) <= 1.0 + 1e-9
+        and float(np.max(finite) - np.min(finite)) >= 0.8
+    )
+    if use_as_rank:
+        r = np.clip(y_f, 0.0, 1.0)
+    else:
+        r = cross_sectional_rank(y_f)
+    # w = mid + (1-mid) * (2*|r-0.5|)**2
+    w = mid + (1.0 - mid) * np.square(2.0 * np.abs(r - 0.5))
+    return w.astype(np.float64)
 
 
 def soft_truncate_rank_label(
@@ -433,6 +534,101 @@ def residual_return_label(
     return pd.Series(resid.astype(np.float32), index=y_s.index)
 
 
+def _prepare_industry_panel(panel: pd.DataFrame) -> pd.DataFrame:
+    """规范化 PIT 行业长表，供逐日 as-of（避免每截面 copy）。"""
+    pit = panel.copy()
+    if "effective_date" not in pit.columns and "start_date" in pit.columns:
+        pit = pit.rename(columns={"start_date": "effective_date"})
+    pit["effective_date"] = pd.to_datetime(pit["effective_date"], errors="coerce")
+    if "end_date" in pit.columns:
+        pit["end_date"] = pd.to_datetime(pit["end_date"], errors="coerce")
+    else:
+        pit["end_date"] = pd.NaT
+    pit["code"] = pit["code"].astype(str)
+    return pit.dropna(subset=["effective_date"])
+
+
+def _sw_l2_as_of(panel: pd.DataFrame, date) -> pd.Series:
+    """``effective_date ≤ t`` 且 ``end_date`` 空或 ``≥ t``；同 code 取最晚生效。"""
+    ts = pd.Timestamp(date)
+    mask = (panel["effective_date"] <= ts) & (
+        panel["end_date"].isna() | (panel["end_date"] >= ts)
+    )
+    sub = (
+        panel.loc[mask]
+        .sort_values("effective_date")
+        .drop_duplicates(subset=["code"], keep="last")
+    )
+    if sub.empty or "sw_l2" not in sub.columns:
+        return pd.Series(dtype=object)
+    return sub.set_index("code")["sw_l2"]
+
+
+def collapse_rare_industries(
+    ind: pd.Series,
+    min_n: int,
+    other_label: str = "其他",
+) -> pd.Series:
+    """档内有效样本 < ``min_n`` 的行业并入 ``other_label``。
+
+    ``min_n<=1`` 时原样返回。并完后若只剩一类，调用方应跳过行业哑元。
+    """
+    if ind is None or getattr(ind, "empty", True):
+        return ind
+    n_min = int(min_n or 0)
+    if n_min <= 1:
+        return ind.astype(str)
+    s = ind.fillna("未分类").astype(str)
+    vc = s.value_counts(dropna=False)
+    rare = set(vc[vc < n_min].index)
+    if not rare:
+        return s
+    return s.where(~s.isin(rare), other_label)
+
+
+def inpool_log_mcap_control(
+    circ_mv_row: pd.Series,
+    members: pd.Index,
+) -> pd.Series:
+    """当日池内 ``log(circ_mv)`` 再截面 z-score，作 Size 控制。
+
+    不用全市场 zscore 后的 ``Barra_Size``。池内方差≈0 时填 0（列仍在，
+    与截距共线，等于「做了 Size 控制但无可估斜率」）。
+    """
+    mv = pd.to_numeric(circ_mv_row.reindex(members), errors="coerce")
+    log_mv = np.log(mv.where(mv > 0))
+    out = np.full(len(members), np.nan, dtype=np.float64)
+    v = log_mv.to_numpy(dtype=np.float64, copy=False)
+    ok = np.isfinite(v)
+    if int(ok.sum()) < 2:
+        return pd.Series(out, index=members, dtype=np.float32)
+    sub = v[ok]
+    std = float(sub.std())
+    if std < 1e-12:
+        out[ok] = 0.0
+        return pd.Series(out, index=members, dtype=np.float32)
+    out[ok] = (sub - float(sub.mean())) / std
+    return pd.Series(out, index=members, dtype=np.float32)
+
+
+def _industry_dummy_cols(
+    ind: pd.Series,
+    min_industry_n: int = 0,
+) -> dict[str, pd.Series]:
+    """行业哑变量（drop_first），与 IC ``_industry_dummies`` 同约定。"""
+    ind_s = ind.fillna("未分类")
+    if min_industry_n and int(min_industry_n) > 1:
+        ind_s = collapse_rare_industries(ind_s, int(min_industry_n))
+    cats = sorted(ind_s.astype(str).unique())
+    if len(cats) <= 1:
+        return {}
+    ref = cats[0]
+    return {
+        f"_ind_{g}": (ind_s.astype(str) == g).astype(np.float32)
+        for g in cats if g != ref
+    }
+
+
 def residualize_panel(
     factor_panel: pd.DataFrame,
     barra_factors: dict[str, pd.DataFrame] | None,
@@ -440,14 +636,22 @@ def residualize_panel(
     rebalance_dates: pd.DatetimeIndex,
     min_stocks: int = 30,
     weight_panel: pd.DataFrame | None = None,
+    industry_panel: pd.DataFrame | None = None,
+    membership_mask: pd.DataFrame | None = None,
+    circ_mv: pd.DataFrame | None = None,
+    min_industry_n: int = 0,
 ) -> pd.DataFrame:
     """
-    逐截面 WLS: ``factor ~ [1, Barra_*, industry_dummies]``，返回残差面板。
+    逐截面 WLS: ``factor ~ [1, controls, industry_dummies]``，返回残差面板。
 
-    与 ``research/ic/barra.py::compute_pure_ic_fast`` 用同一套控制变量
-    （Barra 9 风格 + 行业哑变量 drop_first）**与同一套回归权重（√市值）**，
-    保证 IC 筛选与 ML 训练口径一致——IC 阶段剔除系统性敞口后筛选出的因子，
-    进入 ML 时特征同样被中性化，避免模型把 Size/Beta 系统性敞口当成 alpha 学习。
+    默认控制变量 = Barra 9 风格 + 行业哑变量 drop_first，与
+    ``research/ic/barra.py::compute_pure_ic_fast`` **及同一套回归权重（√市值）**
+    对齐。``--neut-controls size_industry`` 时 ``barra_factors`` 只含
+    ``Barra_Size``（东财 ``log(circ_mv)``），行业走 PIT ``industry_panel``
+    （``effective_date ≤ t`` 当时申万二级）；无 panel 时才回退静态
+    ``industry_map``。``size`` 模式不拼行业。
+    调用方用 ``select_neut_control_factors`` 子集化，勿把 9 风格 dict 直接
+    残差化后再靠缓存键区分。
 
     Parameters
     ----------
@@ -456,7 +660,7 @@ def residualize_panel(
     barra_factors : dict[str, pd.DataFrame] | None
         Barra 风格因子名 -> (date × stock) DataFrame。
     industry_map : pd.Series | None
-        stock code -> industry category。
+        stock code -> industry category（静态回填，仅无 PIT panel 时用）。
     rebalance_dates : pd.DatetimeIndex
         需要做残差化的截面日期；非这些日期的行返回 NaN。
     min_stocks : int, default 30
@@ -465,6 +669,17 @@ def residualize_panel(
         截面回归权重面板 (date × stock)，本仓库口径 = **√市值**
         （见 ``factors/barra_risk.py::barra_regression_weights``）。
         None 时退化为等权 OLS（朴素全市场 OLS 会被小微盘噪声主导）。
+    industry_panel : pd.DataFrame | None
+        PIT 行业长表（code / effective_date / sw_l2 / end_date）。提供时
+        逐调仓日 as-of，忽略静态 ``industry_map`` 的历史回填。
+    membership_mask : pd.DataFrame | None
+        逐日宇宙 bool 面板。提供时**先**把回归样本裁成当日成员，再估 β
+        （禁止全市场 WLS 再切片）。``None`` = 全市场（默认，行为不变）。
+    circ_mv : pd.DataFrame | None
+        与 ``membership_mask`` 联用：Size 控制改为池内 ``log(circ_mv)`` z-score，
+        不用全市场标准化后的 ``Barra_Size`` 列。
+    min_industry_n : int, default 0
+        档内某行业有效样本少于此值则并入「其他」；``<=1`` 关闭（默认全市场不变）。
 
     Returns
     -------
@@ -474,7 +689,8 @@ def residualize_panel(
     """
     if factor_panel is None or factor_panel.empty:
         return factor_panel
-    if (barra_factors is None or len(barra_factors) == 0) and industry_map is None:
+    has_ind = industry_panel is not None or industry_map is not None
+    if (barra_factors is None or len(barra_factors) == 0) and not has_ind:
         # 无控制变量 → 不做残差化，原样返回
         return factor_panel
 
@@ -486,18 +702,18 @@ def residualize_panel(
     f_arr = factor_panel.to_numpy(dtype=np.float64, copy=False)
     date_to_row = {pd.Timestamp(d): i for i, d in enumerate(factor_panel.index)}
 
-    # 行业哑变量：一次性构造为 {col_name: Series(stock → 0/1)}，
-    # 后续按当期 barra_df.index reindex 即可。
+    use_pit = industry_panel is not None and not getattr(industry_panel, "empty", True)
+    pit_prepared: pd.DataFrame | None = (
+        _prepare_industry_panel(industry_panel) if use_pit else None
+    )
+
+    min_ind = int(min_industry_n or 0)
+    use_members = membership_mask is not None
+
+    # 静态路径：行业哑变量一次性构造；PIT / membership 路径每截面 as-of。
     ind_cols: dict | None = None
-    if industry_map is not None:
-        ind_s = industry_map.fillna("未分类")
-        cats = sorted(ind_s.unique())
-        if len(cats) > 1:
-            ref = cats[0]
-            ind_cols = {
-                f"_ind_{g}": (ind_s == g).astype(np.float32)
-                for g in cats if g != ref
-            }
+    if not use_pit and not use_members and industry_map is not None:
+        ind_cols = _industry_dummy_cols(industry_map, min_industry_n=min_ind) or None
 
     for date in rebalance_dates:
         date = pd.Timestamp(date)
@@ -515,10 +731,51 @@ def residualize_panel(
                     ctrl_cols[bname] = bdf.loc[date].astype(np.float32)
         if not ctrl_cols:
             continue  # 当期无 Barra 因子覆盖 → 跳过该截面
-        barra_df = pd.DataFrame(ctrl_cols).fillna(0.0)
+        barra_df = pd.DataFrame(ctrl_cols)
+        if use_members:
+            if date not in membership_mask.index:
+                continue
+            mem = membership_mask.loc[date].reindex(barra_df.index)
+            mem = mem.fillna(False).astype(bool)
+            barra_df = barra_df.loc[mem]
+            if len(barra_df) < min_stocks:
+                continue
+        if (
+            use_members
+            and circ_mv is not None
+            and SIZE_NEUT_FACTOR in barra_df.columns
+            and date in circ_mv.index
+        ):
+            barra_df[SIZE_NEUT_FACTOR] = inpool_log_mcap_control(
+                circ_mv.loc[date], barra_df.index,
+            )
+            other = [c for c in barra_df.columns if c != SIZE_NEUT_FACTOR]
+            if other:
+                barra_df[other] = barra_df[other].fillna(0.0)
+            barra_df = barra_df.dropna(subset=[SIZE_NEUT_FACTOR])
+            if len(barra_df) < min_stocks:
+                continue
+        else:
+            barra_df = barra_df.fillna(0.0)
 
         # 行业哑变量对齐到 barra_df.index
-        if ind_cols is not None:
+        if use_pit and pit_prepared is not None:
+            ind_s = _sw_l2_as_of(pit_prepared, date).reindex(barra_df.index)
+            pit_cols = _industry_dummy_cols(ind_s, min_industry_n=min_ind)
+            if pit_cols:
+                ind_df = pd.DataFrame(pit_cols).reindex(barra_df.index).fillna(0.0)
+                X_df = pd.concat([barra_df, ind_df], axis=1)
+            else:
+                X_df = barra_df
+        elif use_members and industry_map is not None:
+            ind_s = industry_map.reindex(barra_df.index)
+            mem_cols = _industry_dummy_cols(ind_s, min_industry_n=min_ind)
+            if mem_cols:
+                ind_df = pd.DataFrame(mem_cols).reindex(barra_df.index).fillna(0.0)
+                X_df = pd.concat([barra_df, ind_df], axis=1)
+            else:
+                X_df = barra_df
+        elif ind_cols is not None:
             ind_df = pd.DataFrame(ind_cols).reindex(barra_df.index).fillna(0.0)
             X_df = pd.concat([barra_df, ind_df], axis=1)
         else:
