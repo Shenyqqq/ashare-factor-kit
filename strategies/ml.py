@@ -692,7 +692,7 @@ def build_factor_dataset(
     special_factors : str | list | None
         特殊因子 pack / 因子名，白名单过滤后 post-merge 注入（不进因子缓存）。
         例：``"event,size,sparse"`` / ``["event", "size"]``。见
-        ``factors.special_factors`` / ``docs/SPECIAL_FACTORS.md``。
+        ``factors.special_factors`` / ``docs/操作手册.md`` §5.4。
         IC 路径仍不自动纳入；仅训练 / 打分注入。
         ``sparse`` pack 注入时做方差对齐（供 ridge）；**dynamic 轨道禁止注入**。
 

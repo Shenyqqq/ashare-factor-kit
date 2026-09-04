@@ -1,7 +1,7 @@
 """
 factors/factor_ashare.py  —  A 股特色增量因子
 
-落实 docs/ASHARE_FACTOR_GAPS.md 高/中优先级，并补充「有数据未注册」增量：
+落实 A 股特色因子高/中优先级，并补充「有数据未注册」增量：
   - 大单残差净流入（对收益+换手截面回归残差；依赖东财 moneyflow，未就绪则空）
   - 评级上修 / 下调规避 / 研报 EPS 预期差 / 覆盖热度 / 目标价上行空间
   - 龙虎榜机构席位质量 + 净买占比 + reason 分类
@@ -179,7 +179,7 @@ def _safe_normalize(panel: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
 # 1. 大单残差净流入 — 【已弃用 / DEPRECATED】
 # 弃用：依赖东财 moneyflow_large，akshare 全市场拉不稳、单票历史短，因子不可用。
 # 勿再进入 IC / 生产池。保留实现供 Tushare DC 接入后复活。
-# 详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
+# 北向停更后默认不进生产因子。
 # ══════════════════════════════════════════════════════════════════════════════
 
 def factor_moneyflow_residual(

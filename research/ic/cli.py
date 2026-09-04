@@ -1991,10 +1991,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="IC analysis v2（因子 IC 筛选）",
         epilog=(
-            "日常最短: python -m research.ic_analysis_v2 --period 5 --barra --save\n"
+            "日常最短: python -m research.ic_analysis_v2 --period 5 --neut-controls size_industry --save\n"
             "默认已含: FDR / t=2.5 / corr-dedup / research tradable / "
             "decay·emerging·sparse 标注轨（GS 需 --gram-schmidt）。"
-            "全部参数: --help-advanced 或 docs/CLI_QUICKSTART.md"
+            "全部参数: --help-advanced 或 docs/操作手册.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

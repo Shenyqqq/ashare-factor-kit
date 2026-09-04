@@ -20,7 +20,7 @@ Packs
 
 CLI：``--special-factors event,size,sparse``（别名 ``--inject-factors``）；
 ``--event-overlay`` 为 deprecated alias → ``event``。
-详见 ``docs/SPECIAL_FACTORS.md``。
+详见 ``docs/操作手册.md`` §5.4。
 """
 from __future__ import annotations
 

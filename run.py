@@ -15,15 +15,16 @@ run.py  —  一键运行完整流程
 run.py 启动时会自动 bootstrap UTF-8（config/encoding_bootstrap.py）。
 
 用法（最短日常）:
-    python run.py --skip-download --mode ridge --horizon 5 \\
-      --factor-config config/factor_configs.yaml
-    python run.py --skip-download --mode ensemble --horizon 20 \\
-      --factor-config config/factor_configs.yaml --models lgbm,xgb
+    python run.py --skip-download --mode lgbm --horizon 5 \\
+      --factor-config config/factor_configs_h5_sizeind_20260815.yaml \\
+      --neut-controls size_industry --train-windows 104 --train-window-units periods --val-window 0
     python run.py --sample 100
     python run.py --help-advanced   # 全部参数（含高级/deprecated）
 
 默认已含: feature-neutralize、bid-ask(settings=10bp)、research tradable、label=cs_rank。
-详见 docs/CLI_QUICKSTART.md。
+--neut-controls 代码默认仍是 barra；日常/旗舰请显式 size_industry。
+旗舰见 config/flagship_xgb_h5_sizeind_w156_nob.yaml（xgb / 156 期）。
+详见 docs/操作手册.md。
 """
 import argparse
 import os
@@ -211,7 +212,7 @@ def _load_data(skip_download, sample):
     _margin_raw     = _load_opt("margin_balance.parquet")
     margin          = clean_aux_panel(_margin_raw, name="margin") if _margin_raw is not None else None
     # moneyflow 已弃用：akshare 东财大单资金流数据不足（全市场限流、单票历史短），
-    # 因子不可用。强制 None 跳过大单净流入/残差因子计算。详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
+    # 因子不可用。强制 None 跳过大单净流入/残差因子计算。北向/资金流缺口见操作手册 §9.2。
     if _load_opt("moneyflow_large.parquet") is not None:
         logger.warning("moneyflow_large 已弃用（akshare 资金流数据不足），跳过加载；大单净流入/残差因子不计算。")
     moneyflow       = None
@@ -1407,7 +1408,7 @@ if __name__ == "__main__":
             "日常最短: python run.py --skip-download --mode ridge --horizon 5 "
             "--factor-config config/factor_configs.yaml\n"
             "默认已含: feature-neutralize / bid-ask(settings) / research tradable / "
-            "label=cs_rank。全部参数: --help-advanced 或 docs/CLI_QUICKSTART.md"
+            "label=cs_rank。全部参数: --help-advanced 或 docs/操作手册.md"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1465,7 +1466,7 @@ if __name__ == "__main__":
         "--inject-factors",
         dest="special_factors",
         default=None,
-        help="特殊因子 pack（event/size/sparse），白名单后再注入；详见 docs/SPECIAL_FACTORS.md",
+        help="特殊因子 pack（event/size/sparse），白名单后再注入；详见 docs/操作手册.md §5.4",
     )
     parser.add_argument(
         "--cap-band",
@@ -1799,7 +1800,7 @@ if __name__ == "__main__":
         dest="position_regime",
         action="store_true",
         default=False,
-        help=_h("仓位体制：按市场缩放总敞口（docs/POSITION_REGIME.md）", advanced=True),
+        help=_h("仓位体制：按市场缩放总敞口（docs/操作手册.md §5.1）", advanced=True),
     )
     parser.add_argument(
         "--force-exposure",

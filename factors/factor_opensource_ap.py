@@ -1,7 +1,7 @@
 """
 factors/factor_opensource_ap.py — OpenSourceAP CrossSection 会计/价量因子
 
-A 股改写自 Chen/Zimmermann OpenSourceAP predictors（见 docs/OPENSOURCE_AP_FACTORS.md）。
+A 股改写自 Chen/Zimmermann OpenSourceAP predictors。
 财务字段经季报 pivot → 信号构造 → ``pit_reindex_ffill`` / ``_pivot_financial`` PIT 对齐。
 
 方向约定（项目统一「越高越好」）
@@ -45,7 +45,7 @@ A 股改写自 Chen/Zimmermann OpenSourceAP predictors（见 docs/OPENSOURCE_AP_
 - ChEQ / DelEqu 用 ``bvps``（±股本）作账面权益代理。
 - GP/SP/NetDebtPrice/CompositeDebtIssuance/OperProf/XFIN/应计资产比/经营杠杆/资产周转变化
   为现有字段可算的**近似**，非 Compustat 原定义。
-- Batch-3 严格缺口（缺 CHE/INVT/ACT/融资 CF 等）见 docs/OSAP_FACTOR_COVERAGE.md，不假实现。
+- Batch-3 严格缺口（缺 CHE/INVT/ACT/融资 CF 等）不假实现。
 """
 from __future__ import annotations
 

@@ -22,7 +22,7 @@ data/download.py  —  下载历史数据，存为 parquet
     python -m data.download                    # 增量补齐到今天（已有则只补新区间）
     python -m data.download --start 2018-01-01 # 指定起始（默认即此）
     python -m data.download --sample 100       # 调试：只下载前100只
-    # 注意：没有 --update 开关；日常直接跑本模块即增量。详见 data/DATA_UPDATE.md
+    # 注意：没有 --update 开关；日常直接跑本模块即增量。详见 docs/操作手册.md §10。
 """
 import argparse
 import os

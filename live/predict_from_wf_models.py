@@ -150,8 +150,41 @@ def _cross_section_X(dataset, as_of, feature_names):
     return X_raw.fillna(0).loc[has_data]
 
 
-def predict(*, as_of, model_dir, top_n=100, cfg_path=None,
-            prefer_model="xgb", prefer_window=156, output=None):
+def summarize_candidates(top) -> dict:
+    """候选表 ST / B 股 / 北交所 92 计数（供 CLI 日志与 UI 共用，不读盘）。
+
+    - B 股：代码前缀 200 / 900
+    - 北交所 92：代码前缀 92
+    - ST：名称含 ``ST``（启发式；精确历史仍看 ``st_history``）
+    """
+    codes = top["code"].astype(str).str.replace(r"\.\w+$", "", regex=True).str.zfill(6)
+    is_b = codes.str.startswith(("200", "900"))
+    is_92 = codes.str.startswith("92")
+    if "name" in top.columns:
+        is_st = top["name"].astype(str).str.contains("ST", case=False, na=False)
+        st_codes = codes.loc[is_st].tolist()
+        n_st = int(is_st.sum())
+    else:
+        st_codes = []
+        n_st = 0
+    return {
+        "n": int(len(top)),
+        "n_b": int(is_b.sum()),
+        "n_92": int(is_92.sum()),
+        "n_st_name": n_st,
+        "b_codes": codes.loc[is_b].tolist(),
+        "st_codes": st_codes,
+    }
+
+
+def predict_candidates(*, as_of, model_dir, top_n=100, cfg_path=None,
+                       prefer_model="xgb", prefer_window=156, output=None):
+    """按 fold schedule 加载全 WF 留存模型，对信号日出 Top-N（与回测同口径）。
+
+    CLI（``python -m live.predict_from_wf_models``）与 UI 共用此函数，
+    **不训练**、不下单；需本地全市场数据 + ``models_manifest.json``。
+    返回 ``(candidates_df, fit_date)``。
+    """
     import joblib
     from models.wf.models import predict_model
     from live.daily_update import strict_universe_mask, output_topn
@@ -209,13 +242,13 @@ def predict(*, as_of, model_dir, top_n=100, cfg_path=None,
     top.to_csv(csv_path, index=False, encoding="utf-8-sig")
     logger.info(f"已写出（含 fit_date）: {csv_path}  共 {len(top)} 行")
 
-    from data.download import is_b_share_code
-    codes = top["code"].astype(str).str.zfill(6)
-    n_b = int(codes.map(is_b_share_code).sum())
-    n_92 = int(codes.str.startswith("92").sum())
-    logger.info(f"Top{len(top)} 中 B股={n_b}  北交所92={n_92}")
-    if n_b:
-        raise SystemExit(f"候选含 B 股: {codes[codes.map(is_b_share_code)].tolist()}")
+    flags = summarize_candidates(top)
+    logger.info(
+        f"Top{flags['n']} 中 B股={flags['n_b']}  北交所92={flags['n_92']}  "
+        f"名称含ST={flags['n_st_name']}"
+    )
+    if flags["n_b"]:
+        raise SystemExit(f"候选含 B 股: {flags['b_codes']}")
 
     logger.info(f"--- Top30 / {len(top)}（信号日 {as_of.date()}，fit {fit_date.date()}）---")
     for _, r in top.head(30).iterrows():
@@ -224,6 +257,9 @@ def predict(*, as_of, model_dir, top_n=100, cfg_path=None,
         logger.info(f"  {int(r['rank']):>3}. {r['code']} {str(r.get('name') or ''):<10} "
                     f"{yi_s}  score={float(r['score']):.4f}")
     return top, fit_date
+
+
+predict = predict_candidates  # 旧名，CLI / 调用方兼容
 
 
 def _parse_args(argv=None):
@@ -249,9 +285,11 @@ def _parse_args(argv=None):
 
 def main(argv=None):
     a = _parse_args(argv)
-    predict(as_of=a.as_of_date, model_dir=a.model_dir, top_n=a.top_n,
-            cfg_path=a.cfg_path, prefer_model=a.prefer_model,
-            prefer_window=a.prefer_window, output=a.output)
+    predict_candidates(
+        as_of=a.as_of_date, model_dir=a.model_dir, top_n=a.top_n,
+        cfg_path=a.cfg_path, prefer_model=a.prefer_model,
+        prefer_window=a.prefer_window, output=a.output,
+    )
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 """
-简易图形界面：把常用参数映射到 ``python run.py ...`` 与
-``python -m research.ic_analysis_v2 ...``，方便无代码基础的人改参试跑。
+简易图形界面：把常用参数映射到 ``python run.py ...``、
+``python -m research.ic_analysis_v2 ...``，以及 Live 按 fold 出候选股。
 
 启动（仓库根目录）::
 
     streamlit run ui/app.py
 
 不做券商下单、用户系统或 ``logs/driver.py`` 全量编排；全市场 / 全因子很慢，需自备数据。
+Live 页调用 ``live.predict_from_wf_models.predict_candidates``（不训练、不下单）。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import shlex
 import subprocess
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 import streamlit as st
@@ -63,6 +65,29 @@ LABEL_MODES = [
     "triple_barrier",
 ]
 
+# Live 页常量（供 smoke test 断言，不在 import 时读盘）
+LIVE_TAB_LABEL = "Live 候选股"
+LIVE_PRIMARY_BUTTON = "按 fold 出分"
+LIVE_COVERAGE_BUTTON = "检查数据覆盖率"
+FLAGSHIP_WF_REL = "results/xgb_h5_sizeind_w156_nob_wf_20260830"
+LIVE_PATH_HELP = """
+**生产主路径（本页按钮）**：全 WF ``--save-models`` 后，按 fold 加载对应模型出分
+（``retrain_every=4``，例如信号日 08-28 用 08-14 fit 的模型）。与回测同口径。
+调用 ``live.predict_from_wf_models.predict_candidates``，**不重新训练**。
+
+**备选 / 口径不同（本页不跑）**：``python -m live.flagship_last_window`` 在 last 窗现训。
+Barra / neut 指纹与全 WF 回测不同，只适合快速看盘，**不可与回测结论混用**。
+
+**不做自动下单**。输出候选股表（code、名称、rank、score、行业、市值、
+signal_date、suggested_buy_date、fit_date）。请先按
+[docs/操作手册.md](../docs/操作手册.md) §10 在终端增量更新数据；
+本页**不会**全市场下载（那会卡死 UI）。
+"""
+CANDIDATE_DISPLAY_COLS = [
+    "rank", "code", "name", "score", "sw_l2", "circ_mv_yi",
+    "signal_date", "suggested_buy_date", "fit_date",
+]
+
 
 def _venv_python() -> Path:
     """优先用仓库 ``.venv`` 里的 Python，找不到则退回当前解释器。"""
@@ -73,6 +98,95 @@ def _venv_python() -> Path:
     if unix.is_file():
         return unix
     return Path(sys.executable)
+
+
+def list_wf_model_dirs(*, results_dir: Path | None = None) -> list[str]:
+    """扫描含 ``models/models_manifest.json`` 的 ``results/<tag>``（不读 parquet）。"""
+    results = Path(results_dir) if results_dir is not None else REPO_ROOT / "results"
+    if not results.is_dir():
+        return []
+    found: list[str] = []
+    for p in sorted(results.iterdir(), key=lambda x: x.name.lower()):
+        if not p.is_dir():
+            continue
+        if (p / "models" / "models_manifest.json").is_file():
+            try:
+                rel = str(p.relative_to(REPO_ROOT)).replace("\\", "/")
+            except ValueError:
+                rel = str(p).replace("\\", "/")
+            found.append(rel)
+    return found
+
+
+def peek_raw_panel_coverage(
+    rel: str,
+    *,
+    root: Path | None = None,
+) -> dict:
+    """读本地宽表末日非空数。仅覆盖率检查用，不下载。文件缺失则 exists=False。"""
+    base = Path(root) if root is not None else REPO_ROOT
+    path = Path(rel)
+    if not path.is_absolute():
+        path = base / rel
+    if not path.is_file():
+        return {"exists": False, "path": str(path), "error": "文件不存在"}
+    try:
+        import pandas as pd
+
+        df = pd.read_parquet(path)
+        last_dt = pd.Timestamp(df.index.max())
+        row = df.loc[last_dt] if last_dt in df.index else df.iloc[-1]
+        return {
+            "exists": True,
+            "path": str(path),
+            "rows": int(df.shape[0]),
+            "cols": int(df.shape[1]),
+            "last_date": str(last_dt.date()),
+            "last_n_notna": int(row.notna().sum()),
+        }
+    except Exception as exc:  # noqa: BLE001 — UI / smoke 要结构化失败
+        return {"exists": False, "path": str(path), "error": str(exc)}
+
+
+def peek_last_index_date(rel: str, *, root: Path | None = None) -> date | None:
+    """只读 parquet 索引末日（默认信号日）。文件缺失返回 None，不抛错。"""
+    base = Path(root) if root is not None else REPO_ROOT
+    path = Path(rel)
+    if not path.is_absolute():
+        path = base / rel
+    if not path.is_file():
+        return None
+    try:
+        import pandas as pd
+
+        idx = pd.read_parquet(path, columns=[]).index
+        if len(idx) == 0:
+            return None
+        return pd.Timestamp(idx.max()).date()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def candidate_sanity_flags(df) -> dict:
+    """对候选表做 ST / B / 92 检查（不读盘）。"""
+    from live.predict_from_wf_models import summarize_candidates
+
+    return summarize_candidates(df)
+
+
+def run_fold_predict(*, as_of, model_dir, top_n: int = 100, **kwargs):
+    """UI / smoke 入口：调用 ``predict_candidates``（可 mock），cwd 切到仓库根。"""
+    old = os.getcwd()
+    try:
+        os.chdir(REPO_ROOT)
+        from live.predict_from_wf_models import predict_candidates
+
+        md = Path(model_dir)
+        if not md.is_absolute():
+            md = REPO_ROOT / model_dir
+        return predict_candidates(as_of=as_of, model_dir=md, top_n=top_n, **kwargs)
+    finally:
+        os.chdir(old)
 
 
 def _list_factor_yamls() -> list[str]:
@@ -251,6 +365,11 @@ def _init_session() -> None:
         "run_started": None,
         "run_finished": None,
         "exit_code": None,
+        "live_candidates": None,
+        "live_fit_date": None,
+        "live_error": None,
+        "live_coverage": None,
+        "live_default_as_of": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -394,7 +513,7 @@ def _render_backtest_tab(python: Path) -> None:
     with st.expander("使用前请读（诚实说明）", expanded=True):
         st.markdown(
             """
-- 仍需先安装 **Python**、创建虚拟环境、``pip install -r requirements.txt``，并**自行下载**行情/财务等数据（见 [docs/GETTING_STARTED.md](../docs/GETTING_STARTED.md)）。
+- 仍需先安装 **Python**、创建虚拟环境、``pip install -r requirements.txt``，并**自行下载**行情/财务等数据（见 [docs/操作手册.md](../docs/操作手册.md)）。
 - 本页只包装常用 CLI；批量编排请看 ``logs/driver.py``（本 UI **不做** driver）。
 - 建议先用「仅前 N 只股票」冒烟；``sample=0`` 表示全市场，耗时长、吃内存。
 - 输出默认写在 ``results/<tag>/``（或你指定的输出目录）。结果供人工二次筛选，**不是**自动交易。
@@ -499,7 +618,7 @@ def _render_backtest_tab(python: Path) -> None:
             "特殊因子 special-factors（可选，逗号分隔）",
             value="",
             placeholder="例如 event,size",
-            help="白名单之外再注入的 pack，如 event / size。详见 docs/SPECIAL_FACTORS.md。",
+            help="白名单之外再注入的 pack，如 event / size。详见 docs/操作手册.md §5.4。",
         )
         output_dir = st.text_input(
             "输出目录 output-dir（可选）",
@@ -688,6 +807,168 @@ def _render_ic_tab(python: Path) -> None:
     _render_run_controls(argv, python=python)
 
 
+def _default_signal_date() -> date:
+    cached = st.session_state.get("live_default_as_of")
+    if cached is not None:
+        return cached
+    peeked = peek_last_index_date("data/raw/close_hfq.parquet")
+    st.session_state.live_default_as_of = peeked or date.today()
+    return st.session_state.live_default_as_of
+
+
+def _render_coverage_block(info: dict, *, label: str, expect_n: int) -> None:
+    if not info.get("exists"):
+        st.warning(f"{label}：{info.get('error') or '文件不存在'}（`{info.get('path', '')}`）")
+        return
+    n = int(info["last_n_notna"])
+    msg = (
+        f"{label}：{info['rows']}×{info['cols']}，末日 **{info['last_date']}**，"
+        f"末日非空 **{n}**（参考阈值约 {expect_n}+）"
+    )
+    if n < expect_n:
+        st.error(msg + " → 覆盖不足，请按操作手册 §10 在终端增量更新，勿在 UI 里下载。")
+    else:
+        st.success(msg)
+
+
+def _render_live_tab() -> None:
+    st.caption(
+        "生产路径：按 fold 加载全 WF ``--save-models`` 模型出候选股，与回测同口径。"
+        " **不训练、不下单**。请先在终端按操作手册 §10 更新数据。"
+    )
+    with st.expander("生产路径 vs last-window 备选（请读）", expanded=True):
+        st.markdown(LIVE_PATH_HELP)
+
+    dirs = list_wf_model_dirs()
+    placeholder = "（未找到含 models_manifest.json 的 results/<tag>，请手动填写）"
+    if dirs:
+        default_idx = dirs.index(FLAGSHIP_WF_REL) if FLAGSHIP_WF_REL in dirs else 0
+        pick = st.selectbox(
+            "结果目录 / models_manifest（全 WF --save-models 产物）",
+            options=dirs,
+            index=default_idx,
+            help="需存在 models/models_manifest.json。默认旗舰目录若存在会预选。",
+        )
+    else:
+        st.warning(
+            f"未扫到 WF 模型目录。请先跑全 WF ``--save-models``，"
+            f"或手动填写（旗舰示例：`{FLAGSHIP_WF_REL}`）。"
+        )
+        pick = placeholder
+
+    custom = st.text_input(
+        "或手动填写结果目录（相对仓库根或绝对路径）",
+        value="" if dirs else FLAGSHIP_WF_REL,
+        placeholder=FLAGSHIP_WF_REL,
+        help="填写后优先于下拉框。",
+    )
+    model_dir = custom.strip() or (pick if pick != placeholder else "")
+
+    left, right = st.columns([1, 1], gap="large")
+    with left:
+        as_of = st.date_input(
+            "信号日（默认数据末日 / 最近交易日）",
+            value=_default_signal_date(),
+            help="A 股 T 日收盘后更新到 T 日，T 即信号日，T+1 开盘买入。",
+        )
+        top_n = st.number_input(
+            "Top-N",
+            min_value=1,
+            max_value=500,
+            value=100,
+            step=10,
+            help="写出并展示的候选只数；表内另给 Top30 摘要。",
+        )
+    with right:
+        st.markdown("**数据覆盖率（只读本地 parquet，不下载）**")
+        st.caption("全市场下载会卡死 UI。请先在终端按 docs/操作手册.md §10 更新。")
+        cov_clicked = st.button(LIVE_COVERAGE_BUTTON, use_container_width=True)
+
+    if cov_clicked:
+        st.session_state.live_coverage = {
+            "circ_mv": peek_raw_panel_coverage("data/raw/circ_mv.parquet"),
+            "close_hfq": peek_raw_panel_coverage("data/raw/close_hfq.parquet"),
+            "turnover": peek_raw_panel_coverage("data/raw/turnover_rate.parquet"),
+        }
+
+    cov = st.session_state.get("live_coverage")
+    if cov:
+        _render_coverage_block(cov["circ_mv"], label="circ_mv", expect_n=4000)
+        _render_coverage_block(cov["close_hfq"], label="close_hfq", expect_n=4000)
+        _render_coverage_block(cov["turnover"], label="turnover_rate", expect_n=4000)
+
+    run_clicked = st.button(LIVE_PRIMARY_BUTTON, type="primary")
+    if run_clicked:
+        if not model_dir:
+            st.error("请选择或填写含 models_manifest.json 的结果目录。")
+        else:
+            manifest = Path(model_dir)
+            if not manifest.is_absolute():
+                manifest = REPO_ROOT / model_dir
+            if not (manifest / "models" / "models_manifest.json").is_file():
+                st.error(f"未找到 `{manifest / 'models' / 'models_manifest.json'}`")
+            else:
+                st.session_state.live_error = None
+                with st.spinner(
+                    "正在按 fold 出分（加载全量数据 + 命中 neut/Barra 缓存，**非训练**）…"
+                ):
+                    try:
+                        top, fit_date = run_fold_predict(
+                            as_of=str(as_of),
+                            model_dir=model_dir,
+                            top_n=int(top_n),
+                        )
+                        st.session_state.live_candidates = top
+                        st.session_state.live_fit_date = fit_date
+                    except Exception as exc:  # noqa: BLE001
+                        st.session_state.live_candidates = None
+                        st.session_state.live_fit_date = None
+                        st.session_state.live_error = str(exc)
+
+    if st.session_state.get("live_error"):
+        st.error(st.session_state.live_error)
+
+    top = st.session_state.get("live_candidates")
+    if top is None:
+        return
+
+    flags = candidate_sanity_flags(top)
+    fit_s = str(st.session_state.get("live_fit_date") or "")
+    if "fit_date" in top.columns and len(top):
+        fit_s = str(top["fit_date"].iloc[0])
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("候选只数", flags["n"])
+    m2.metric("fit_date", fit_s or "—")
+    m3.metric("名称含 ST", flags["n_st_name"])
+    m4.metric("B 股 / 北交所92", f"{flags['n_b']} / {flags['n_92']}")
+
+    if flags["n_b"]:
+        st.error(f"候选含 B 股（生产应 SystemExit）：{flags['b_codes']}")
+    if flags["n_st_name"]:
+        st.warning(f"名称含 ST（请刷新 st_history 后重出分）：{flags['st_codes']}")
+    if flags["n_b"] == 0 and flags["n_st_name"] == 0:
+        st.success("ST / B 检查通过（名称启发式 ST；B=200/900 前缀）。")
+
+    show_cols = [c for c in CANDIDATE_DISPLAY_COLS if c in top.columns]
+    extra = [c for c in top.columns if c not in show_cols]
+    table = top[show_cols + extra] if show_cols else top
+
+    st.subheader("Top30")
+    st.dataframe(table.head(30), use_container_width=True, hide_index=True)
+
+    st.subheader(f"Top{len(top)}")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+    csv_bytes = table.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        "下载候选 CSV",
+        data=csv_bytes,
+        file_name=f"candidates_{as_of.strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="量化选股 · 简易运行面板",
@@ -699,22 +980,24 @@ def main() -> None:
 
     st.title("量化选股 · 简易运行面板")
     st.caption(
-        "本地包装常用 CLI：**回测**（``run.py``）与 **因子筛选**（``ic_analysis_v2``）。"
+        "本地包装常用 CLI：**回测**（``run.py``）、**因子筛选**（``ic_analysis_v2``）、"
+        "**Live 候选股**（按 fold 加载 WF 模型）。"
         " **不做**券商下单 / 账号系统 / ``logs/driver.py`` 编排 / 一键无数据复现。"
     )
 
     python = _venv_python()
-    tab_bt, tab_ic = st.tabs(["回测", "因子筛选"])
+    tab_bt, tab_ic, tab_live = st.tabs(["回测", "因子筛选", LIVE_TAB_LABEL])
     with tab_bt:
         _render_backtest_tab(python)
     with tab_ic:
         _render_ic_tab(python)
+    with tab_live:
+        _render_live_tab()
 
     st.divider()
     st.markdown(
-        "更多说明：[docs/UI.md](../docs/UI.md) · "
-        "[docs/CLI_QUICKSTART.md](../docs/CLI_QUICKSTART.md) · "
-        "[docs/GETTING_STARTED.md](../docs/GETTING_STARTED.md)"
+        "更多说明：[docs/操作手册.md](../docs/操作手册.md) · "
+        "[docs/PROJECT_FEATURES.md](../docs/PROJECT_FEATURES.md)"
     )
 
 

@@ -346,8 +346,7 @@ def factor_margin_change(
 # ══════════════════════════════════════════════════════════════════════════════
 # 弃用原因：akshare 东财大单/超大单全市场拉不稳（push2his 限流重、单票历史常仅近数月），
 #   raw 文件 moneyflow_large 长期缺失或过短，因子不可用。勿再进入 IC / 生产 YAML。
-#   实现保留供未来接 Tushare DC 长历史后复活；当前 registry 已通过 moneyflow=None 跳过。
-#   详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
+#   实现保留供未来接长历史后复活；当前 registry 已通过 moneyflow=None 跳过。
 # ══════════════════════════════════════════════════════════════════════════════
 
 def factor_moneyflow_large(
@@ -491,7 +490,7 @@ def load_moneyflow() -> pd.DataFrame | None:
     """[DEPRECATED] 加载东财大单净流入宽表。
 
     弃用：akshare 资金流数据不足（全市场限流、单票历史短），因子不可用。
-    始终返回 None；勿再进入 IC / 生产池。详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1。
+    始终返回 None；勿再进入 IC / 生产池。
     """
     import warnings
     warnings.warn(

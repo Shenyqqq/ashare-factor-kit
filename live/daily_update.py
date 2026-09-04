@@ -17,7 +17,7 @@
 
 与现有研究口径一致：clean_ret、PIT、tradable strict、barra WLS（√市值）。
 不破坏研究回测路径：增量是新入口，不替换现有全量 run.py。
-已知限制见 docs/LIVE_DAILY.md。
+已知限制见 docs/操作手册.md §10。
 """
 from __future__ import annotations
 
@@ -252,7 +252,7 @@ def incremental_download(as_of, lookback_days, sample=0):
 
     # ── 大单/超大单净流入：已弃用（akshare 资金流数据不足，因子不可用）──
     # 不再增量下载 moneyflow_large/superlarge；因子侧已标记弃用，勿进入 IC/生产池。
-    # 详见 docs/ASHARE_FACTOR_DATA_GAPS.md §1 / factors/factor_alpha.py::load_moneyflow。
+    # 详见 factors/factor_alpha.py::load_moneyflow。
 
     # ── 机构持仓（季频；resume by 季报期）──
     try:
@@ -1541,7 +1541,7 @@ def _parse_args(argv=None):
             "      --model-dir results/lgbm_h5_w6-12 --output candidates.md\n"
             "\n"
             "需先有 --save-models 训练产物（results/<tag>/models/models_manifest.json）。\n"
-            "详见 docs/LIVE_DAILY.md"
+            "详见 docs/操作手册.md §10"
         ),
     )
     p.add_argument("--as-of-date", default=None, help="当日（YYYY-MM-DD，默认今天）")
