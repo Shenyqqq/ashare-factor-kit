@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Agent 在本仓库工作时的精简上下文指南。与 [README.md](README.md) 互补（README 对外介绍；命令教程见 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) / [docs/CLI_QUICKSTART.md](docs/CLI_QUICKSTART.md)；本文是 agent 上手速查）。
+Agent 在本仓库工作时的精简上下文指南。与 [README.md](README.md) 互补（README 对外介绍；用户操作真源见 [docs/操作手册.md](docs/操作手册.md)；本文是 agent 上手速查）。
 
 ## 项目简介
 
@@ -14,7 +14,7 @@ A 股多因子量化选股框架，定位 **辅助人工选股，不做全自动
 
 | 顶层目录 | 用途 |
 |----------|------|
-| `run.py` | 主入口 CLI；日常见 `--help`，高级/deprecated 见 `--help-advanced` / [docs/CLI_QUICKSTART.md](docs/CLI_QUICKSTART.md) |
+| `run.py` | 主入口 CLI；日常见 `--help`，高级/deprecated 见 `--help-advanced` / [docs/操作手册.md](docs/操作手册.md) |
 | `config/` | `settings.py`（全局参数，含 `IC_MIN_LISTING_DAYS=252`、`BID_ASK_SPREAD_BPS=10.0`）、`factor_configs.yaml`（因子白名单） |
 | `data/` | 下载 / 清洗 / 行业 / 财务事件；`raw/` `universe/` `processed/`；`download_delisted.py` 保留退市股；`industry/download_industry.py` 产出 PIT `industry_map_panel.parquet` |
 | `factors/` | 因子实现 + `get_factor_registry()` 注册中心；含分数差分动量；财务因子经 PIT 对齐；`special_factors.py`（event/size 等绕过 IC YAML 的注入包） |
@@ -50,7 +50,7 @@ A 股多因子量化选股框架，定位 **辅助人工选股，不做全自动
 | **退市股 + ST 时间序列** | 股票池保留退市股（`data/download_delisted.py`）；ST：深交所精确历史 + 沪/北 `sh_bj_current_st_conservative_fallback` |
 | **行业 PIT** | `industry_map_panel.parquet` 严格默认（`--barra` 缺失即报错）；仅 `--allow-static-industry` 可退化 |
 | **IC v2 上线** | `logs/driver.py` 已切到 `research.ic_analysis_v2`；Newey-West HAC t、可交易池 mask、BH-FDR、rolling ICIR、扣成本 IC 均进入生产筛选 |
-| **ML 特征中性化** | `--feature-neutralize` 在 `build_factor_dataset` 出口做 Barra+行业残差化，与 IC 纯 IC 同口径 |
+| **ML 特征中性化** | `--feature-neutralize` 在 `build_factor_dataset` 出口做残差化；**日常/旗舰 `--neut-controls size_industry`**（Size+PIT 行业）；代码默认仍是 `barra`（9 风格，可选消融）；与 IC 纯 IC 同口径 |
 | **FDR 多重检验校正** | `research/ic/statistics.py::benjamini_hochberg` + `selection.py::use_fdr`（CLI 默认 ON，`--no-use-fdr` 关） |
 | **过拟合检验** | `research/pbo.py` 算 PBO + Deflated Sharpe Ratio（AFML Ch.13/15）；当前 51 实验最优 DSR=0.0253，提示过拟合 |
 | **分数差分** | `utils/fractional_diff.py`（AFML Ch.5，d=0.4 默认）→ 因子 `分数差分动量_20d`，保留长期记忆同时平稳 |
@@ -71,16 +71,16 @@ A 股多因子量化选股框架，定位 **辅助人工选股，不做全自动
 ```bash
 .venv\Scripts\activate
 
-# 冒烟 / 日常训练（默认已含 feature-neutralize + bid-ask）
+# 冒烟 / 日常训练（feature-neutralize 默认开；日常请显式 sizeind）
 python run.py --sample 100
-python run.py --skip-download --mode ridge --horizon 5 \
-  --factor-config config/factor_configs.yaml
-python run.py --skip-download --mode ensemble --horizon 20 \
-  --factor-config config/factor_configs.yaml --models lgbm,xgb
+python run.py --skip-download --mode lgbm --horizon 5 \
+  --factor-config config/factor_configs_h5_sizeind_20260815.yaml \
+  --neut-controls size_industry --train-windows 104 --train-window-units periods --val-window 0
+# 旗舰见 config/flagship_xgb_h5_sizeind_w156_nob.yaml（xgb / 156 期，不是 lgbm）
 
-# IC v2（默认 FDR / t=2.5 / corr-dedup；GS 需 --gram-schmidt；h5/h20 同参）
-python -m research.ic_analysis_v2 --period 5 --barra --save
-python -m research.ic_analysis_v2 --period 20 --barra --save
+# IC v2（日常 sizeind；--barra 为 9 风格消融，与 size* 互斥）
+python -m research.ic_analysis_v2 --period 5 --neut-controls size_industry --save
+python -m research.ic_analysis_v2 --period 20 --neut-controls size_industry --save
 
 # 编排 / 定池 / 过拟合 / 退市股
 python logs/driver.py --preset main
@@ -90,7 +90,7 @@ python -m data.download_delisted
 python logs/analyze_results.py
 ```
 
-最短命令与隐藏高级开关见 [docs/CLI_QUICKSTART.md](docs/CLI_QUICKSTART.md)；`python run.py --help-advanced` / `python -m research.ic_analysis_v2 --help-advanced`。
+最短命令与隐藏高级开关见 [docs/操作手册.md](docs/操作手册.md)；`python run.py --help-advanced` / `python -m research.ic_analysis_v2 --help-advanced`。
 
 `run.py` 模式：`linear` / `ridge|lgbm|xgb|cat|rf|mlp` / `ensemble`（默认 lgbm+xgb）/ `dynamic` / `industry` / `ensemble + --blend-dynamic`。
 `--horizon`：5=周频 / 10=双周 / 20=月频（默认）/ 60=季频。

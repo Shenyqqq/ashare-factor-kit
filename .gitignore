@@ -70,6 +70,7 @@ data/quality_report_*.md
 
 # 其它输出
 *.png
+!figs/*.png
 *.pdf
 backtest_result*
 tmp_cols.txt

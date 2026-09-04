@@ -1,219 +1,255 @@
 # A 股多因子量化选股框架
 
-面向研究与辅助选股的 A 股多因子流水线：**数据下载 → 因子计算 → IC 筛选 → ML / 动态加权 → 分组回测 → 按 fold 加载模型出候选股（live）**。
+一个面向**研究与辅助选股**的 A 股多因子量化框架，覆盖从数据处理、因子研究到模型训练、回测和实盘候选股生成的完整流程。
 
-## 这是什么 / 不是什么
+```text
+数据下载
+   ↓
+因子计算
+   ↓
+IC 筛选
+   ↓
+ML / 因子加权
+   ↓
+Walk-Forward 回测
+   ↓
+保存各期模型
+   ↓
+Live 加载对应模型
+   ↓
+输出 Top-N 候选股
+```
 
-| 是 | 不是 |
-|----|------|
-| 可复现的研究框架与实验脚手架 | 全自动交易系统 / 券商下单接口 |
-| 输出得分排名与 Top-N 候选池，供人工二次筛选 | 投资建议或收益承诺 |
-| 强调 PIT、可交易口径、成本与过拟合检验 | 「一键复现完整历史曲线」的数据快照仓库 |
+项目的核心目标不是把“因子 + 模型 + 回测”简单拼在一起，而是尽量把量化研究中常见的数据泄漏、样本选择偏差、不可交易假设以及回测与实盘不一致等问题落实到工程流程中。
 
-数据需自行通过 AKShare（等）下载；不同机器、不同下载时点与接口变更会导致结果不可逐点复现。过拟合风险真实存在，请用样本外与 PBO/DSR（概率过拟合 / 紧缩夏普，检验「挑出来的最优是否太好看」）等工具自检，勿盲信单次最优实验。
+模型最终输出的是股票评分与候选排名，**不包含自动下单功能**，用于研究、策略评估以及人工二次选股。
 
 ---
 
-## 流水线说明
+## 项目结构
 
-下面按真实执行顺序说明每一步在干什么（不是术语堆砌）。更细的陷阱与内部约定见 [docs/PIPELINE.md](docs/PIPELINE.md)、[AGENTS.md](AGENTS.md)。
+```text
+quant_trading/
+├── run.py                 # 主入口
+├── ui/
+│   └── app.py             # Streamlit 面板
+├── config/                # 配置与因子白名单
+├── data/                  # 行情、财务、行业、市值等数据
+├── factors/               # 因子实现与 registry
+├── models/                # Walk-Forward / dynamic / industry
+├── strategies/            # linear / ML 策略调度
+├── backtest/              # 分组回测与交易成本
+├── research/              # IC、rolling pool、PBO 等研究模块
+├── utils/                 # PIT、WLS、调仓、股票池等工具
+├── live/                  # Live 模型加载与候选股生成
+├── tests/
+├── docs/                  # 项目文档
+├── logs/                  # 实验编排
+└── results/               # 本地实验结果与模型
+```
 
-### 1. 数据怎么下载
+---
 
-主入口是 `data/download.py`（AKShare）。日常拉两类行情：后复权 OHLCV（`*_hfq`，训练和量价因子用）和不复权 `prices_raw`（换手、市值校验用）。市值走东财日频 `python -m data.download_stock_value_em`，写入流通市值 `circ_mv` 和总市值 `total_mv`（顺带 `pe_ttm` / `pb`）；**Size 风格因子读的就是东财 `circ_mv`**，不是总资产。股本 `python -m data.download_shares` 再配合 `python -m data.compute_market_cap`，用「成交量（手）×100 / 流通股本」算换手率。
+## 流程概览
 
-股票池刻意保留退市股（`python -m data.download_delisted`），避免只拿还活着的公司做研究。ST 用 `python -m data.download_st_history`：深交所有带日期的精确历史；沪市 / 北交所没有公开带日期接口，只能从上市日起保守标 ST。行业是时间序列面板（`python -m data.industry.download_industry` → `industry_map_panel.parquet`），不是一张永远不变的对照表。财务季报经 `utils/pit_align.py` 按法定披露窗口对齐后再用（季报约 +30 日、半年报 +60、年报 +90；表里若有公告日则优先），禁止按报告期直接往未来填。
+### 1. 数据下载与整理
 
-日更不要全量扫股本；市值增量不要把「最近 N 天」当成 `--start` 去覆盖历史（会全量重拉或截断前向填充）。逐步命令与覆盖率检查见 [docs/LIVE_OPS_README.md](docs/LIVE_OPS_README.md)。研究全流程也可直接 `python run.py`（会顺带下载）；已有数据时加 `--skip-download`。
+首先从行情、财务、行业、市值、股本等数据源构建历史面板。
+
+除了常规 OHLCV 数据外，框架还维护退市股票、ST 状态、历史行业分类以及流通市值等信息，并对财务数据进行 Point-in-Time（PIT）处理，使每个历史截面只使用当时能够获得的信息。
+
+其中，行情、财务、行业、股票状态等数据都会经过统一的数据处理层，再提供给后面的因子和模型模块。
 
 ### 2. 因子计算
 
-因子在 `factors/` 里实现，经 `get_factor_registry()` 注册后才能进管线。量价与部分风险因子必须用 `clean_ret`：涨跌停日的收益记为缺失，不当成普通涨跌。因子函数内部已经按「越高越好」取过方向，后面筛选和模型不再二次翻符号。
+在整理后的历史面板上计算多种量价、基本面、风险和事件类因子。
 
-### 3. IC 凭什么筛选
+因子通过统一 registry 注册进入研究流程。因子输出统一采用“**数值越大，预期收益越高**”的方向约定，后续 IC 分析、模型训练和回测使用同一套方向定义。
 
-生产筛选走 IC v2（`python -m research.ic_analysis_v2 --period 5 --barra --save`；月频把 `--period` 改成 20）。对每个因子算截面 Rank IC（因子排序与未来收益排序的相关）和 ICIR（IC 均值除以 IC 波动）。再叠加：Newey-West HAC t（考虑序列相关后的显著性）、BH-FDR（同时测很多因子时控制假发现率）、截面相关去重、可交易池掩码、滚动 ICIR、扣交易成本后的 IC。稠密因子还有 **long_share** 门（分组回测里多头贡献占比，默认须大于 0.4）；稀疏因子（事件类、经常大面积缺失的）走另一条轨，不和稠密因子抢同一套阈值。
+对于涨跌停等特殊交易状态，因子计算与研究样本不会简单地将股票直接删除，而是根据具体用途分别处理。
 
-约定：Q1 是最低分、Q5 是最高分；IC 为正表示高分那一组更好。通过的因子写入 `research/output/selected_factors_h*.json`，再落到 `config/factor_configs*.yaml` 白名单；之后训练只吃这份名单，而不是全市场随便堆特征。
+### 3. IC 筛选
 
-### 4. ML / 加权是怎么加权的
+计算因子的截面 Rank IC、ICIR，并结合统计检验、相关性、稳定性和可交易性等指标筛选因子。
 
-`python run.py --mode ...` 不是同一种「动态加权」，要分开看：
+经过筛选的因子进入配置中的白名单，只有这些因子才会参与后续 ML 训练或因子组合。
 
-| 模式 | 实际在加权什么 |
-|------|----------------|
-| **linear** | 配置里的 `FACTOR_WEIGHTS`，手工/静态权重。 |
-| **单模型 ML**（`ridge` / `lgbm` / `xgb` / `cat` / `rf` / `mlp`） | Walk-Forward（按时间向前滚）训练该模型，用模型得分给股票排序。 |
-| **ensemble** | 多个训练窗口 × 多个模型 → 按 IC 加权后做 Z-score 平均（**不是**把排名简单平均）。 |
-| **dynamic** | 不训树模型，按滚动 ICIR 给因子实时加权。 |
-| **industry** | 按申万二级行业分别训练。 |
+这一层的目的，是先判断因子本身是否具有稳定的横截面信息，再进入模型阶段，而不是把大量未经筛选的特征直接交给机器学习模型。
 
-当前旗舰是 **xgb + Size/行业中性化 + 训练窗 156 期 + 每 4 期重训一次**（`retrain_every=4`），不是 ensemble 盲平均。`--feature-neutralize` 会在特征出口做风格/行业的加权最小二乘残差化（WLS，权重大约是√市值）：可以是完整 Barra 风格，旗舰用的是 Size + 申万二级，与「纯 IC」同一套中性化口径。
+![因子分析](figs/factor_ic.png)
 
-### 5. 分组回测怎么回测
+### 4. ML / 因子加权
 
-入口是 `backtest/quantile.py`（由 `run.py` 训练结束后调用）。信号在收盘后产生，**下一交易日开盘买入**，前瞻收益是 `收盘[t+N] / 开盘[t+1] - 1`。默认周五（W-FRI）调仓，持有到下一期信号。分组用 `pd.qcut` 切 Q1–Q5，另出 Top-N。成本默认：佣金 1bp、印花税 5bp、滑点 0、买卖价差 10bp。
+通过线性模型、树模型或其他模型学习因子与未来收益之间的关系，也可以使用滚动 ICIR 等方法进行动态因子加权。
 
-回测成交仍拦截：买日一字涨停买不进、卖日涨跌停卖不出。回测用的得分宇宙默认 **strict**——只保留「严格可交易且标签可用」的股票，避免训练池更大、把等权基准抬高。研究和执行是分开的：默认信号日股票池**保留**涨跌停（当天不因涨跌停剔除），训练标签也不做成交掩码；不要把「研究能打分」理解成「回测一定能成交」。
+模型训练采用 Walk-Forward 的时间序列方式，并通过 Purging 和 Embargo 隔离存在持有期重叠的样本。
 
-### 6. 候选股输出（含 live）
+模型输出的是每个调仓日股票的预测分数，随后按照分数进行排序和分组。
 
-模型只给得分排名和 Top-N 名单，**不做自动下单**。研究回测产物在 `results/<tag>/`。实盘是：先全量 Walk-Forward 加 `--save-models` 把每一折的模型存下来，再用 `python -m live.predict_from_wf_models` 按折加载对应模型，对最新信号日出候选股，供人工看 Top100 / Top30 后手动操作。详见下文「实盘 / Live」。
+### 5. 回测
 
----
+回测模拟实际的信号生成与交易过程。
 
-## 特色与特别实现
+信号在收盘后产生，下一交易日开盘执行，并在回测中考虑涨跌停等成交限制以及交易成本。
 
-和「下载行情 → 算几个因子 → 回测」的传统脚本相比，本仓库把 **PIT（当时可观测信息）**、可交易性、多重检验、风格中性化、Walk-Forward 泄漏控制、以及研究/执行分口径做成了默认，而不是事后补丁。
+除了组合净值，还会输出 Q1–Q5 分组表现和 Top-N 股票结果，用于观察因子的单调性、模型排序能力以及实际候选池表现。
 
-### 传统做法 vs 本仓库
+![分组回测](figs/backtest_nav.png)
 
-| 传统 A 股多因子里常见的坑 | 本仓库的默认做法 |
-|---------------------------|------------------|
-| 财务按报告期直接往未来填；行业用静态一张表；训练池丢掉退市 / ST → 幸存者偏差 | 法定披露窗口 PIT；行业时间序列；保留退市股；ST 按日查询 |
-| `pct_change` 当动量，涨跌停日当正常收益 | `clean_ret`：涨跌停日收益为缺失 |
-| `close.pct_change(N)` 当「未来收益」 | 次日开盘买：`close[t+N] / open[t+1] - 1` |
-| 等权 OLS 中性化，用总资产当 Size | √市值 WLS；Size = log(流通市值)，源为东财 `circ_mv` |
-| IC 只看均值，同时测很多因子也不校正 | HAC t + BH-FDR + long_share + 相关去重 |
-| 随机切分样本，或训练/测试标签时间重叠 | purged Walk-Forward + embargo（重叠样本剔除，边界再留禁运带） |
-| 回测股票池 = 训练池，等权基准被膨胀 | `--bt-score-universe strict` |
-| 宇宙混进 B 股 | 剔除 B 股（代码 200 / 900）；北交所 92 开头保留，但行情可能断更 |
+### 6. Live 候选股
 
-### 做成默认的工程点
+经过完整 Walk-Forward 训练后，各期模型可以保存下来。
 
-- **PIT 与可交易性**：财务、行业、退市、ST 按上面表格处理，而不是「下载完就算历史已知」。详见 [docs/PIT_AUDIT.md](docs/PIT_AUDIT.md)。沪市 ST 没有精确历史接口，本地 `st_history` 过期会漏掉新戴帽，日更必须刷 `download_st_history`。
-- **研究口径 vs 回测成交**：默认 research——信号日池保留涨跌停、标签不做成交掩码；回测仍拦买日一字涨停等。得分宇宙默认 strict。可用 `--tradable-strict` / `--label-exec-mask` 恢复旧的严格执行口径。
-- **IC v2 与 Barra 纯化**：生产筛选即上一节的 HAC t / FDR / 去重 / long_share；`--feature-neutralize` 让 ML 特征与纯 IC 同口径，避免模型去学市值、行业等系统性敞口。
-- **Walk-Forward 泄漏控制**：按时间向前滚；purged training + embargo；默认多窗共用近期验证集（`--val-window 0` 可关掉独立验证）。因子经 `get_factor_registry()` 统一注册，面板与残差化缓存带持有期 / 调仓频率指纹，换 horizon 不会误用旧缓存。
-- **分位回测与成本**：Q1–Q5 + Top-N，佣金 / 印花 / 买卖价差进净值，而不是「不计成本的纸面多空」。
-- **rolling-pool（滚动定池）**：每一期调仓日 t 的因子池，只用 **严格早于 t** 的 IC（当天 IC 依赖尚未实现的未来收益）。禁止把训练 / 验证 / 预测窗里出现过的因子并成一张大表。
-- **live 与回测必须同口径**：生产路径是全量 Walk-Forward `--save-models`，live 按折加载当时那一期该用的模型（`live/predict_from_wf_models.py`）。`flagship_last_window` 是在最新窗口现训的快速备选，**折调度和中性化缓存都与回测不同**，不能拿来「验证」回测数字。
-- **定位**：辅助人工选股，不是自动交易。
+Live 阶段不重新构造另一套预测逻辑，而是根据当前信号日期找到对应的历史模型 fold，加载该模型及其相关元数据，对最新股票池进行预测并输出 Top-N 候选股。
 
-其它（可选）：AFML 分数差分动量、聚类特征重要性、可选 SHAP、事件类 special factors 注入。过拟合检验（PBO / DSR）用来泼冷水，不应当成「已经防过拟合」的卖点。
+因此，Live 使用的特征构建、数据处理、中性化和模型调度逻辑与回测保持一致。
 
-Agent 与开发约定见 [AGENTS.md](AGENTS.md)（内部速查，非对外教程）。
+生产路径是全量 Walk-Forward 时加上 `--save-models`，再用 `python -m live.predict_from_wf_models` 按 fold 加载对应模型（`retrain_every=4`），与回测同口径；**不做自动下单**。备选 `python -m live.flagship_last_window` 在最近一个窗口现训再出分，口径不同，只适合快速看盘。增量更新、覆盖率与旗舰参数见 **`docs/操作手册.md`**。
+
+![股票候选](figs/live_candidates.png)
 
 ---
 
-## 目录结构速览
+## 特色实现
 
-```
-quant_trading/
-├── run.py                 # 主入口 CLI
-├── ui/app.py              # 可选 Streamlit 简易面板（回测 run.py + IC 筛选）
-├── config/                # settings.py、因子白名单 YAML
-├── data/                  # 下载 / 清洗 / 行业 / 市值（raw 不进库）
-├── factors/               # 因子实现 + registry + 面板缓存
-├── models/                # Walk-Forward / dynamic / industry（含 wf/）
-├── strategies/            # linear / ml 调度
-├── backtest/              # 分组回测引擎与成本
-├── research/              # IC v2、rolling_pool、pbo
-├── utils/                 # rebalance / PIT / WLS / universe(cap-band)
-├── live/                  # 实盘：按 fold 加载 WF 模型出候选股
-├── tests/
-├── docs/                  # 命令与流水线文档
-├── logs/driver.py         # IC → YAML → 批量实验编排
-└── results/<tag>/         # 本地实验产物（默认 gitignore）
-```
+### 1. 四层解耦的交易状态处理
+
+将交易状态分别放在**因子计算、模型训练、收益标签和回测执行**四个层面处理。
+
+这样既不会因为涨跌停、停牌等状态直接删除股票而损失截面信息，也不会在回测中假设实际无法完成的交易。
+
+### 2. 严格的 Point-in-Time 数据治理
+
+财务数据按照历史可获得时间进行对齐，避免公告日期之后的信息提前进入历史样本。
+
+行业也使用带生效时间的历史面板，而不是用当前行业分类回填整个历史区间。
+
+PIT 处理贯穿数据层，而不是仅在回测阶段进行修补。
+
+### 3. WLS 风险残差化与 Barra 中性化
+
+使用基于市值权重的截面 WLS，对 Size 和行业等系统性暴露进行残差化。
+
+中性化直接发生在特征进入模型之前，使因子筛选和 ML 训练使用一致的风险控制口径，降低模型通过市值或行业暴露获得“虚假预测能力”的可能性。
+
+### 4. 面向重叠持有期的因子筛选
+
+对于存在重叠持有期的 IC 序列，不仅观察 IC 均值，还结合 Newey-West HAC 检验、Benjamini-Hochberg FDR、稳定性指标和因子相关性进行筛选。
+
+目标不是寻找“历史上最高”的因子，而是尽量保留统计上可靠、具有一定持续性的因子。
+
+### 5. 稠密因子与事件因子双轨处理
+
+传统量价和基本面因子通常是稠密信号，而龙虎榜、解禁、高管增减持等事件因子可能在绝大多数交易日没有有效观测。
+
+框架针对这两类因子采用不同的评价方式，并在模型端进行相应的尺度处理，避免稀疏信号仅仅因为高缺失率而被统一规则淘汰。
+
+### 6. Purging & Embargo 防止时间泄漏
+
+Walk-Forward 训练不仅按照时间划分数据，还会移除与验证目标存在时间重叠的训练样本，并在训练集与验证集之间设置 Embargo。
+
+这对于多日持有期尤其重要，可以避免同一段未来收益信息以不同样本的形式同时进入训练和验证过程。
+
+### 7. 聚类特征重要性
+
+量化因子通常存在大量高度相关的特征。
+
+因此，模型解释阶段会先对相关因子进行聚类，再观察组级别的重要性，从而减少同类特征之间相互分摊权重所带来的解释偏差。
+
+相比直接查看单个特征的 Feature Importance，这种方式更适合分析“哪类信息真正驱动了模型”。
+
+### 8. 回测与 Live 使用同一套模型架构
+
+Live 不单独训练一套与回测不同的预测模型，而是直接加载 Walk-Forward 过程中保存的各期模型，并按照相同的重训周期进行调度。
+
+特征构建、风格处理和模型元数据也沿用回测路径，从架构上降低“回测是一套模型、实盘又是另一套逻辑”的风险。
+
+### 9. 严格可交易池与基准校正
+
+研究样本与实际可交易股票池并不完全等价。
+
+回测计算组合表现和基准时，会进一步限制到实际可交易范围，避免不可交易股票被纳入等权基准或组合后，扭曲超额收益评价。
+
+### 10. PBO / DSR 过拟合评估
+
+项目内置 Probability of Backtest Overfitting（PBO）和 Deflated Sharpe Ratio（DSR）等工具，用于评估大量参数搜索和策略选择之后，历史最优结果究竟有多少可能只是数据挖掘产生的。
+
+这部分不是“防止过拟合”的保证，而是给研究结果增加一道独立的反向检查。
 
 ---
 
 ## 快速开始
 
+安装依赖：
+
 ```bash
 python -m venv .venv
-# Windows
+```
+
+Windows：
+
+```bash
 .venv\Scripts\activate
+```
+
+安装项目依赖：
+
+```bash
 pip install -r requirements.txt
+```
 
-# 复制环境变量模板（可选：TUSHARE_TOKEN、DATA_ROOT）
-copy .env.example .env
+准备数据后，可以先运行一个小规模样本进行冒烟测试：
 
-# 冒烟：下载 + 前 100 只股票跑通
+```bash
 python run.py --sample 100
 ```
 
-日常训练、IC 筛选、cap-band、编排与高级开关见：
-
-- **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)** — 从数据到回测的推荐流程
-- **[docs/CLI_QUICKSTART.md](docs/CLI_QUICKSTART.md)** — 最短命令与默认开关
-- **[docs/PIPELINE.md](docs/PIPELINE.md)** — 端到端流水线与陷阱
-- **[docs/LIVE_OPS_README.md](docs/LIVE_OPS_README.md)** — 旗舰 live：增量更新 → 全 WF 存模型 → 按 fold 出候选股
-- `python run.py --help` / `--help-advanced`
-
-研究侧最短命令（默认已含特征中性化与 10bp 买卖价差）：
+完整的因子筛选：
 
 ```bash
 python -m research.ic_analysis_v2 --period 5 --barra --save
-python run.py --skip-download --mode xgb --horizon 5 \
+```
+
+使用筛选后的因子进行模型训练与回测：
+
+```bash
+python run.py \
+  --skip-download \
+  --mode xgb \
+  --horizon 5 \
   --factor-config config/factor_configs.yaml
 ```
 
-### 图形界面（可选）
+训练时加上 `--save-models` 后，可按 fold 出候选股（与回测同口径，不做自动下单）：
 
-不想记命令时，可用本地 Streamlit 面板改常用参数并调用 `run.py`（回测）或 `research.ic_analysis_v2`（因子筛选）（**仍须**先装 Python / 依赖，并自行准备数据；全市场 / IC 全量很慢，建议先 sample 或短名单冒烟）。不做券商下单或 `logs/driver.py` 编排。
+```bash
+python -m live.predict_from_wf_models --as-of-date <信号日> --model-dir results/<tag>
+```
+
+可选图形界面，三个标签为回测、因子筛选和 Live 候选股。Live 页选择结果目录与信号日，按 fold 出分、展示 Top，并可检查覆盖率；增量下载须在终端完成，不在 UI 里跑：
 
 ```bash
 streamlit run ui/app.py
 ```
 
-说明见 **[docs/UI.md](docs/UI.md)**。
+更完整的数据准备、参数说明、Live 流程和日常维护方式见：
+
+**`操作手册.md`**
 
 ---
 
-## 实盘 / Live
+## 注意事项
 
-定位：默认周五（W-FRI）收盘后出信号，**下一交易日开盘买**；人工看 Top100 / Top30；A 股 T+1。框架**不自动下单**。
+这个项目定位于**量化研究和辅助选股**，而不是自动交易系统。
 
-旗舰名 `xgb_h5_sizeind_w156_nob`，配置 `config/flagship_xgb_h5_sizeind_w156_nob.yaml`。完整逐步命令、覆盖率数字与排错见 **[docs/LIVE_OPS_README.md](docs/LIVE_OPS_README.md)**（下文只给最短路径和必须检查项）。
+回测结果依赖数据源、股票池、交易规则、成本假设以及参数选择，不应直接理解为未来收益预期。特别是因子筛选和模型调参都可能产生数据挖掘偏差，因此项目提供 PBO / DSR 等工具用于进一步检查过拟合。
 
-### 生产主路径（与回测同口径）
+项目尽可能避免幸存者偏差、前视数据和不可交易假设，但这些工程措施并不意味着策略本身不存在过拟合，也不保证样本外有效。
 
-先全量 Walk-Forward 训练并 `--save-models`，每期模型落到 `results/<tag>/models/`（只需在口径不变时跑一次；换中性化 / 持有期 / 调仓频率须重跑）。之后 live **按折加载**：`retrain_every=4` 时，例如 8 月 28 日的信号加载 8 月 14 日拟合的模型（中间三期复用，与回测调度一致），便于用同一份净值做实盘追踪。
+另外，由于行情和基本面数据来自外部数据源，不同下载时间、接口版本及数据修订都可能导致历史结果存在差异。
 
-```bash
-# 1) 全 WF 存模型（口径变更或首次才需要；完整参数见 LIVE_OPS）
-python run.py --skip-download --mode xgb --horizon 5 --save-models ...
+**本项目仅供学习与研究使用，不构成任何投资建议。证券投资存在风险，使用本项目进行投资决策所产生的结果由使用者自行承担。**
 
-# 2) 按 fold 出当日候选股
-python -m live.predict_from_wf_models --as-of-date <信号日> \
-  --model-dir results/xgb_h5_sizeind_w156_nob_wf_<日期> --top-n 100
-```
+## License
 
-### 快速备选（口径不同）
-
-```bash
-python -m live.flagship_last_window --no-download \
-  --output-dir results/xgb_h5_sizeind_w156_nob_<日期>
-```
-
-在最新窗口现训一个模型再出分，快，但 Barra / 残差化缓存指纹与全量回测不一致，**不能用来核对回测 Top-N 或净值**。要严格同口径请走上一小节。
-
-（通用增量出分入口 `python -m live.daily_update` 见 [docs/LIVE_DAILY.md](docs/LIVE_DAILY.md)，同样不是旗舰同口径路径。）
-
-### 增量更新：最短顺序与必须检查
-
-日常**不带** `--start`、不要 `--force-refresh` 全量扫股本。顺序：
-
-```bash
-python -m data.download
-python -m data.download_stock_value_em
-python -m data.download_st_history          # 沪市新戴帽靠这一步
-python -m data.compute_market_cap           # 不要带 --start，否则换手会被截断
-python -m data.download_shares              # 按过期天数增量，不要全量扫
-```
-
-上线前至少核对：
-
-- **`circ_mv` 末日非空列数**：应是数千只；塌成几百只说明增量没跑完就被拼成稀疏行，须跑完再 assemble，不要对半成品 `--assemble-only`。
-- **刷 ST**：`st_history` 过期会把新戴帽放进 Top-N。
-- **换手不要被 lookback 截断**：`compute_market_cap` 带最近日期的 `--start` 会让 `turnover_rate` 只剩几十行。
-
----
-
-## 许可与免责
-
-本仓库以 [MIT License](LICENSE) 发布。
-
-**免责声明**：本项目仅供学习与研究，不构成任何投资建议。证券投资有风险，据此操作造成的盈亏由使用者自行承担。
+[MIT License](LICENSE)
